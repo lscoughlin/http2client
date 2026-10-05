@@ -22,7 +22,8 @@ already exists, stories link to it instead of restating it.
 - Design notes: [`../doc/design/`](../doc/design/)
 - Verified toolchain behaviour: [`../doc/reference/fpc-verified/`](../doc/reference/fpc-verified/)
 
-This repository is **not a git repo**; all deliverables are files on disk.
+This repository is a git repo; deliverables are committed on `main` and also
+live as files on disk.
 
 ## Dependency graph
 
