@@ -140,3 +140,19 @@ Rules:
 - `WINDOW_UPDATE` is batched: credit is returned once
   `TWindow.NeedsUpdate(Threshold)` is true, so small reads do not emit one
   frame per call.
+
+### Implementation note (S12 validation finding)
+
+`TFlowControl` was implemented and unit-tested but initially wired into
+**nothing**: `TConnection` received DATA without ever returning window
+credit, so a body larger than the advertised 65535-byte window stalled once
+the peer's window hit zero — nghttpd simply stopped sending and the read
+raised `EHttpTimeout` (`timed out reading response body`). Interop case A.7
+(a 100 000-byte response) reproduces it.
+
+The connection layer now drives `TFlowControl`: `TrackReceivedData` accrues
+receive credit on every inbound DATA frame, and `SendWindowUpdate` posts a
+WINDOW_UPDATE — connection level on stream 0, stream level on the lease's
+stream — once `cWindowUpdateBatchSize` (32768) bytes have accrued;
+`UnregisterStream` flushes the remainder. `ApplyPeerSettingsValue` adjusts
+every open stream by the `SETTINGS_INITIAL_WINDOW_SIZE` delta.

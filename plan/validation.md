@@ -83,7 +83,7 @@ never returned window credit after receiving DATA; a 100 KB response stalled
 at the 65535-byte initial window with `EHttpTimeout`. The fix lives in
 `src/Http2.Connection.pas` (`TrackReceivedData` / `SendWindowUpdate`, batched
 at `cWindowUpdateBatchSize = 32768`) and is documented in
-`doc/design/flow-control.md` under "Validation finding (S12)".
+`doc/design/protocol.md` under "Implementation note (S12 validation finding)".
 
 ## B. h2-client-test-harness (primary conformance)
 
