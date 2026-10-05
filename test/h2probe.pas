@@ -1,7 +1,7 @@
 /// Single-shot HTTP/2 conformance probe CLI (plan story S12, deliverable B.1).
 // - usage: h2probe --url=https://127.0.0.1:8080/ [--insecure]
 //                    [--method=GET] [--body=...] [--timeout-ms=N]
-//                    [--keep-open-ms=N] [--parallel=N]
+//                    [--keep-open-ms=N] [--parallel=N] [--trace-frames]
 // - it builds one client, performs ONE request (or N parallel requests with
 //   --parallel), reads each response body to EOF, and maps the observed
 //   OUTCOME to an exit code that mirrors the h2-client-test-harness verifier
@@ -18,8 +18,8 @@ program h2probe;
 
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
-  SysUtils, Classes, Http2.Errors, Http2.Client, Http2.Stream,
-  Http2.ProbeOutcome;
+  SysUtils, Classes, TypInfo, Http2.Errors, Http2.Client, Http2.Stream,
+  Http2.ProbeOutcome, Http2.Frames, Http2.Observer;
 
 const
   cDefaultTimeoutMs  = 5000;
@@ -35,6 +35,7 @@ var
   GParallel: Integer;
   GBodySet: Boolean;
   GBodyWriterSet: Boolean;
+  GTraceFrames: Boolean;
 
 function ReadOptionValue(const AArg: string): string;
 var
@@ -67,6 +68,7 @@ begin
   GBodySet := False;
   GBodyWriterSet := False;
   GInsecure := False;
+  GTraceFrames := False;
   GTimeoutMs := cDefaultTimeoutMs;
   GKeepOpenMs := cDefaultKeepOpenMs;
   GParallel := 1;
@@ -79,6 +81,8 @@ begin
     Value := ReadOptionValue(Arg);
     if (Arg = '--insecure') then
       GInsecure := True
+    else if (Arg = '--trace-frames') then
+      GTraceFrames := True
     else if Name = '--url' then
       GUrl := Value
     else if Name = '--method' then
@@ -163,6 +167,47 @@ begin
   if FChunk < 1 then
     FChunk := 1;
   FPos := 0;
+end;
+
+type
+  /// prints every frame the client writes and reads in an nghttp -nv-comparable
+  /// one-line form, so the S12 section E differential oracle can diff our wire
+  /// behaviour against nghttp for the same request.
+  TFrameTraceObserver = class(TBaseObserver)
+private
+  class function FrameLine(const ADirection: string;
+    const AFrame: TFrame): string; static;
+public
+  procedure OnFrameIn(const AFrame: TFrame); override;
+  procedure OnFrameOut(const AFrame: TFrame); override;
+end;
+
+class function TFrameTraceObserver.FrameLine(const ADirection: string;
+  const AFrame: TFrame): string;
+var
+  F: TFrameFlag;
+  Flags: string;
+begin
+  Flags := '';
+  for F := Low(TFrameFlag) to High(TFrameFlag) do
+    if F in AFrame.Header.Flags then
+      Flags := Flags + UpperCase(Copy(
+        GetEnumName(TypeInfo(TFrameFlag), Ord(F)), 3, MaxInt)) + ',';
+  if Flags <> '' then
+    Flags := Copy(Flags, 1, Length(Flags) - 1);
+  Result := Format('%s %s stream=%d len=%d flags=[%s]',
+    [ADirection, FrameTypeName(AFrame.Header.FrameType),
+     AFrame.Header.StreamId, Length(AFrame.Payload), Flags]);
+end;
+
+procedure TFrameTraceObserver.OnFrameIn(const AFrame: TFrame);
+begin
+  WriteLn('FRAME in  ', FrameLine('', AFrame));
+end;
+
+procedure TFrameTraceObserver.OnFrameOut(const AFrame: TFrame);
+begin
+  WriteLn('FRAME out ', FrameLine('', AFrame));
 end;
 
 function TChunkWriter.NextChunk(out ABuffer: TBytes): Boolean;
@@ -282,6 +327,7 @@ end;
 
 var
   Client: IHttpClient;
+  Factory: THttpClientFactory;
   Workers: array of TProbeWorker;
   I, Succeeded: Integer;
   FinalOutcome: TProbeOutcome;
@@ -290,15 +336,17 @@ var
 begin
   ParseArgs;
 
-  Client := THttpClientFactory.Create
+  Factory := THttpClientFactory.Create
     .WithMaxConnections(GParallel)
     .WithMaxStreamsPerConnection(GParallel)
     .WithFollowRedirects(False)
     .WithConnectTimeout(GTimeoutMs)
     .WithHeaderTimeout(GTimeoutMs)
     .WithIdleTimeout(0)
-    .WithInsecureTls(GInsecure)
-    .Build;
+    .WithInsecureTls(GInsecure);
+  if GTraceFrames then
+    Factory := Factory.WithObserver(TFrameTraceObserver.Create);
+  Client := Factory.Build;
 
   FinalOutcome := poSuccess;
   Worst := nil;

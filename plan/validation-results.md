@@ -10,4 +10,4 @@ PASS = MATCH+BETTER = 1;  FAIL = WORSE = 0;  UNKNOWN = 0
 
 | id | ref state | ref class | our exit | our outcome | static intent | verdict | our RESULT |
 |---|---|---|---|---|---|---|---|
-| 4.2/3 | pass | error | 3 | stream-error | MULTI:conn-error/stream-error/success | MATCH | `RESULT=stream-error class=EHttpStreamError code=FRAME_SIZE_ERROR msg=frame length 16385 exceeds SETTINGS_MAX_FRAME_SIZE 16384` |
+| 5.1/12 | pass | error | 2 | conn-error | MULTI:conn-error/stream-error | MATCH | `RESULT=conn-error class=EHttpProtocolError code=PROTOCOL_ERROR msg=unexpected pseudo-header in response: :method` |

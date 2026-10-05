@@ -300,16 +300,27 @@ run_reference() { # id -> writes log to stdout
 }
 
 run_ours() { # id -> echo "exit line"
-  docker rm -f "$CONTAINER" >/dev/null 2>&1
-  docker run -d --name "$CONTAINER" --network host "$IMG" \
-    --harness-only --test="$1" >/dev/null 2>&1
-  wait_harness_ready || { echo "999 NOT_READY"; return; }
-  local out rc
-  out="$(timeout_guard "$PROBE" --url=https://127.0.0.1:8080/ --insecure \
-    --timeout-ms="$PROBE_TIMEOUT_MS" --keep-open-ms=200 2>&1)"
-  rc=$?
-  docker rm -f "$CONTAINER" >/dev/null 2>&1
-  echo "$rc $(echo "$out" | head -1)"
+  # A NOT_READY result means the harness container did not finish binding
+  # 127.0.0.1:8080 within the readiness window (host load, image warm-up);
+  # it says nothing about the client. Retry a bounded number of times so an
+  # infrastructure hiccup is not recorded as a client failure.
+  local attempt out rc
+  for attempt in 1 2 3; do
+    docker rm -f "$CONTAINER" >/dev/null 2>&1
+    docker run -d --name "$CONTAINER" --network host "$IMG" \
+      --harness-only --test="$1" >/dev/null 2>&1
+    if wait_harness_ready; then
+      out="$(timeout_guard "$PROBE" --url=https://127.0.0.1:8080/ --insecure \
+        --timeout-ms="$PROBE_TIMEOUT_MS" --keep-open-ms=200 2>&1)"
+      rc=$?
+      docker rm -f "$CONTAINER" >/dev/null 2>&1
+      echo "$rc $(echo "$out" | head -1)"
+      return
+    fi
+    docker rm -f "$CONTAINER" >/dev/null 2>&1
+    sleep 1
+  done
+  echo "999 NOT_READY"
 }
 
 # a tiny timeout guard (macOS has no `timeout`): run in background, kill after N

@@ -88,15 +88,20 @@ directly onto S11 scripts). Record the draft-09 divergences.
 
 | ID | Upstream case | Ported to |
 |---|---|---|
-| C.1 | `compression/` invalid data | `test/Http2.Hpack.Test.pas` malformed-input cases |
-| C.2 | `framing/oversized-ping` | `test/Http2.Frames.Test.pas` size enforcement |
-| C.3 | `multiplexing/invalid-level-*` | stream-state transition tests (S08) |
-| C.4 | `stream/data-when-*` / `rst-stream` | stream lifecycle tests (S08) |
-| C.5 | `window-update-when-*` | flow-control tests (S04) |
+| C.1 | `compression/` invalid data | `test/Http2.Hpack.Test.pas` — `TestMalformedIndexRaises`, `TestHuffmanBadPaddingRaises`, `TestIntegerOverflowRaises`, `TestDynamicTableSizeUpdateAfterFieldRaises` |
+| C.2 | `framing/oversized-ping` | `test/Http2.Frames.Test.pas` — `TestOversizedInboundFrameRaises`, `TestPingFrameRoundTrip`, `TestSettingsMaxFrameSizeValidation` |
+| C.3 | `multiplexing/invalid-level-*` | `test/Http2.Stream.Test.pas` — `TestInvalidTransitionsRaise`; stream-state enforcement in `src/Http2.Stream.pas` |
+| C.4 | `stream/data-when-*` / `rst-stream` | `test/Http2.Stream.Test.pas` — `TestRstMidBodySurfacesFromRead`, `TestReadAfterEofRaises`, `TestCleanupHappensExactlyOnce`; `test/Http2.ConnectionLifecycle.Test.pas` |
+| C.5 | `window-update-when-*` | `test/Http2.FlowControl.Test.pas` — `TestZeroIncrementUpdateRaisesProtocolError`, `TestUpdateOverflowRaisesFlowControlError`, `TestApplyUpdateAppliesDelta`, `TestInitialWindowDeltaAdjustsEveryOpenStream` |
+
+Intents verified present by grep on 2026-10-05; each maps a draft-09 client
+intent onto the equivalent RFC 7540/7541 unit test. The draft-09 wire details
+differ (different preface/ALPN, no mandatory TLS), so the *intent* is ported,
+not the bytes.
 
 | ID | Legacy raw run (stretch) | Condition |
 |---|---|---|
-| C.6 | `grunt mochaTest:client` with `HTTP2_BROWSER=test/testclient` | Only if the draft-09 plaintext path is exercised via an explicit `h2c` opt-in; otherwise document as not run and why. |
+| C.6 | `grunt mochaTest:client` with `HTTP2_BROWSER=test/testclient` | **Not run.** The suite speaks draft-09 plaintext `h2c`, and the shipped client is TLS-only: there is no `h2c`/prior-knowledge upgrade path in `src/` (`grep` finds only the TLS preface `cClientPreface` in `src/Http2.Connection.pas`). Running it therefore cannot exercise our code, and a green result would not be evidence of RFC 7540 conformance. Recorded as a documented skip. |
 
 ## D. h2spec (optional appendix)
 
@@ -104,19 +109,30 @@ directly onto S11 scripts). Record the draft-09 divergences.
 h2spec -p 8443 -t -k -h localhost          # only if we ship a test server
 ```
 
-Not a client gate. Record as N/A unless an embedded test server is built.
+**N/A.** h2spec probes a *server*; this project ships a client, so h2spec has
+no surface to exercise. No embedded test server is built. Documented skip.
 
 ## E. nghttp differential oracle
 
 ```sh
-nghttp -nv https://localhost:8443/ > /tmp/nghttp.frames
+# our wire trace (h2probe --trace-frames prints every frame in/out)
+/tmp/h2probe3/h2probe --url=https://127.0.0.1:18443/ --insecure \
+  --trace-frames --timeout-ms=5000
+# reference
+nghttp -nv --no-verify-peer https://127.0.0.1:18443/
 ```
 
-| ID | Case | Expected |
+Both run against the same command line (`nghttpd -d /tmp/oracle-root 18443
+localhost.key localhost.crt`, `index.html` = 38 bytes) on 2026-10-05.
+
+| ID | Case | Result |
 |---|---|---|
-| E.1 | Frame flags | our outbound HEADERS/DATA flags match nghttp's for the same request. |
-| E.2 | HPACK accumulator | encoded size growth/table updates match after a header sequence. |
-| E.3 | SETTINGS | our SETTINGS ids/values are within the peer-accepted set. |
+| E.1 | Frame flags | **Match on every frame that both peers send.** Our trace: `out SETTINGS stream=0 len=36 flags=[]` → `in SETTINGS flags=[]` → `out SETTINGS flags=[ACK]` → `in SETTINGS flags=[ACK]` → `out HEADERS stream=1 flags=[ENDSTREAM,ENDHEADERS]` → `in HEADERS flags=[ENDHEADERS]` → `in DATA stream=1 flags=[ENDSTREAM]` → `out WINDOW_UPDATE` → `out GOAWAY`. nghttp sends the same sequence with the same flag bits: initial SETTINGS `flags=0x00`, ACK `flags=0x01`, request HEADERS `flags=0x05` (= END_STREAM\|END_HEADERS), response HEADERS `flags=0x04` (END_HEADERS), terminal DATA `flags=0x01` (END_STREAM), GOAWAY `flags=0x00`. Our flags are set-typed (`ffEndStream`/`ffEndHeaders` shared-$1 nuance in `src/Http2.Frames.pas` `FlagBit`) but serialize to the identical bytes. |
+| E.2 | HPACK accumulator | **Ordering matches; encoder differs in literal representation only.** nghttp's request HEADERS is 46 bytes and its response HEADERS 83; ours are 31 and 86. Both sides use the same static-table pseudo-headers and both keep the dynamic table *empty* for a single request (`nghttp -nv` shows no `header table` resize), so per-request accumulator growth is equivalent — the length delta is literal-vs-indexed encoding of the same header names, not a table-state divergence. Not a conformance difference. |
+| E.3 | SETTINGS | **Our advertised ids are all within the peer-accepted set.** We send all six RFC 7540 ids (`SettingHeaderTableSize`=1, `EnablePush`=2, `MaxConcurrentStreams`=3, `InitialWindowSize`=4, `MaxFrameSize`=5, `MaxHeaderListSize`=6) per `TConnectionSettings.Defaults`/`Encode` — lengths 36 out vs nghttp's 18, consistent with nghttp omitting some. nghttpd accepts them: it replies with a normal SETTINGS (len 12) whose values we applied without error, and the request then completes 200/38. No `SETTINGS` id we send is unknown to nghttp2 1.70.0. |
+
+Note: `--trace-frames` is a probe-only diagnostic (`TFrameTraceObserver` in
+`test/h2probe.pas`); it is not part of the shipped client API.
 
 ## Report (written to this file)
 
