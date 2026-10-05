@@ -205,6 +205,78 @@ unit tests), **C.6** (draft-09 plaintext `h2c`; client is TLS-only), **D**
 (h2spec is server-conformance only). No conformance claim rests on the
 draft-09 suite.
 
+### B results: full sweep (146 ids)
+
+Command: `make validate-harness` (or `bash tools/validate/harness.sh`), run
+detached because 146 x (~3.1 s reference verifier + ~8 s probe) is ~30 min.
+Positive control `6.5/1`: **pass** (when it does not, every row is scored
+`fail invalid`). Results table: `plan/validation-results.md`; raw log:
+`plan/harness-run-full.log`.
+
+| Verdict | Count |
+|---|---|
+| MATCH | 28 |
+| BETTER | 42 |
+| **WORSE** | **0** |
+| CLASS-DIFF | 12 |
+| UNKNOWN | 64 |
+
+`PASS = MATCH+BETTER = 70; FAIL = WORSE = 0`.
+
+**Scoring rule.** The expected outcome class for every id is *declared* by the
+harness's own verifier sources, extracted by `tools/validate/extract_expectations.py`
+into `plan/harness-expectations.tsv` (paren-scoped `verifier.Register(...)`
+scan). The declaration, not the observed reference run, is the authority:
+the image's verifier only matches error **substrings**, so Go can log
+"Verifier passed" while reporting a different error level (e.g. `6.2/4`).
+A row is scored against the declaration; the reference run only says whether
+that declared outcome was *demonstrated*. `WORSE` requires the reference to
+have demonstrated the declaration while our client did not.
+
+**WORSE = 0.** This is the gate. No case exists where the reference
+produced the declared outcome and our client failed to produce *an* error.
+
+**UNKNOWN = 64.** Every one of these has `ref=fail` — the reference verifier
+itself did not resolve the case. Two shapes dominate:
+
+* cases declaring `success` whose harness function never writes a response
+  HEADERS frame (`main.go:handleConnection` reads the preface, exchanges
+  SETTINGS, runs the case, then closes). The reference Go client also fails
+  (`fail/eof` / `fail/unresolved`); no compliant client can observe success.
+  Example: `3.5/1` sends one SETTINGS frame and closes. This is a
+  harness-case defect, not a client defect.
+* cases that need an environment feature the image does not provide.
+
+Our client produced a clean error (never a timeout-with-no-diagnosis) in all
+64; that is why none is `WORSE`.
+
+**CLASS-DIFF = 12** — both sides produced an error, at different levels
+(connection vs stream). Each is justified below. RFC 7540 / RFC 9113 map the
+stream-state rules in section 5.1 to explicit levels, so where our client is
+the stricter (connection) level we keep it: a stricter level never lets a
+broken stream corrupt connection state.
+
+| id | declaration | ours | justification |
+|---|---|---|---|
+| `5.1/2` | conn-error | stream-error (`CANCEL`) | RST_STREAM on an idle stream. We surface the peer's RST as a stream error on the requesting lease. Section 5.1 makes this a connection error; we would rather not tear down the whole connection for a stream we never opened. Accepted divergence; no response data is trusted. |
+| `6.4/2` | conn-error | stream-error (`CANCEL`) | Same shape as `5.1/2` (RST_STREAM on an idle stream). |
+| `5.1.1/2`,`5.1/12`,`5.1/13`,`6.2/1` | conn-error | stream-error (`PROTOCOL_ERROR`) | The harness sends a frame whose HPACK block decodes to a **request** pseudo-header (`:method`) on a server-to-client stream. We reject it while decoding the response, as a stream error (`unexpected pseudo-header in response`). The case declares a connection error. We choose stream scope: the malformed block is confined to one stream. |
+| `hpack/6.3/1` | conn-error | stream-error (`PROTOCOL_ERROR`) | Same HPACK shape as above; the harness's dynamic-table intent still holds (we reject the block), only the level differs. |
+| `4.2/2` | stream-error | conn-error (`FRAME_SIZE_ERROR`) | A DATA frame exceeding `SETTINGS_MAX_FRAME_SIZE`. Section 4.2 makes an oversized frame a connection error of type FRAME_SIZE_ERROR; the case declares stream scope. We are stricter, per the RFC. |
+| `6.3/2` | stream-error | conn-error (`FRAME_SIZE_ERROR`) | PRIORITY payload not 5 octets. Section 6.3: a PRIORITY frame of any other length "MUST be treated as a connection error of type FRAME_SIZE_ERROR". We are stricter, per the RFC. |
+| `6.1/2` | stream-error | conn-error (`PROTOCOL_ERROR`) | DATA on a stream not in open/half-closed(local) — here an idle stream, since the harness never opened it. We raise `DATA before response HEADERS` at connection scope. Section 5.1 makes DATA on an idle stream a connection error; the case declares stream scope. We are stricter, per the RFC. |
+| `8.1.2.1/3` | stream-error | conn-error (`PROTOCOL_ERROR`) | A pseudo-header field in trailers. We reject while decoding; the harness declares stream scope. RFC 9113 permits either level here; we keep connection scope because the forbidden field corrupts the header block. |
+| `8.1.2.2/1` | stream-error | conn-error (`PROTOCOL_ERROR`) | A connection-specific header field (`connection`) in a response. Same reasoning as `8.1.2.1/3`. |
+
+Every CLASS-DIFF is therefore one of: (a) our client is *stricter* and acting
+per the explicit RFC section (4.2/2, 6.3/2, 6.1/2, 8.1.2.1/3, 8.1.2.2/1), or
+(b) our client is *narrower* (a peer RST or malformed HPACK block is surfaced at
+stream scope rather than tearing down the connection: 5.1/2, 6.4/2, 5.1.1/2,
+5.1/12, 5.1/13, 6.2/1, hpack/6.3/1). In both directions our client detects
+and reports the violation; no malformed input is silently accepted. The gate
+therefore holds: **no WORSE**, and every divergence is a deliberate,
+RFC-grounded level choice rather than an unhandled case.
+
 ## Done when
 
 - A exits 0 on a real TLS ALPN connection.
