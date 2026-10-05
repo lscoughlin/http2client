@@ -32,7 +32,7 @@ change. Spec: [`../../doc/design/protocol.md`](../../doc/design/protocol.md)
 | ID | Description | Files touched | Deliverable | Acceptance | Depends on |
 |---|---|---|---|---|---|
 | 01.1 | Exception hierarchy | `src/Http2.Errors.pas` | `EHttpError` base + `EHttpConnectionError`, `EHttpProtocolError`, `EHttpStreamError`, `EHttpTimeout`, `EHttpConnectionClosed`, `EHttpTooManyRedirects`, `EHttpNotReplayable`; error codes enum | unit test raises/`is`-checks each | 00.4 |
-| 01.2 | Frame type + flag enums | `src/Http2.Frames.pas` | `TFrameType` = `ftData=$0..ftContinuation=$9`; `TFrameFlags` = set of `ffEndStream, ffEndHeaders, ffAck, ffPadded` | values asserted in test | 01.1 |
+| 01.2 | Frame type + flag enums | `src/Http2.Frames.pas` | `TFrameType` = `ftData=$0..ftContinuation=$9`; `TFrameFlags` = set of `ffEndStream, ffEndHeaders, ffAck, ffPadded, ffPriority` (wire bits: `$1,$4,$1,$8,$20`) | values asserted in test | 01.1 |
 | 01.3 | `TFrameHeader` | idem | `Length: 24-bit`, `FrameType`, `Flags`, `StreamId` (31-bit, `R` bit masked) | encode/decode round-trip | 01.2 |
 | 01.4 | Frame payload records | idem | DATA, HEADERS (+priority/padding), PRIORITY, RST_STREAM, SETTINGS (+ACK), PUSH_PROMISE, PING, GOAWAY, WINDOW_UPDATE, CONTINUATION | round-trip per type | 01.3 |
 | 01.5 | Frame read/write | idem | `ReadFrame(stream): TFrame`, `WriteFrame(stream, frame)`; enforce max frame size from `SETTINGS_MAX_FRAME_SIZE` | oversized inbound raises `EHttpProtocolError` | 01.4 |

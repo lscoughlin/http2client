@@ -5,14 +5,14 @@
   "status": "active",
   "autoContinue": true,
   "usage": {
-    "tokensUsed": 280812,
-    "activeSeconds": 40
+    "tokensUsed": 400477,
+    "activeSeconds": 199
   },
   "sisyphus": false,
   "createdAt": "2026-10-05T14:46:34.463Z",
-  "updatedAt": "2026-10-05T14:47:27.366Z",
+  "updatedAt": "2026-10-05T14:50:22.082Z",
   "activePath": ".pi/goals/active_goal_2026100516463446_muvd4vrz-nguxny.md",
-  "revision": 30,
+  "revision": 59,
   "scheduler": {
     "version": 1,
     "owner": "01a10c49-6455-75dd-a27f-500acef91d00",
@@ -35,8 +35,10 @@
       {
         "id": "task-s00",
         "title": "S00 — Toolchain, build, and harness bootstrap",
-        "status": "pending",
-        "verificationContract": "make and make test both exit 0; nghttpd --version and docker run --rm h2-test-harness --list demonstrated; vendored mormot revision recorded in plan/toolchain.md."
+        "status": "complete",
+        "verificationContract": "make and make test both exit 0; nghttpd --version and docker run --rm h2-test-harness --list demonstrated; vendored mormot revision recorded in plan/toolchain.md.",
+        "completedAt": "2026-10-05T14:47:33.155Z",
+        "evidence": "make + make test exit 0 (fpcunit 1 test, 0 errors/0 failures); nghttpd nghttp2/1.70.0 at /opt/homebrew/bin; docker run --rm h2-test-harness --list prints 146 case ids; mormot pinned @2ccea1a0e5d7be85b"
       },
       {
         "id": "task-s01",
@@ -114,7 +116,7 @@
     "blockCompletion": true,
     "proposedAt": "2026-10-05T14:46:31.581Z"
   },
-  "currentTaskId": "task-s00"
+  "currentTaskId": "task-s01"
 }
 
 # Goal Prompt
@@ -126,12 +128,12 @@ Implement the HTTP/2 client specified in doc/design/ and planned in plan/README.
 - Status: running
 - Auto-continue: on
 - Sisyphus mode: no
-- Time spent: 40s
-- Tokens used: 281K (280,812) tokens
+- Time spent: 3m19s
+- Tokens used: 400K (400,477) tokens
 ## Tasks
 
 <!-- blockCompletion: true -->
-- [ ] task-s00: S00 — Toolchain, build, and harness bootstrap — contract: make and make test both exit 0; nghttpd --version and docker run --rm h2-test-harness --list demonstrated; vendored mormot revision recorded in plan/toolchain.md.
+- [x] task-s00: S00 — Toolchain, build, and harness bootstrap — evidence: make + make test exit 0 (fpcunit 1 test, 0 errors/0 failures); nghttpd nghttp2/1.70.0 at /opt/homebrew/bin; docker run --rm h2-test-harness --list prints 146 case ids; mormot pinned @2ccea1a0e5d7be85b
 - [ ] task-s01: S01 — Error model and frame codec (Http2.Errors, Http2.Frames) — contract: Every frame type byte-round-trips; exception hierarchy matches doc/design/errors-redirects.md; make test green.
 - [ ] task-s02: S02 — Headers and header names (Http2.Headers) — contract: Header API complete; case-insensitivity and forbidden-header rejection tested; make test green.
 - [ ] task-s03: S03 — HPACK codec (Http2.Hpack) — contract: RFC 7541 Appendix C vectors pass byte-for-byte; malformed input is connection-fatal; make test green.

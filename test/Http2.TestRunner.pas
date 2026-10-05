@@ -12,7 +12,8 @@ implementation
 
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
-  SysUtils, fpcunit, testregistry, consoletestrunner;
+  SysUtils, fpcunit, testregistry, consoletestrunner,
+  Http2.Errors.Test, Http2.Frames.Test;
 
 type
   TTestProbe = class(TTestCase)

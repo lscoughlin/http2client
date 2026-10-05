@@ -33,7 +33,9 @@ type
     ftWindowUpdate   = $8,
     ftContinuation   = $9);
 
-  TFrameFlags = set of (ffEndStream, ffEndHeaders, ffAck, ffPadded);
+  // wire bit values collide across frame types: PADDED=$8, PRIORITY=$20,
+  // END_STREAM=ACK=$1, END_HEADERS=$4
+  TFrameFlags = set of (ffEndStream, ffEndHeaders, ffAck, ffPadded, ffPriority);
 
   TFrameHeader = record
     Length: LongWord;      // 24 bits on the wire
