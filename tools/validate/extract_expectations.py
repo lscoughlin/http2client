@@ -43,6 +43,36 @@ KINDS = {
 }
 
 
+def matching_paren(text: str, open_idx: int) -> int:
+    """Index of the ')' matching the '(' at open_idx, or -1.
+
+    Tracks nesting and skips string literals so an inline func literal's inner
+    parens do not terminate the call early.
+    """
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(open_idx, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
 def classify_body(body: str) -> str:
     """Map a verifier function body to the expectation it declares."""
     m = KIND.search(body)
@@ -63,11 +93,17 @@ def main() -> int:
     for path in files:
         text = path.read_text(encoding='utf-8', errors='replace')
         funcs = dict(FUNC.findall(text))
-        hits = list(REGISTER.finditer(text))
-        for i, m in enumerate(hits):
+        for m in REGISTER.finditer(text):
             tid = m.group(1)
-            end = hits[i + 1].start() if i + 1 < len(hits) else len(text)
-            window = text[m.end():end]
+            # Bound the registration to its own call: scanning to the NEXT
+            # Register marker would run past the end of the file for the last
+            # registration and pick up unrelated functions' Expect* calls.
+            rp = text.rindex('(', 0, m.end())
+            close = matching_paren(text, rp)
+            if close < 0:
+                unresolved.append((tid, 'unbalanced Register call'))
+                continue
+            window = text[m.end():close]
 
             kind = classify_body(window)
             if not kind:

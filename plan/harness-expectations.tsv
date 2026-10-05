@@ -1,11 +1,11 @@
 3.5/1	success
-3.5/2	success
+3.5/2	conn-error
 4.1/1	success
 4.1/2	success
 4.1/3	success
 4.2/1	success
 4.2/2	stream-error
-4.2/3	success
+4.2/3	conn-error
 5.1.1/1	conn-error
 5.1.1/2	conn-error
 5.1.2/1	stream-error
@@ -39,7 +39,7 @@
 6.2/3	conn-error
 6.2/4	conn-error
 6.3/1	conn-error
-6.3/2	conn-error
+6.3/2	stream-error
 6.4/1	conn-error
 6.4/2	conn-error
 6.4/3	conn-error
@@ -59,7 +59,7 @@
 6.8/1	conn-error
 6.9.1/1	success
 6.9.1/2	conn-error
-6.9.1/3	success
+6.9.1/3	stream-error
 6.9.2/3	conn-error
 6.9/1	conn-error
 6.9/2	stream-error
@@ -143,4 +143,4 @@ http2/4.3/1	success
 http2/5.5/1	success
 http2/7/1	success
 http2/8.1.2.4/1	conn-error
-http2/8.1.2.5/1	success
+http2/8.1.2.5/1	conn-error
