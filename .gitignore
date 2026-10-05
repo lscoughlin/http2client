@@ -5,7 +5,14 @@
 *.compiled
 bin/
 lib/
-# Local secrets of no interest
+# Lazarus package build outputs (the generated registration unit is derived
+# from http2client.lpk, which is the authoritative source)
+*.compiled
+*.lrs
+backup/
+http2client.pas
+http2client.pas.bak
+packagefiles.xml
 .DS_Store
 # Vendored third-party: keep, but ignore build outputs within
 third_party/**/*.o

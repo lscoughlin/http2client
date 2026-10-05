@@ -97,6 +97,63 @@ docker run --rm h2-test-harness --list   # lists the case ids
 - Cite versions exactly as in the table when a story's acceptance depends on
   them.
 
+## Lazarus package
+
+The repo ships `http2client.lpk` so the library is usable from the Lazarus
+IDE as a design-time package.
+
+| Fact | Value |
+|---|---|
+| Package name / type | `http2client`, `RunAndDesignTime`, `Version 0.1.0` |
+| Units | all 11 in `src/`, `Http2.pas` (umbrella) first |
+| `OtherUnitFiles` | `src` + the four vendored mormot dirs (`core`, `lib`, `net`, `crypt`) |
+| `RequiredPkgs` | `FCL` **only** — deliberately **not** the IDE `mormot2` package (see below) |
+| Unit output | `lib/$(TargetCPU)-$(TargetOS)` (gitignored) |
+| Syntax mode | Delphi (`{$mode delphi}` is set per-unit anyway) |
+| Generated file | `http2client.pas` (auto-created registration unit) — **derived from the `.lpk`, gitignored** |
+
+Build:
+
+```sh
+lazbuild http2client.lpk
+```
+
+**Why the IDE `mormot2` package is not a dependency.** Declaring
+`<PackageName Value="mormot2"/>` makes `lazbuild` fail with
+`TLazPackageGraph.AddPackage failed to open: Package: http2client 0.0 uses
+mormot2` until the IDE has the `mormot2` package linked/installed, and
+mormot's own `.lpk` forces defines (`FPCMM_REPORTMEMORYLEAKS`,
+`FPCMM_SERVER`, …) that our Makefile build does not use. Putting the four
+mormot source dirs on `OtherUnitFiles` instead makes the package compile
+self-contained from within the repo, with no IDE package state.
+
+**Environment quirk (this machine).** The checked-out Lazarus 4.2
+(`/Users/liamcoughlin/Downloads/lazarus`) was built against a different FPC
+than the system `fpc 3.2.4`, so its prebuilt
+`packager/units/aarch64-darwin/lazaruspackageintf.ppu` trips
+`(10028) Recompiling LazarusPackageIntf, checksum changed for system.ppu`
+and then `(10022) Can't find unit LazarusPackageIntf`. Workaround: compile
+that unit from source against 3.2.4 into a scratch dir and pass it to
+`lazbuild`:
+
+```sh
+L=/Users/liamcoughlin/Downloads/lazarus
+F=/usr/local/lib/fpc/3.2.4/units/aarch64-darwin
+mkdir -p /tmp/lpkintf
+fpc -Mobjfpc -Fu$L/packager/registration -Fu$L/components/buildintf \
+    -Fu$L/designer -Fu$L/ideintf \
+    -Fu$F/rtl -Fu$F/fcl-base -Fu$F/fcl-net -Fu$F/rtl-generics \
+    -Fu$F/fcl-process -Fu$F/paszlib -Fu$F/hash \
+    -FU/tmp/lpkintf -FE/tmp/lpkintf \
+    $L/packager/registration/lazaruspackageintf.pas
+lazbuild --opt=-Fu/tmp/lpkintf \
+         --opt=-Fu$L/packager/registration http2client.lpk
+```
+
+Verified: `79371 lines compiled`, all 11 units produced `.ppu`/`.o` in
+`lib/aarch64-darwin/`. A stock Lazarus matched to its FPC would not need the
+`--opt` workaround.
+
 ## Prerequisites for a fresh clone (expanded)
 
 The pinned checkouts under `third_party/` are **not** committed (see
