@@ -100,11 +100,23 @@ type
     constructor Create(AConn: TConnection);
   end;
 
+  /// the seam S08's stream lease registers with, so a dying connection can
+  /// terminate every in-flight stream exactly once
+  IConnectionStream = interface
+    /// the connection failed: terminate any pending read/write with this error
+    procedure OnConnectionFailed(const AMessage: string;
+      const ACode: THttp2ErrorCode);
+    /// the peer sent GOAWAY: streams above ALastStreamId are retryable
+    procedure OnConnectionGoAway(const ALastStreamId: LongWord);
+  end;
+
   /// the minimal connection object S06/S07 need: state, the two frame queues,
   /// the socket, and the thread. S08 extends it with stream leases.
   TConnection = class
   private
     FLock: TCriticalSection;
+
+    FStreams: TDictionary<LongWord, IConnectionStream>;
     FStateEvent: PRTLEvent;
     FSocket: IHttp2Socket;
     FOutbound: IBlockingQueue<TFrame>;
@@ -156,6 +168,13 @@ type
     procedure MarkSettingsAcked;
     /// update the idle clock used by the PING keep-alive schedule
     procedure TouchActivity;
+    /// register a stream lease for connection-failure fan-out
+    procedure RegisterStream(const AStreamId: LongWord;
+      const AStream: IConnectionStream);
+    /// remove a stream lease (idempotent); call exactly once per stream
+    procedure UnregisterStream(const AStreamId: LongWord);
+    /// number of in-flight stream leases (test seam)
+    function StreamCount: Integer;
 
     property State: TConnectionState read GetState;
     property PeerSettings: TConnectionSettings read GetPeerSettings;
@@ -614,11 +633,13 @@ begin
   FPingIntervalMs := 0;
   FPingTimeoutMs := 0;
   FLastActivity := GetTickCount64;
+  FStreams := TDictionary<LongWord, IConnectionStream>.Create;
 end;
 
 destructor TConnection.Destroy;
 begin
   Close;
+  FreeAndNil(FStreams);
   RTLEventDestroy(FStateEvent);
   FLock.Free;
   inherited Destroy;
@@ -746,16 +767,81 @@ begin
 end;
 
 procedure TConnection.MarkGoAway(const ALastStreamId: LongWord);
+var
+  Snapshot: TArray<IConnectionStream>;
+  S: IConnectionStream;
 begin
   FLock.Acquire;
   try
     FGoAwayLastStreamId := ALastStreamId;
     if FState = csOpen then
       FState := csGoAway;
+    Snapshot := FStreams.Values.ToArray;
   finally
     FLock.Release;
   end;
   RTLEventSetEvent(FStateEvent);
+  // notify OUTSIDE the lock: a lease must never call back into TConnection
+  // (RegisterStream/UnregisterStream) while we hold FLock, or it deadlocks
+  for S in Snapshot do
+    S.OnConnectionGoAway(ALastStreamId);
+end;
+
+procedure TConnection.RegisterStream(const AStreamId: LongWord;
+  const AStream: IConnectionStream);
+begin
+  FLock.Acquire;
+  try
+    FStreams.AddOrSetValue(AStreamId, AStream);
+  finally
+    FLock.Release;
+  end;
+end;
+
+procedure TConnection.UnregisterStream(const AStreamId: LongWord);
+begin
+  FLock.Acquire;
+  try
+    FStreams.Remove(AStreamId);
+  finally
+    FLock.Release;
+  end;
+end;
+
+function TConnection.StreamCount: Integer;
+begin
+  FLock.Acquire;
+  try
+    Result := FStreams.Count;
+  finally
+    FLock.Release;
+  end;
+end;
+
+procedure TConnection.FailWith(const AMessage: string;
+  const ACode: THttp2ErrorCode);
+var
+  Snapshot: TArray<IConnectionStream>;
+  S: IConnectionStream;
+begin
+  FLock.Acquire;
+  try
+    if FState <> csClosed then
+    begin
+      FState := csClosed;
+      FError := AMessage;
+      FErrorCode := ACode;
+    end;
+    Snapshot := FStreams.Values.ToArray;
+  finally
+    FLock.Release;
+  end;
+  RTLEventSetEvent(FStateEvent);
+  // fail every in-flight stream and release every blocked waiter
+  FOutbound.Shutdown;
+  FInbound.Shutdown;
+  for S in Snapshot do
+    S.OnConnectionFailed(AMessage, ACode);
 end;
 
 procedure TConnection.TouchActivity;
@@ -766,26 +852,6 @@ begin
   finally
     FLock.Release;
   end;
-end;
-
-procedure TConnection.FailWith(const AMessage: string;
-  const ACode: THttp2ErrorCode);
-begin
-  FLock.Acquire;
-  try
-    if FState <> csClosed then
-    begin
-      FState := csClosed;
-      FError := AMessage;
-      FErrorCode := ACode;
-    end;
-  finally
-    FLock.Release;
-  end;
-  RTLEventSetEvent(FStateEvent);
-  // fail every in-flight stream and release every blocked waiter
-  FOutbound.Shutdown;
-  FInbound.Shutdown;
 end;
 
 end.
