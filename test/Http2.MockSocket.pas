@@ -304,6 +304,9 @@ published
   procedure TestScenarioGoAway;
   procedure TestScenarioRstStream;
   procedure TestScenarioZeroWindowStallsBodyRead;
+  /// regression: received DATA must return window credit to the peer, else a
+  /// body larger than the initial window stalls (interop A.7)
+  procedure TestScenarioLargeBodyEmitsWindowUpdate;
   procedure TestScenarioMalformedFrameClosesConnection;
   /// the contractual one: the PUBLIC Send path over the mock socket
   procedure TestScenarioFullSendPathOverMockSocket;
@@ -1642,6 +1645,77 @@ begin
       // connection
       Lease.ReleaseLease;
       Sock.UnstallReads;
+      IL := nil;
+    end;
+  finally
+    Alloc.Free;
+    Server.Free;
+    Conn.Free;
+  end;
+end;
+
+procedure TScriptedScenarioTest.TestScenarioLargeBodyEmitsWindowUpdate;
+var
+  Sock: TMockSocket;
+  Conn: TConnection;
+  Server: TScriptedServer;
+  Alloc: TStreamIdAllocator;
+  Lease: TStreamLease;
+  IL: IConnectionStream;
+  Req: TStreamRequest;
+  Frames: TArray<TFrame>;
+  I, N, Ofs: Integer;
+  Body: TBytes;
+  Conns, Streams: Boolean;
+begin
+  Sock := TMockSocket.Create;
+  Conn := TConnection.Create(Sock);
+  Server := TScriptedServer.Create(Sock);
+  Alloc := TStreamIdAllocator.Create;
+  try
+    Conn.Start;
+    AssertTrue('connection opens', Conn.WaitForState(csOpen, 2000));
+    Server.SendSettings(TConnectionSettings.Defaults);
+    Req := TStreamRequest.WithMethod(hmGet, 'api.example:443').WithPath('/');
+    StartLease(Conn, Alloc, Req, Lease, IL);
+    try
+      // a body well past cWindowUpdateBatchSize (32768) forces the client to
+      // replenish the consumed window; without the wiring the peer would
+      // stall and the read would time out (interop A.7). The body is split
+      // into frames no larger than the default SETTINGS_MAX_FRAME_SIZE.
+      SetLength(Body, 100000);
+      FillChar(Body[0], Length(Body), Ord('x'));
+      Server.SendHeaders(1, '200', False);
+      Ofs := 0;
+      while Ofs < Length(Body) do
+      begin
+        N := Length(Body) - Ofs;
+        if N > 16000 then
+          N := 16000;
+        Sock.EnqueueData(1, Copy(Body, Ofs, N),
+          Ofs + N >= Length(Body));
+        Inc(Ofs, N);
+      end;
+      AssertTrue('response headers received',
+        Lease.WaitForResponseHeader(2000));
+      AssertEquals('status 200', 200, Lease.StatusCode);
+      AssertEquals('full body read', 100000,
+        Length(ReadAllBodyBytes(Lease.Body)));
+      AssertTrue('body complete', Lease.Body.Eof);
+      Frames := Sock.OutboundFrames(True);
+      Conns := False;
+      Streams := False;
+      for I := 0 to Length(Frames) - 1 do
+        if Frames[I].Header.FrameType = ftWindowUpdate then
+        begin
+          if Frames[I].Header.StreamId = 0 then
+            Conns := True;
+          if Frames[I].Header.StreamId = 1 then
+            Streams := True;
+        end;
+      AssertTrue('a connection-level WINDOW_UPDATE was emitted', Conns);
+      AssertTrue('a stream-level WINDOW_UPDATE was emitted', Streams);
+    finally
       IL := nil;
     end;
   finally
