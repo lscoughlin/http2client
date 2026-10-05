@@ -17,9 +17,15 @@ interface
 
 uses
   SysUtils, Classes, SyncObjs, Generics.Collections,
-  Http2.Errors, Http2.Frames, Http2.Tls, Http2.Observer;
+  Http2.Errors, Http2.Frames, Http2.Tls, Http2.Observer, Http2.FlowControl;
 
 const
+  /// connection-level receive window we advertise (RFC 7540 section 6.9.2)
+  cDefaultConnectionWindowSize = 65535;
+  /// per-stream receive window we advertise
+  cDefaultStreamWindowSize = 65535;
+  /// emit a WINDOW_UPDATE once this many bytes have accrued (half the window)
+  cWindowUpdateBatchSize = 32768;
   /// default bound on either frame queue (backpressure instead of growth)
   cDefaultQueueCapacity = 128;
   /// how long a socket read blocks before the thread re-checks outbound work
@@ -141,6 +147,11 @@ type
     FLastActivity: QWord;
     FObserver: IHttp2Observer;
     FCloseObserved: Boolean;
+    FFlowControl: TFlowControl;
+    /// per-stream bytes received since the last stream WINDOW_UPDATE
+    FPendingStreamCredit: TDictionary<LongWord, LongWord>;
+    /// connection bytes received since the last connection WINDOW_UPDATE
+    FPendingConnCredit: LongWord;
     function GetState: TConnectionState;
     function GetPeerSettings: TConnectionSettings;
     procedure SetState(const AValue: TConnectionState);
@@ -161,6 +172,13 @@ type
     procedure EmitWindowUpdate(const AStreamId, AIncrement: LongWord);
     procedure EmitRetry(const AStreamId: LongWord);
     procedure EmitDiscarded(const AFrame: TFrame; const AReason: string);
+    /// account for received DATA and return window credit to the peer when
+    /// enough has accrued (RFC 7540 section 6.9). Called for every inbound
+    /// DATA frame, stream-scoped or not.
+    procedure TrackReceivedData(const AStreamId: LongWord;
+      const ALength: LongWord);
+    /// emit any still-pending WINDOW_UPDATEs (e.g. when a stream ends)
+    procedure FlushStreamCredit(const AStreamId: LongWord);
   public
     constructor Create(const ASocket: IHttp2Socket); overload;
     constructor Create(const ASocket: IHttp2Socket;
@@ -173,6 +191,10 @@ type
     procedure Close;
     /// enqueue a frame for the thread to write; False once closed
     function PostFrame(const AFrame: TFrame): Boolean;
+    /// connection + per-stream flow-control state (plan S04/S10 seam)
+    property FlowControl: TFlowControl read FFlowControl;
+    /// emit a WINDOW_UPDATE for AStreamId now, returning any pending credit
+    procedure SendWindowUpdate(const AStreamId: LongWord);
     /// may a new stream still be opened on this connection?
     function CanOpenStream: Boolean;
     /// RFC 7540 section 6.8: after GOAWAY, a stream with an id strictly above
@@ -597,6 +619,12 @@ begin
     else if AFrame.Header.StreamId = 0 then
       TConnection(FConn).EmitDiscarded(AFrame,
         FrameTypeName(AFrame.Header.FrameType) + ' arrived on stream 0');
+    // account for received DATA and return window credit to the peer; this
+    // must happen for connection-level DATA (stream 0) as well as the
+    // stream-scoped case, else a large response stalls on the peer's window
+    if AFrame.Header.FrameType = ftData then
+      TConnection(FConn).TrackReceivedData(AFrame.Header.StreamId,
+        AFrame.DataLength);
     // route stream-scoped frames to their owning lease; anything unclaimed
     // (no lease registered yet) stays on the shared inbound queue
     if AFrame.Header.StreamId <> 0 then
@@ -697,12 +725,18 @@ begin
   FLastActivity := GetTickCount64;
   FObserver := nil;
   FCloseObserved := False;
+  FFlowControl := TFlowControl.Create(cDefaultConnectionWindowSize,
+    cDefaultStreamWindowSize);
+  FPendingStreamCredit := TDictionary<LongWord, LongWord>.Create;
+  FPendingConnCredit := 0;
   FStreams := TDictionary<LongWord, IConnectionStream>.Create;
 end;
 
 destructor TConnection.Destroy;
 begin
   Close;
+  FreeAndNil(FPendingStreamCredit);
+  FreeAndNil(FFlowControl);
   FreeAndNil(FStreams);
   RTLEventDestroy(FStateEvent);
   FLock.Free;
@@ -829,10 +863,16 @@ end;
 
 procedure TConnection.ApplyPeerSettingsValue(
   const ASettings: TConnectionSettings);
+var
+  Delta: Int64;
 begin
   FLock.Acquire;
   try
+    // a SETTINGS_INITIAL_WINDOW_SIZE change adjusts every open stream window
+    Delta := ASettings.InitialWindowSize - FPeerSettings.InitialWindowSize;
     FPeerSettings := ASettings;
+    if Delta <> 0 then
+      FFlowControl.ApplyInitialWindowDelta(Delta);
   finally
     FLock.Release;
   end;
@@ -866,6 +906,7 @@ begin
   FLock.Acquire;
   try
     FStreams.AddOrSetValue(AStreamId, AStream);
+    FFlowControl.OpenStream(AStreamId);
   finally
     FLock.Release;
   end;
@@ -874,9 +915,13 @@ end;
 
 procedure TConnection.UnregisterStream(const AStreamId: LongWord);
 begin
+  // return the stream's outstanding receive credit before it disappears
+  SendWindowUpdate(AStreamId);
   FLock.Acquire;
   try
     FStreams.Remove(AStreamId);
+    FFlowControl.CloseStream(AStreamId);
+    FPendingStreamCredit.Remove(AStreamId);
   finally
     FLock.Release;
   end;
@@ -943,6 +988,83 @@ begin
   finally
     FLock.Release;
   end;
+end;
+
+procedure TConnection.TrackReceivedData(const AStreamId: LongWord;
+  const ALength: LongWord);
+var
+  Pending: LongWord;
+  StreamId: LongWord;
+  Win: TWindow;
+  EmitConn, EmitStream: Boolean;
+  EmitConnInc, EmitStreamInc: LongWord;
+begin
+  if ALength = 0 then
+    Exit;
+  EmitConn := False;
+  EmitStream := False;
+  StreamId := AStreamId;
+  EmitConnInc := 0;
+  EmitStreamInc := 0;
+  FLock.Acquire;
+  try
+    // connection window: DATA counts against it regardless of the stream
+    FPendingConnCredit := FPendingConnCredit + ALength;
+    if FPendingConnCredit >= cWindowUpdateBatchSize then
+    begin
+      FPendingConnCredit := 0;
+      EmitConnInc := cWindowUpdateBatchSize;
+    end;
+    // stream window: only for a stream we still track (an open lease)
+    if (StreamId <> 0) and FFlowControl.TryGetStream(StreamId, Win) then
+    begin
+      if not FPendingStreamCredit.TryGetValue(StreamId, Pending) then
+        Pending := 0;
+      Pending := Pending + ALength;
+      if Pending >= cWindowUpdateBatchSize then
+      begin
+        FPendingStreamCredit.AddOrSetValue(StreamId, 0);
+        EmitStreamInc := Pending;
+      end
+      else
+        FPendingStreamCredit.AddOrSetValue(StreamId, Pending);
+    end;
+  finally
+    FLock.Release;
+  end;
+  if EmitConnInc > 0 then
+  begin
+    PostFrame(BuildWindowUpdateFrame(0, EmitConnInc));
+    EmitWindowUpdate(0, EmitConnInc);
+  end;
+  if EmitStreamInc > 0 then
+  begin
+    PostFrame(BuildWindowUpdateFrame(StreamId, EmitStreamInc));
+    EmitWindowUpdate(StreamId, EmitStreamInc);
+  end;
+end;
+
+procedure TConnection.SendWindowUpdate(const AStreamId: LongWord);
+var
+  Pending: LongWord;
+begin
+  FLock.Acquire;
+  try
+    if not FPendingStreamCredit.TryGetValue(AStreamId, Pending) then
+      Exit;
+    if Pending = 0 then
+      Exit;
+    FPendingStreamCredit.AddOrSetValue(AStreamId, 0);
+  finally
+    FLock.Release;
+  end;
+  PostFrame(BuildWindowUpdateFrame(AStreamId, Pending));
+  EmitWindowUpdate(AStreamId, Pending);
+end;
+
+procedure TConnection.FlushStreamCredit(const AStreamId: LongWord);
+begin
+  SendWindowUpdate(AStreamId);
 end;
 
 { observer fan-out }

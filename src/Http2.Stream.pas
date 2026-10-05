@@ -881,7 +881,15 @@ begin
       Exit(False);
     Remaining := Integer(Deadline - GetTickCount64);
     if not PopInbound(Frame, Remaining) then
+    begin
+      // the queue can shut down because the stream failed (RST_STREAM,
+      // GOAWAY, connection loss) rather than because the deadline expired;
+      // surface that cause instead of masking it as a timeout, else the
+      // caller's transparent-retry path never sees the stream error
+      if FFailed then
+        raise MakeStreamError;
       Exit(False);
+    end;
     HandleInboundFrame(Frame);
   end;
   if FFailed then

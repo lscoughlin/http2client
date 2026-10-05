@@ -18,7 +18,8 @@ uses
   Http2.ConnectionThread.Test, Http2.ConnectionLifecycle.Test,
   Http2.Stream.Test, Http2.Client.Test, Http2.Request.Test,
   Http2.Redirects.Test, Http2.Timeouts.Test,
-  Http2.MockSocket, Http2.HpackProps.Test, Http2.Concurrency.Test;
+  Http2.MockSocket, Http2.HpackProps.Test, Http2.Concurrency.Test,
+  Http2.ProbeOutcome.Test;
 
 type
   TTestProbe = class(TTestCase)
