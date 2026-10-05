@@ -24,15 +24,22 @@ type
     FLastMessage: string;
     FLastCode: THttp2ErrorCode;
     FLastGoAwayId: LongWord;
+    FFrameCount: Integer;
+    FLastFrameType: TFrameType;
+    FLastFrameStreamId: LongWord;
   public
     procedure OnConnectionFailed(const AMessage: string;
       const ACode: THttp2ErrorCode);
     procedure OnConnectionGoAway(const ALastStreamId: LongWord);
+    procedure OnStreamFrame(const AFrame: TFrame);
     property FailCount: Integer read FFailCount;
     property GoAwayCount: Integer read FGoAwayCount;
     property LastMessage: string read FLastMessage;
     property LastCode: THttp2ErrorCode read FLastCode;
     property LastGoAwayId: LongWord read FLastGoAwayId;
+    property FrameCount: Integer read FFrameCount;
+    property LastFrameType: TFrameType read FLastFrameType;
+    property LastFrameStreamId: LongWord read FLastFrameStreamId;
   end;
 
   TConnectionLifecycleTest = class(TTestCase)
@@ -63,6 +70,13 @@ procedure TRecordingLease.OnConnectionGoAway(const ALastStreamId: LongWord);
 begin
   Inc(FGoAwayCount);
   FLastGoAwayId := ALastStreamId;
+end;
+
+procedure TRecordingLease.OnStreamFrame(const AFrame: TFrame);
+begin
+  Inc(FFrameCount);
+  FLastFrameType := AFrame.Header.FrameType;
+  FLastFrameStreamId := AFrame.Header.StreamId;
 end;
 
 { TConnectionLifecycleTest }

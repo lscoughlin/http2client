@@ -108,6 +108,8 @@ type
       const ACode: THttp2ErrorCode);
     /// the peer sent GOAWAY: streams above ALastStreamId are retryable
     procedure OnConnectionGoAway(const ALastStreamId: LongWord);
+    /// a frame addressed to this stream arrived from the peer
+    procedure OnStreamFrame(const AFrame: TFrame);
   end;
 
   /// the minimal connection object S06/S07 need: state, the two frame queues,
@@ -175,6 +177,9 @@ type
     procedure UnregisterStream(const AStreamId: LongWord);
     /// number of in-flight stream leases (test seam)
     function StreamCount: Integer;
+    /// hand a stream-scoped frame to its lease; False when nobody owns it
+    /// (the frame is then left on the shared inbound queue)
+    function DispatchStreamFrame(const AFrame: TFrame): Boolean;
 
     property State: TConnectionState read GetState;
     property PeerSettings: TConnectionSettings read GetPeerSettings;
@@ -542,10 +547,13 @@ begin
         TConnection(FConn).MarkGoAway(LastStreamId);
       end;
   else
-    // route stream-scoped frames to the inbound queue; stream-0 frames of a
-    // type we do not track are ignored for now
+    // route stream-scoped frames to their owning lease; anything unclaimed
+    // (no lease registered yet) stays on the shared inbound queue
     if AFrame.Header.StreamId <> 0 then
-      FInbound.Push(AFrame);
+    begin
+      if not TConnection(FConn).DispatchStreamFrame(AFrame) then
+        FInbound.Push(AFrame);
+    end;
   end;
 end;
 
@@ -816,6 +824,21 @@ begin
   finally
     FLock.Release;
   end;
+end;
+
+function TConnection.DispatchStreamFrame(const AFrame: TFrame): Boolean;
+var
+  S: IConnectionStream;
+begin
+  FLock.Acquire;
+  try
+    Result := FStreams.TryGetValue(AFrame.Header.StreamId, S);
+  finally
+    FLock.Release;
+  end;
+  // deliver OUTSIDE the lock: a lease callback must never re-enter FLock
+  if Result then
+    S.OnStreamFrame(AFrame);
 end;
 
 procedure TConnection.FailWith(const AMessage: string;
