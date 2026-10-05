@@ -8,7 +8,7 @@ tags:
   - http2client
   - plan
   - validation
-status: done
+status: validated
 up: "[[http2client]]"
 depends-on:
   - "10-redirects-timeouts"
