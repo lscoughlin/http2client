@@ -99,6 +99,10 @@ type
     /// a frame header whose declared length exceeds any legal
     /// SETTINGS_MAX_FRAME_SIZE, so ReadFrame raises EHttpProtocolError
     procedure EnqueueOversizedFrameHeader;
+    /// a PUSH_PROMISE frame addressed to AStreamId promising APromisedId;
+    /// since we advertise ENABLE_PUSH = 0 the peer must not send this
+    procedure EnqueuePushPromise(const AStreamId, APromisedId: LongWord;
+      const ABlock: TBytes);
 
     /// behave like a scripted server: answer each request HEADERS with a
     /// `:status` (+ body) response. Pass AEndStream=False to answer with
@@ -203,6 +207,9 @@ public
   procedure ScenarioZeroWindow(const AStreamId: LongWord);
   // an oversized frame header, so the connection must fail the read
   procedure ScenarioMalformedFrame;
+  /// send PUSH_PROMISE even though the client disabled push (case 8.2/1)
+  procedure ScenarioPushPromise(const AStreamId,
+    APromisedId: LongWord);
 end;
 
 /// a worker that performs exactly one Read on a socket
@@ -308,6 +315,9 @@ published
   /// body larger than the initial window stalls (interop A.7)
   procedure TestScenarioLargeBodyEmitsWindowUpdate;
   procedure TestScenarioMalformedFrameClosesConnection;
+  /// RFC 9113 section 6.6: we advertise ENABLE_PUSH = 0, so a PUSH_PROMISE
+  /// from the peer is a connection PROTOCOL_ERROR (harness case 8.2/1)
+  procedure TestScenarioPushPromiseRejected;
   /// the contractual one: the PUBLIC Send path over the mock socket
   procedure TestScenarioFullSendPathOverMockSocket;
 end;
@@ -589,6 +599,24 @@ begin
   Hdr[7] := 0;
   Hdr[8] := 0;
   Feed(Hdr);
+end;
+
+procedure TMockSocket.EnqueuePushPromise(const AStreamId,
+  APromisedId: LongWord; const ABlock: TBytes);
+var
+  Payload: TBytes;
+begin
+  // PUSH_PROMISE payload: R + promised-stream-id (4 bytes), then the header
+  // block fragment. We advertise ENABLE_PUSH = 0, so any such frame must be
+  // rejected as a connection PROTOCOL_ERROR (RFC 9113 section 6.6).
+  SetLength(Payload, 4 + Length(ABlock));
+  Payload[0] := (APromisedId shr 24) and $FF;
+  Payload[1] := (APromisedId shr 16) and $FF;
+  Payload[2] := (APromisedId shr 8) and $FF;
+  Payload[3] := APromisedId and $FF;
+  if Length(ABlock) > 0 then
+    Move(ABlock[0], Payload[4], Length(ABlock));
+  FeedFrame(TFrame.Create(ftPushPromise, [ffEndHeaders], AStreamId, Payload));
 end;
 
 procedure TMockSocket.AutoRespondToRequestHeaders(const AStatus: string;
@@ -1013,6 +1041,12 @@ end;
 procedure TScriptedServer.ScenarioMalformedFrame;
 begin
   FMock.EnqueueOversizedFrameHeader;
+end;
+
+procedure TScriptedServer.ScenarioPushPromise(const AStreamId,
+  APromisedId: LongWord);
+begin
+  FMock.EnqueuePushPromise(AStreamId, APromisedId, nil);
 end;
 
 { TObserverTestLease }
@@ -1741,6 +1775,31 @@ begin
     AssertTrue('the malformed frame closes the connection',
       Conn.WaitForState(csClosed, 2000));
     AssertEquals('a frame-size error was recorded', Ord(ecFrameSizeError),
+      Ord(Conn.ErrorCode));
+  finally
+    Server.Free;
+    Conn.Free;
+  end;
+end;
+
+procedure TScriptedScenarioTest.TestScenarioPushPromiseRejected;
+var
+  Sock: TMockSocket;
+  Conn: TConnection;
+  Server: TScriptedServer;
+begin
+  Sock := TMockSocket.Create;
+  Conn := TConnection.Create(Sock);
+  Server := TScriptedServer.Create(Sock);
+  try
+    AssertFalse('we advertise ENABLE_PUSH = 0',
+      TConnectionSettings.Defaults.EnablePush);
+    Conn.Start;
+    AssertTrue('connection opens', Conn.WaitForState(csOpen, 2000));
+    Server.ScenarioPushPromise(1, 3);
+    AssertTrue('the PUSH_PROMISE closes the connection',
+      Conn.WaitForState(csClosed, 2000));
+    AssertEquals('a protocol error was recorded', Ord(ecProtocolError),
       Ord(Conn.ErrorCode));
   finally
     Server.Free;

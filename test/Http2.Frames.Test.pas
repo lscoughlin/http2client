@@ -56,6 +56,10 @@ type
     procedure TestSettingsUnknownIdIgnored;
     procedure TestSettingsEnablePushValidation;
     procedure TestSettingsMaxFrameSizeValidation;
+    // a client implements no pushed-stream state, so its default SETTINGS
+    // must advertise ENABLE_PUSH = 0 (RFC 9113 section 6.6); advertising 1
+    // while ignoring PUSH_PROMISE is the harness case 8.2/1 bug
+    procedure TestDefaultsDisablePush;
   end;
 
 implementation
@@ -629,6 +633,20 @@ begin
     on E: EHttpProtocolError do
       ; // expected
   end;
+end;
+
+procedure TFramesTest.TestDefaultsDisablePush;
+var
+  S: TConnectionSettings;
+  Encoded: TBytes;
+begin
+  S := TConnectionSettings.Defaults;
+  AssertFalse('default advertises ENABLE_PUSH = 0', S.EnablePush);
+  // and the value really reaches the wire: entry 1 (id 2) must be zero
+  Encoded := S.Encode;
+  AssertEquals('ENABLE_PUSH id high', 0, Encoded[6]);
+  AssertEquals('ENABLE_PUSH id low', SettingEnablePush, Encoded[7]);
+  AssertEquals('ENABLE_PUSH value 0', 0, Encoded[11]);
 end;
 
 procedure TFramesTest.TestSettingsMaxFrameSizeValidation;

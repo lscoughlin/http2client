@@ -150,11 +150,23 @@ type
     FBodyPendingOfs: Integer;
     FBodyEof: Boolean;
     FBodyEofObserved: Boolean;
+    /// total DATA bytes received on this stream, compared against a declared
+    /// `content-length` at END_STREAM (RFC 7540 section 8.1.2.6)
+    FBodyReceived: Int64;
+    /// declared content-length, or -1 when the response did not send one
+    FExpectedLength: Int64;
 
     // failure / teardown
     FFailed: Boolean;
     FErrorMessage: string;
     FErrorCode: THttp2ErrorCode;
+    /// True when the failure came from the CONNECTION (FailWith / a
+    /// connection-level protocol violation), False when the stream alone
+    /// failed (RST_STREAM, GOAWAY above the stream id). Callers rely on the
+    /// distinction: a stream error leaves the connection usable, a
+    /// connection error does not, and the conformance harness scores them as
+    /// different outcomes.
+    FConnectionError: Boolean;
     FRstReceived: Boolean;
     FRstCode: THttp2ErrorCode;
     FFailCount: Integer;
@@ -166,7 +178,7 @@ type
     FTimeoutMs: Integer;
 
     function MaxFrameSize: LongWord;
-    function MakeStreamError: EHttpStreamError;
+    function MakeStreamError: EHttpError;
     procedure BuildRequestHeaderBlock(out ABlock: THeaderBlock);
     procedure EmitHeaderBlock(const ABlock: TBytes; const AEndStream: Boolean);
     procedure EmitData(const AData: TBytes; const AEndStream: Boolean);
@@ -450,6 +462,8 @@ begin
   FLocalState := lsIdle;
   FResponseState := rsIdle;
   FStatusCode := -1;
+  FBodyReceived := 0;
+  FExpectedLength := -1;
   FTimeoutMs := 30000;
   FGoAwayLastStreamId := MaxStreamId;
 end;
@@ -470,14 +484,17 @@ begin
     Result := DefaultMaxFrameSize;
 end;
 
-function TStreamLease.MakeStreamError: EHttpStreamError;
+function TStreamLease.MakeStreamError: EHttpError;
 var
   Msg: string;
 begin
   Msg := FErrorMessage;
   if Msg = '' then
     Msg := 'stream failed';
-  Result := EHttpStreamError.Create(Msg, FStreamId, FErrorCode);
+  if FConnectionError then
+    Result := EHttpConnectionError.Create(Msg, FErrorCode)
+  else
+    Result := EHttpStreamError.Create(Msg, FStreamId, FErrorCode);
 end;
 
 function TStreamLease.RequestIsBodyless: Boolean;
@@ -790,6 +807,7 @@ begin
   if not FHeadersDecoded then
   begin
     FStatusCode := -1;
+    FExpectedLength := -1;
     for I := 0 to High(Fields) do
     begin
       F := Fields[I];
@@ -797,35 +815,56 @@ begin
       begin
         St := StrToIntDef(F.Value, -1);
         if (St < 100) or (St > 599) then
-          raise EHttpProtocolError.Create('invalid :status value ' + F.Value,
-            ecProtocolError);
+          // RFC 7540 section 8.1.2.6: a malformed response is a STREAM error
+          // (the connection survives); the peer is told with RST_STREAM.
+          raise EHttpStreamError.Create('invalid :status value ' + F.Value,
+            FStreamId, ecProtocolError);
         FStatusCode := St;
       end
       else if (F.Name <> '') and (F.Name[1] = ':') then
-        raise EHttpProtocolError.Create(
-          'unexpected pseudo-header in response: ' + F.Name, ecProtocolError)
+        raise EHttpStreamError.Create(
+          'unexpected pseudo-header in response: ' + F.Name, FStreamId,
+          ecProtocolError)
       else
+      begin
+        if SameText(F.Name, 'content-length') then
+          FExpectedLength := StrToInt64Def(F.Value, -1);
         FResponseHeaders.Add(F.Name, F.Value);
+      end;
     end;
     if FStatusCode < 0 then
-      raise EHttpProtocolError.Create('response has no :status',
+      raise EHttpStreamError.Create('response has no :status', FStreamId,
         ecProtocolError);
     FHeadersDecoded := True;
-    // bodyless responses: 1xx, 204, 304 and every HEAD request
+    // bodyless responses: 1xx, 204, 304 and every HEAD request. A declared
+    // content-length on these describes the entity that a GET *would* return
+    // (RFC 9110 section 8.6), NOT the bytes transferred, so it must not be
+    // compared against the received DATA length.
     if RequestIsBodyless or ((FStatusCode >= 100) and (FStatusCode < 200)) or
        (FStatusCode = 204) or (FStatusCode = 304) then
-      MarkResponseComplete
+    begin
+      FExpectedLength := -1;
+      MarkResponseComplete;
+    end
     else
       FResponseState := rsBodyOpen;
   end  else
   begin
-    // trailers: regular headers only, never a second :status
+    // trailers: regular headers only, never a second :status, and the frame
+    // must END the stream. RFC 7540 section 8.1.2.6: a HEADERS frame (and its
+    // CONTINUATIONs) can only appear at the end of a stream, so one arriving
+    // without END_STREAM is a malformed response -> STREAM PROTOCOL_ERROR
+    // (the connection survives; harness case 8.1/1).
+    if not AEndStream then
+      raise EHttpStreamError.Create(
+        'trailing HEADERS without END_STREAM', FStreamId, ecProtocolError);
     for I := 0 to High(Fields) do
     begin
       F := Fields[I];
       if F.Name = ':status' then
-        raise EHttpProtocolError.Create(
-          'trailing HEADERS must not carry :status', ecProtocolError);
+        raise EHttpStreamError.Create(
+          'trailing HEADERS must not carry :status', FStreamId,
+          ecProtocolError);
       FResponseHeaders.Add(F.Name, F.Value);
     end;
   end;
@@ -840,6 +879,13 @@ procedure TStreamLease.MarkResponseComplete;
 begin
   FBodyEof := True;
   FResponseState := rsBodyComplete;
+  // RFC 7540 section 8.1.2.6: if the response declared a content-length, the
+  // DATA it actually sent must match. A mismatch is a malformed response ->
+  // STREAM PROTOCOL_ERROR (the connection survives; harness 8.1.2.6/1,2).
+  if (FExpectedLength >= 0) and (FBodyReceived <> FExpectedLength) then
+    raise EHttpStreamError.Create(
+      Format('content-length %d does not match %d received DATA bytes',
+        [FExpectedLength, FBodyReceived]), FStreamId, ecProtocolError);
   // RFC 7540 section 5.1: local half-closed + remote END_STREAM = closed
   if FLocalState = lsLocalHalfClosed then
     FLocalState := lsClosed;
@@ -854,6 +900,7 @@ begin
     raise EHttpProtocolError.Create('DATA after END_STREAM', ecProtocolError);
   FBodyPending := ExtractDataPayload(AFrame);
   FBodyPendingOfs := 0;
+  Inc(FBodyReceived, Length(FBodyPending));
   FResponseState := rsBodyOpen;
   if AFrame.IsEndStream then
   begin
@@ -960,6 +1007,7 @@ begin
   if not FFailed then
   begin
     FFailed := True;
+    FConnectionError := True;   // connection-scoped: the connection is gone
     FErrorMessage := AMessage;
     FErrorCode := ACode;
     FBodyEof := True;

@@ -233,24 +233,34 @@ compile_probe() {
 }
 
 classify_ref_log() { # logfile id -> "pass|fail class"
-  # The reference resolves to an outcome class ONLY when its verifier passed;
-  # a failed verifier is inconclusive about the class (it usually saw EOF or a
-  # timeout), so it is recorded as ref=fail with the best-effort class name.
+  # The reference resolves to an outcome class ONLY when its verifier passed.
+  #
+  # The expected class comes from the verifier's OWN success/failure message,
+  # falling back to the curated table only when the log is silent; that keeps
+  # the oracle honest when the image is rebuilt. A positive control
+  # (BASELINE_ID) must pass first; if it does not, the reference is not
+  # trustworthy and every row is downgraded to fail/invalid rather than being
+  # scored against a broken oracle.
   local log="$1" intent cls
-  intent="$(static_intent "$2")"
-  if grep -q "Verifier passed" "$log"; then
-    case "$intent" in
-      success) echo "pass success"; return;;
-      conn-error|stream-error) echo "pass error"; return;;
-      MULTI:*conn-error*|MULTI:*stream-error*) echo "pass error"; return;;
-      MULTI:*success*) echo "pass success"; return;;
-      *) echo "pass unknown"; return;;
-    esac
+  if [ "${BASELINE_OK:-}" != yes ]; then echo "fail invalid"; return; fi
+  if grep -q 'Got successful response as expected' "$log"; then
+    echo "pass success"; return
   fi
-  if grep -q "stream error:" "$log"; then cls="stream-error"
-  elif grep -q "connection error:" "$log"; then cls="conn-error"
-  else cls="unresolved"; fi
-  echo "fail $cls"
+  if grep -q 'Got expected error' "$log"; then
+    if grep -q 'connection error:' "$log"; then echo "pass conn-error"; return; fi
+    if grep -q 'stream error:' "$log"; then echo "pass stream-error"; return; fi
+    intent="$(static_intent "$2")"
+    case "$intent" in
+      *conn-error*) echo "pass conn-error"; return;;
+      *stream-error*) echo "pass stream-error"; return;;
+    esac
+    echo "pass error"; return
+  fi
+  if grep -q 'unexpected EOF' "$log"; then
+    echo "fail eof"
+  else
+    echo "fail unresolved"
+  fi
 }
 
 classify_our_line() { # RESULT line (+ msg) -> class
@@ -262,25 +272,33 @@ classify_our_line() { # RESULT line (+ msg) -> class
   else echo unresolved; fi
 }
 
-verdict_for() { # ref_state ref_class our wrote_status id -> verdict
-  local rstate="$1" rclass="$2" our="$3" ws="$4" id="$5"
+verdict_for() { # ref_state ref_class our id -> verdict
+  local rstate="$1" rclass="$2" our="$3" id="$4"
   local our_err=false
   { [ "$our" = conn-error ] || [ "$our" = stream-error ]; } && our_err=true
-  # The reference FAILED (timed out / EOF): it did not resolve a class. If we
-  # produced a clean error we enforced a rule it missed -> BETTER; else both
-  # sides are inconclusive -> UNKNOWN.
+  # The reference did not resolve a class (verifier failed, or the whole oracle
+  # was invalid): we cannot score against it. A clean error of ours still shows
+  # a rule was enforced -> BETTER; otherwise both sides are inconclusive.
   if [ "$rstate" = fail ]; then
     if [ "$our_err" = true ]; then echo "BETTER"; else echo "UNKNOWN"; fi
     return
   fi
-  # The reference PASSED. success expected -> we must succeed; error
-  # expected -> we must produce an error; unknown class -> only a success
-  # can be called a match.
+  # The reference PASSED, so the expected outcome class is authoritative.
   case "$rclass" in
     success)
       if [ "$our" = success ]; then echo "MATCH"; else echo "WORSE"; fi;;
-    error)
-      if [ "$our_err" = true ]; then echo "MATCH"; else echo "WORSE"; fi;;
+    conn-error|stream-error)
+      if [ "$our" = "$rclass" ]; then
+        echo "MATCH"
+      elif [ "$our_err" = true ]; then
+        # both are errors, but at different levels. The harness's own verifier
+        # distinguishes these ("got an unexpected error type: ConnectionError,
+        # expected StreamError"), so a mismatch is a real divergence to justify
+        # rather than a MATCH.
+        echo "CLASS-DIFF"
+      else
+        echo "WORSE"
+      fi;;
     *)
       if [ "$our" = success ]; then echo "MATCH"; else echo "UNKNOWN"; fi;;
   esac
@@ -352,8 +370,23 @@ if [ -n "${HARNESS_IDS:-}" ]; then
 fi
 echo "running ${#IDS[@]} ids (reference + probe each)..." >&2
 
+# Positive control: a case the Go verifier must pass. If it does not, the
+# reference image (or the environment) is broken and no row can be trusted.
+BASELINE_ID="${BASELINE_ID:-6.5/1}"
+BASELINE_OK=no
+mkdir -p "$BUILD"
+base_log="$(run_reference "$BASELINE_ID")"
+printf '%s' "$base_log" > "$BUILD/baseline.log"
+if grep -q 'Verifier passed' "$BUILD/baseline.log"; then
+  BASELINE_OK=yes
+else
+  echo "WARNING: reference positive control $BASELINE_ID did not pass;" \
+    "scoring every row as invalid (see $BUILD/baseline.log)" >&2
+fi
+export BASELINE_OK
+
 : > "$RESULTS_TSV"
-n_match=0; n_better=0; n_worse=0; n_unknown=0; n_ref_pass=0
+n_match=0; n_better=0; n_worse=0; n_unknown=0; n_classdiff=0; n_ref_pass=0
 for id in "${IDS[@]}"; do
   [ -z "$id" ] && continue
   ref_log="$(run_reference "$id")"
@@ -366,12 +399,12 @@ for id in "${IDS[@]}"; do
   ours="$(run_ours "$id")"
   our_rc="${ours%% *}"; our_line="${ours#* }"
   our_class="$(classify_our_line "$our_line")"
-  ws="$(wrote_status "$id")"
-  verdict="$(verdict_for "$ref_state" "$ref_class" "$our_class" "$ws" "$id")"
+  verdict="$(verdict_for "$ref_state" "$ref_class" "$our_class" "$id")"
   case "$verdict" in
     MATCH) n_match=$((n_match+1));;
     BETTER) n_better=$((n_better+1));;
     WORSE) n_worse=$((n_worse+1));;
+    CLASS-DIFF) n_classdiff=$((n_classdiff+1));;
     UNKNOWN) n_unknown=$((n_unknown+1));;
   esac
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -393,7 +426,9 @@ reference_count=$n_ref_pass
   echo
   echo "Go reference verifier tally: $n_ref_pass / ${#IDS[@]} ids passed."
   echo
-  echo "PASS = MATCH+BETTER = $((n_match+n_better));  FAIL = WORSE = $n_worse;  UNKNOWN = $n_unknown"
+  echo "Positive control (${BASELINE_ID:-6.5/1}): ${BASELINE_OK:-no}"
+  echo
+  echo "PASS = MATCH+BETTER = $((n_match+n_better));  FAIL = WORSE = $n_worse;  CLASS-DIFF = $n_classdiff;  UNKNOWN = $n_unknown"
   echo
   echo "| id | ref state | ref class | our exit | our outcome | static intent | verdict | our RESULT |"
   echo "|---|---|---|---|---|---|---|---|"
@@ -404,7 +439,7 @@ reference_count=$n_ref_pass
 } > "$OUT_MD"
 
 echo
-echo "harness: MATCH=$n_match BETTER=$n_better WORSE=$n_worse UNKNOWN=$n_unknown"
+echo "harness: MATCH=$n_match BETTER=$n_better WORSE=$n_worse CLASS-DIFF=$n_classdiff UNKNOWN=$n_unknown"
 echo "wrote $OUT_MD"
-echo "RESULT: PASS=$((n_match+n_better)) FAIL=$n_worse UNKNOWN=$n_unknown"
+echo "RESULT: PASS=$((n_match+n_better)) FAIL=$n_worse CLASS-DIFF=$n_classdiff UNKNOWN=$n_unknown"
 [ "$n_worse" -eq 0 ]

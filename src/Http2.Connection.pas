@@ -539,6 +539,11 @@ begin
         // frame-type/stream-id pairing, mandatory payload sizes, zero
         // WINDOW_UPDATE increments. A violation is a connection error.
         ValidateFrame(Frame, FPeerMaxFrameSize);
+        // routing can also raise EHttpError (malformed SETTINGS/GOAWAY,
+        // PUSH_PROMISE while push is disabled); keep it inside this handler
+        // so the frame's own error code is reported rather than being
+        // downgraded to ecInternalError by the outer catch-all.
+        RouteInbound(Frame);
       except
         on E: EHttpTimeout do
           Continue;                 // idle poll: loop back to outbound work
@@ -548,7 +553,6 @@ begin
           Break;
         end;
       end;
-      RouteInbound(Frame);
     end;
     DrainOutbound;                  // flush anything pending after Terminate
   except
@@ -604,6 +608,14 @@ begin
         ParseGoAway(AFrame, LastStreamId, Code, Debug);
         TConnection(FConn).MarkGoAway(LastStreamId);
       end;
+    ftPushPromise:
+      // We advertise SETTINGS_ENABLE_PUSH = 0 (see TConnectionSettings.Defaults),
+      // so a PUSH_PROMISE is a connection error (RFC 9113 section 6.6). Fail
+      // loudly instead of silently discarding the frame — otherwise the
+      // request simply hangs until the header timeout.
+      raise EHttpProtocolError.Create(
+        'peer sent PUSH_PROMISE although push is disabled',
+        ecProtocolError);
   else
   begin
     // purely additive observability: report flow-control updates and frames

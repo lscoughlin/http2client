@@ -300,7 +300,13 @@ end;
 class function TConnectionSettings.Defaults: TConnectionSettings;
 begin
   Result.HeaderTableSize := 4096;
-  Result.EnablePush := True;
+  // RFC 9113 section 6.6: a client that does not support server push MUST
+  // advertise SETTINGS_ENABLE_PUSH = 0; a peer that then sends PUSH_PROMISE
+  // is committing a connection PROTOCOL_ERROR (section 6.6). This client
+  // implements no pushed-stream state, so the honest and required value
+  // is 0 — advertising 1 while ignoring PUSH_PROMISE is the bug the
+  // h2-client-test-harness case 8.2/1 looks for.
+  Result.EnablePush := False;
   Result.MaxConcurrentStreams := 100;   // matches MaxStreamsPerConnection
   Result.InitialWindowSize := 65535;
   Result.MaxFrameSize := DefaultMaxFrameSize;

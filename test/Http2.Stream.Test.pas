@@ -74,6 +74,11 @@ type
     // 08.6
     procedure TestBodylessResponseIsImmediatelyEof;
     procedure TestReadAfterEofRaises;
+    // RFC 9110 8.6 / RFC 7540 8.1.2.6: a HEAD response carries the
+    // content-length a GET would return, but sends no body; it must be accepted.
+    procedure TestHeadContentLengthIsNotComparedAgainstBody;
+    // restores the mismatch check guarded by the HEAD exemption above
+    procedure TestContentLengthMismatchRaises;
     // 08.7
     procedure TestRstMidBodySurfacesFromRead;
     // 08.8
@@ -674,6 +679,104 @@ begin
   end;
 end;
 
+procedure TStreamLeaseTest.TestHeadContentLengthIsNotComparedAgainstBody;
+var
+  Sock: TMockSocket;
+  Conn: TConnection;
+  Lease: TStreamLease;
+  IL: IConnectionStream;
+  Alloc: TStreamIdAllocator;
+  Req: TStreamRequest;
+  Enc: THpackCodec;
+  Extra: array[0..0] of THttpHeaderField;
+  Buf: array[0..7] of Byte;
+begin
+  Sock := TMockSocket.Create;
+  Conn := TConnection.Create(Sock);
+  try
+    Req := TStreamRequest.WithMethod(hmHead, 'api.example');
+    MakeLease(Conn, Req, Alloc, Lease, IL);
+    try
+      Lease.Start;
+      Enc := THpackCodec.Create;
+      try
+        Extra[0].Name := 'content-length';
+        Extra[0].Value := '10';
+        Extra[0].Sensitive := False;
+        // a HEAD response: describes 10 bytes but END_STREAM with no DATA
+        Conn.DispatchStreamFrame(ResponseHeadersFrame(Enc, '200', Extra,
+          Lease.StreamId, True));
+      finally
+        Enc.Free;
+      end;
+      AssertTrue('HEAD response headers are accepted',
+        Lease.WaitForResponseHeader(1000));
+      AssertEquals('no body bytes for HEAD', LongInt(0),
+        Lease.ReadBody(Buf, SizeOf(Buf)));
+      AssertEquals('status preserved', 200, Lease.StatusCode);
+    finally
+      Lease.ReleaseLease;
+      IL := nil;
+      Alloc.Free;
+    end;
+  finally
+    Conn.Free;
+  end;
+end;
+
+procedure TStreamLeaseTest.TestContentLengthMismatchRaises;
+var
+  Sock: TMockSocket;
+  Conn: TConnection;
+  Lease: TStreamLease;
+  IL: IConnectionStream;
+  Alloc: TStreamIdAllocator;
+  Req: TStreamRequest;
+  Enc: THpackCodec;
+  Extra: array[0..0] of THttpHeaderField;
+  Buf: array[0..63] of Byte;
+  Raised: Boolean;
+begin
+  Sock := TMockSocket.Create;
+  Conn := TConnection.Create(Sock);
+  try
+    Req := TStreamRequest.WithMethod(hmGet, 'api.example');
+    MakeLease(Conn, Req, Alloc, Lease, IL);
+    try
+      Lease.Start;
+      Enc := THpackCodec.Create;
+      try
+        Extra[0].Name := 'content-length';
+        Extra[0].Value := '10';
+        Extra[0].Sensitive := False;
+        Conn.DispatchStreamFrame(ResponseHeadersFrame(Enc, '200', Extra,
+          Lease.StreamId, False));
+        // only 3 bytes of DATA, but END_STREAM -> malformed response
+        Conn.DispatchStreamFrame(
+          BuildDataFrame(Lease.StreamId, BytesOf('abc'), True));
+      finally
+        Enc.Free;
+      end;
+      AssertTrue('headers accepted', Lease.WaitForResponseHeader(1000));
+      Raised := False;
+      try
+        Lease.ReadBody(Buf, SizeOf(Buf));
+      except
+        on E: EHttpStreamError do Raised := True;
+      end;
+      AssertTrue(
+        'a content-length that disagrees with the DATA length is a stream error',
+        Raised);
+    finally
+      Lease.ReleaseLease;
+      IL := nil;
+      Alloc.Free;
+    end;
+  finally
+    Conn.Free;
+  end;
+end;
+
 procedure TStreamLeaseTest.TestRstMidBodySurfacesFromRead;
 var
   Sock: TMockSocket;
@@ -879,7 +982,7 @@ begin
       try
         Lease.ReadBody(Buf, SizeOf(Buf));
       except
-        on E: EHttpStreamError do Raised := True;
+        on E: EHttpConnectionError do Raised := True;
       end;
       AssertTrue('body read observes the connection failure', Raised);
     finally
