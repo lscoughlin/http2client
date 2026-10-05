@@ -1,2 +1,3 @@
 {"type":"goal_created","goalId":"muvd4vrz-nguxny","objective":"Implement the HTTP/2 client specified in doc/design/ and planned in plan/README.md in Object Pascal for Free Pascal 3.2.4, using a team of parallel agents, until all 12 plan stories (S00–S12) are complete and the external validation ladder is green.","sisyphus":false,"autoContinue":true,"at":"2026-10-05T14:46:34.463Z"}
 {"type":"task_list_set","goalId":"muvd4vrz-nguxny","taskCount":13,"blockCompletion":true,"at":"2026-10-05T14:46:34.463Z"}
+{"type":"task_started","goalId":"muvd4vrz-nguxny","taskId":"task-s00","at":"2026-10-05T14:46:40.304Z"}
