@@ -18,7 +18,7 @@ interface
 uses
   SysUtils, Classes, SyncObjs, Generics.Collections, fpcunit, testregistry,
   Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack,
-  Http2.Tls, Http2.Connection, Http2.Stream, Http2.Client;
+  Http2.Tls, Http2.Connection, Http2.Stream, Http2.Client, Http2.Observer;
 
 type
   /// a scripted in-memory HTTP/2 server: parses every frame the client writes
@@ -179,6 +179,8 @@ type
     // 09.10 / integration (opt-in: set HTTP2_LIVE_ITEST=1 and run nghttpd)
     procedure TestLiveGetAgainstNghttpd;
     procedure TestLivePostEchoAgainstNghttpd;
+    // S11 wiring: the factory-level observer reaches real connections
+    procedure TestFactoryObserverReceivesConnectionAndFrameEvents;
   end;
 
 implementation
@@ -1020,6 +1022,36 @@ begin
   finally
     Client.Close;
   end;
+end;
+
+procedure TClientTest.TestFactoryObserverReceivesConnectionAndFrameEvents;
+var
+  Fact: TFakeSocketFactory;
+  Obs: TRecordingObserver;
+  Client: IHttpClient;
+  R: IHttpResponse;
+begin
+  Fact := TFakeSocketFactory.Create;
+  Obs := TRecordingObserver.Create;
+  Client := THttpClientFactory.Create
+    .WithSocketFactory(Fact)
+    .WithObserver(Obs)
+    .Build;
+  R := Client.Send(THttpRequest.Create(hmGet, 'https://api.example/thing'));
+  AssertEquals('status decoded', 200, R.StatusCode);
+  AssertTrue('connection open was observed',
+    Obs.WaitForCount(oekConnectionOpen, 1, 3000));
+  AssertTrue('the request HEADERS frame was observed outbound',
+    Obs.WaitForCount(oekFrameOut, 1, 3000));
+  AssertTrue('the server SETTINGS frame was observed inbound',
+    Obs.WaitForCount(oekFrameIn, 1, 3000));
+  AssertTrue('the stream lease was observed open',
+    Obs.WaitForCount(oekStreamOpen, 1, 3000));
+  // non-vacuous: a factory that dropped the observer would record nothing
+  AssertTrue('events were actually delivered', Obs.Count > 0);
+  Client.Close;
+  AssertTrue('connection close was observed',
+    Obs.WaitForCount(oekConnectionClose, 1, 3000));
 end;
 
 initialization

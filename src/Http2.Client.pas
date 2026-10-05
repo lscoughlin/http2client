@@ -21,7 +21,7 @@ interface
 uses
   SysUtils, Classes, SyncObjs, Generics.Collections, TypInfo,
   Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack,
-  Http2.Tls, Http2.Connection, Http2.Stream;
+  Http2.Tls, Http2.Connection, Http2.Stream, Http2.Observer;
 
 const
   /// documented factory defaults (doc/design/client-api.md "HttpClientFactory")
@@ -34,6 +34,10 @@ const
   cDefaultIdleTimeoutMs           = 60000;
   /// the default TLS port; omitted from :authority when the URL port matches
   cDefaultHttpsPort               = 443;
+  /// transparent retries allowed for an idempotent request on a refused stream
+  cMaxTransparentRetries          = 2;
+  /// a cancellable wait polls its token in slices of this many milliseconds
+  cCancelPollSliceMs              = 20;
 
 type
   THttpConnection = class;
@@ -44,6 +48,26 @@ type
   IHttp2SocketFactory = interface
     function Dial(const AHost: string; const APort: Word;
       const ATimeoutMs: Integer): IHttp2Socket;
+  end;
+
+  /// cooperative cancellation for an in-flight Send (plan S10 task 10.8).
+  /// Pass one via THttpRequest.WithCancelToken; when it flips to cancelled the
+  /// stream is reset with RST_STREAM(CANCEL) and the lease released.
+  ICancellationToken = interface
+    ['{6B1C2D3E-4F50-4A61-9C72-0000000000C1}']
+    function IsCancelled: Boolean;
+  end;
+
+  /// the default thread-safe token: Cancel() may be called from any thread
+  TCancellationToken = class(TInterfacedObject, ICancellationToken)
+  private
+    FLock: TCriticalSection;
+    FCancelled: Boolean;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Cancel;
+    function IsCancelled: Boolean;
   end;
 
   /// the production factory: TCP then TLS handshake offering ALPN "h2"
@@ -83,6 +107,8 @@ type
     FHeaders: IHttpHeaders;
     FBody: THttpBody;
     FBodyWriter: IBodyWriter;
+    FCancelToken: ICancellationToken;
+    FHeaderTimeoutMs: Integer; // per-request override; 0 = factory default
     function GetMethodToken: string;
     function GetAuthority: string;
     function GetPath: string;
@@ -95,6 +121,14 @@ type
     function WithHeader(const AName, AValue: string): THttpRequest;
     function WithBody(const ABody: THttpBody): THttpRequest;
     function WithBodyWriter(const AWriter: IBodyWriter): THttpRequest;
+    /// attach a cancellation token; cancelling it resets the stream in flight
+    function WithCancelToken(const AToken: ICancellationToken): THttpRequest;
+    /// override the factory HeaderTimeoutMs for this request (0 = default)
+    function WithTimeout(const AMs: Integer): THttpRequest;
+    /// re-target the request at AUrl (used by the redirect loop)
+    function WithUrl(const AUrl: string): THttpRequest;
+    /// drop any request body (used when a redirect rewrites the method)
+    function DropBody: THttpRequest;
     /// bridge to the S08 wire record: pseudo-header mapping at encode time
     function ToStreamRequest: TStreamRequest;
 
@@ -109,6 +143,10 @@ type
     property Authority: string read GetAuthority;
     /// path + query, '/' when empty (:path)
     property Path: string read GetPath;
+    /// the cancellation token (nil when none was supplied)
+    property CancelToken: ICancellationToken read FCancelToken;
+    /// this request's header timeout in ms; 0 means "use the factory default"
+    property HeaderTimeoutMs: Integer read FHeaderTimeoutMs;
   end;
 
   /// the public client: Send blocks until status + headers; Close drains
@@ -134,6 +172,7 @@ type
     FProxyPort: Word;
     FSocketFactory: IHttp2SocketFactory;
     FCACertFile: string;
+    FObserver: IHttp2Observer;
   public
     class function Create: THttpClientFactory; static;
     function WithMaxConnections(const AMax: Integer): THttpClientFactory;
@@ -150,6 +189,10 @@ type
     /// PEM bundle used to verify the peer's certificate; '' = system trust
     /// store. Needed whenever the origin uses a private CA.
     function WithCACertFile(const AFileName: string): THttpClientFactory;
+    /// observability seam: every connection opened by Build reports its
+    /// connection/stream/frame events to AObserver (doc/design/
+    /// testing-observability.md). Nil disables observation.
+    function WithObserver(const AObserver: IHttp2Observer): THttpClientFactory;
     function Build: IHttpClient;
 
     property MaxConnections: Integer read FMaxConnections;
@@ -162,6 +205,7 @@ type
     property ProxyHost: string read FProxyHost;
     property ProxyPort: Word read FProxyPort;
     property CACertFile: string read FCACertFile;
+    property Observer: IHttp2Observer read FObserver;
   end;
 
   /// one pooled connection, exposed as an interface so an outstanding response
@@ -245,6 +289,11 @@ type
     function Eligible: Boolean;
     function Acquire(const ARequest: TStreamRequest;
       const ATimeoutMs: Integer; out AAcquired: Boolean): IHttpResponse;
+    /// acquire with a cancellation token: polls the lease wait so a cancel
+    /// posts RST_STREAM(CANCEL) and releases the lease before returning
+    function AcquireCancellable(const ARequest: TStreamRequest;
+      const ATimeoutMs: Integer; const AToken: ICancellationToken;
+      out AAcquired: Boolean): IHttpResponse;
     procedure Drain;
     procedure ReleaseIfIdle;
     function GetConn: TConnection;
@@ -267,7 +316,12 @@ type
     FIdleTimeoutMs: Integer;
     FTotalConnections: Integer;
     FClosed: Boolean;
+    FObserver: IHttp2Observer;
+    /// last time a pooled connection was used, keyed by its TConnection
+    FIdleSince: TDictionary<Pointer, QWord>;
     procedure ReapClosed;
+    procedure ReapIdleLocked;
+    procedure MarkUsed(const C: IPooledConnection);
     function ListFor(const AOrigin: string): TList<IPooledConnection>;
     function OpenConnection(const AOrigin, AHost: string;
       const APort: Word): IPooledConnection;
@@ -276,13 +330,17 @@ type
   public
     constructor Create(const AFactory: IHttp2SocketFactory; const AMaxConnections,
       AMaxStreamsPerConnection, AConnectTimeoutMs, AHeaderTimeoutMs,
-      AIdleTimeoutMs: Integer);
+      AIdleTimeoutMs: Integer; const AObserver: IHttp2Observer = nil);
     destructor Destroy; override;
     /// acquire a lease on the least-loaded eligible connection, opening a new
-    /// one or waiting for a slot per doc/design/client-api.md
+    /// one or waiting for a slot per doc/design/client-api.md. When AToken is
+    /// non-nil the wait is cancellable (plan S10 task 10.8).
     function Acquire(const AOrigin, AHost: string; const APort: Word;
-      const ARequest: TStreamRequest;
-      const AHeaderTimeoutMs: Integer): IHttpResponse;
+      const ARequest: TStreamRequest; const AHeaderTimeoutMs: Integer;
+      const AToken: ICancellationToken = nil): IHttpResponse;
+    /// close and remove connections idle for longer than IdleTimeoutMs, so
+    /// the pool stays within MaxConnections (plan S10 task 10.7).
+    procedure ReapIdle;
     procedure Close;
     // test seams
     function ConnectionCount: Integer;
@@ -304,11 +362,13 @@ type
     FMaxRedirects: Integer;
     FClosed: Boolean;
     FLock: TCriticalSection;
+    function SendOnce(const ARequest: THttpRequest): IHttpResponse;
   public
     constructor Create(const AFactory: IHttp2SocketFactory;
       const AMaxConnections, AMaxStreamsPerConnection: Integer;
       const AFollowRedirects: Boolean; const AMaxRedirects,
-      AConnectTimeoutMs, AHeaderTimeoutMs, AIdleTimeoutMs: Integer);
+      AConnectTimeoutMs, AHeaderTimeoutMs, AIdleTimeoutMs: Integer;
+      const AObserver: IHttp2Observer = nil);
     destructor Destroy; override;
     function Send(const ARequest: THttpRequest): IHttpResponse;
     procedure Close;
@@ -332,8 +392,17 @@ type
 procedure ParseHttpUrl(const AUrl: string; out AHost: string; out APort: Word;
   out APath: string);
 
-/// origin key = host[:port] with the default port omitted (doc/design)
+/// origin key = host[:port] with the default port omitted (doc/design). A
+/// non-https URL is prefixed with its scheme so an http redirect target cannot
+/// share a pooled https connection (plan S10 task 10.4).
 function OriginOfUrl(const AUrl: string): string;
+
+/// lowercased scheme of AUrl ('https' when the URL carries none)
+function SchemeOfUrl(const AUrl: string): string;
+
+/// resolve a redirect Location against the URL that produced it: absolute,
+/// protocol-relative, root-relative or path-relative (plan S10 task 10.1)
+function ResolveLocation(const ABaseUrl, ALocation: string): string;
 
 /// read a response body to EOF into a byte array (used by TResponseReader<T>)
 function ReadAllBodyBytes(const ABody: IHttpBodyStream): TBytes;
@@ -423,9 +492,20 @@ begin
     APath := PathPart;
 end;
 
+function SchemeOfUrl(const AUrl: string): string;
+var
+  P: Integer;
+begin
+  P := Pos('://', AUrl);
+  if P > 0 then
+    Result := LowerCase(Copy(AUrl, 1, P - 1))
+  else
+    Result := 'https';
+end;
+
 function OriginOfUrl(const AUrl: string): string;
 var
-  Host, Path: string;
+  Host, Path, Scheme: string;
   Port: Word;
 begin
   ParseHttpUrl(AUrl, Host, Port, Path);
@@ -433,6 +513,66 @@ begin
     Result := Host
   else
     Result := Host + ':' + IntToStr(Port);
+  // a different scheme is a different origin even on the same host:port, so
+  // an http redirect target never reuses a pooled https connection
+  Scheme := SchemeOfUrl(AUrl);
+  if Scheme <> 'https' then
+    Result := Scheme + '://' + Result;
+end;
+
+function ResolveLocation(const ABaseUrl, ALocation: string): string;
+var
+  Base, Prefix, Rest, Path, Dir: string;
+  P, Cut: Integer;
+begin
+  if ALocation = '' then
+    Exit('');
+  if Pos('://', ALocation) > 0 then
+    Exit(ALocation);
+  if Copy(ALocation, 1, 2) = '//' then
+    Exit(SchemeOfUrl(ABaseUrl) + ':' + ALocation);
+
+  Base := ABaseUrl;
+  P := Pos('://', Base);
+  if P > 0 then
+    Prefix := Copy(Base, 1, P + 2)     // 'scheme://'
+  else
+    Prefix := 'https://';
+  Rest := Copy(Base, Length(Prefix) + 1, Length(Base));  // authority + path
+
+  // authority ends at the first '/' or '?'
+  P := Pos('/', Rest);
+  Cut := Pos('?', Rest);
+  if (Cut > 0) and ((P = 0) or (Cut < P)) then
+    P := Cut;
+  if P = 0 then
+  begin
+    // no path at all: the base directory is the root
+    if Copy(ALocation, 1, 1) <> '/' then
+      Exit(Prefix + Rest + '/' + ALocation);
+    Exit(Prefix + Rest + ALocation);
+  end;
+
+  Path := Copy(Rest, P, Length(Rest));   // '/...' incl. any query
+  Cut := Pos('?', Path);
+  if Cut > 0 then
+    Path := Copy(Path, 1, Cut - 1);      // drop the base query
+
+  if Copy(ALocation, 1, 1) = '/' then
+    Exit(Prefix + Copy(Rest, 1, P - 1) + ALocation);
+
+  // path-relative: drop the final path segment (RFC 3986 merge). A base with
+  // a query but no path merges at the root.
+  if Path = '' then
+    Dir := '/'
+  else
+  begin
+    Cut := Length(Path);
+    while (Cut > 1) and (Path[Cut] <> '/') do
+      Dec(Cut);
+    Dir := Copy(Path, 1, Cut);
+  end;
+  Result := Prefix + Copy(Rest, 1, P - 1) + Dir + ALocation;
 end;
 
 function ReadAllBodyBytes(const ABody: IHttpBodyStream): TBytes;
@@ -450,6 +590,53 @@ begin
     SetLength(Result, Total + N);
     Move(Buf[0], Result[Total], N);
     Inc(Total, N);
+  end;
+end;
+
+function HttpMethodIsIdempotent(const AToken: string): Boolean;
+begin
+  Result := (AToken = 'GET') or (AToken = 'HEAD') or (AToken = 'PUT') or
+    (AToken = 'DELETE') or (AToken = 'OPTIONS') or (AToken = 'TRACE');
+end;
+
+function HttpStatusIsRedirect(const AStatus: LongInt): Boolean;
+begin
+  Result := (AStatus = 301) or (AStatus = 302) or (AStatus = 303) or
+    (AStatus = 307) or (AStatus = 308);
+end;
+
+{ TCancellationToken }
+
+constructor TCancellationToken.Create;
+begin
+  inherited Create;
+  FLock := TCriticalSection.Create;
+  FCancelled := False;
+end;
+
+destructor TCancellationToken.Destroy;
+begin
+  FLock.Free;
+  inherited Destroy;
+end;
+
+procedure TCancellationToken.Cancel;
+begin
+  FLock.Acquire;
+  try
+    FCancelled := True;
+  finally
+    FLock.Release;
+  end;
+end;
+
+function TCancellationToken.IsCancelled: Boolean;
+begin
+  FLock.Acquire;
+  try
+    Result := FCancelled;
+  finally
+    FLock.Release;
   end;
 end;
 
@@ -478,6 +665,8 @@ begin
   Result.FHeaders := NewHttpHeaders;
   Result.FBody := Default(THttpBody);
   Result.FBodyWriter := nil;
+  Result.FCancelToken := nil;
+  Result.FHeaderTimeoutMs := 0;
 end;
 
 function THttpRequest.GetMethodToken: string;
@@ -553,6 +742,32 @@ begin
   Result.FBody := Default(THttpBody);
 end;
 
+function THttpRequest.WithCancelToken(
+  const AToken: ICancellationToken): THttpRequest;
+begin
+  Result := Self;
+  Result.FCancelToken := AToken;
+end;
+
+function THttpRequest.WithTimeout(const AMs: Integer): THttpRequest;
+begin
+  Result := Self;
+  Result.FHeaderTimeoutMs := AMs;
+end;
+
+function THttpRequest.WithUrl(const AUrl: string): THttpRequest;
+begin
+  Result := Self;
+  Result.FUrl := AUrl;
+end;
+
+function THttpRequest.DropBody: THttpRequest;
+begin
+  Result := Self;
+  Result.FBody := Default(THttpBody);
+  Result.FBodyWriter := nil;
+end;
+
 function THttpRequest.ToStreamRequest: TStreamRequest;
 var
   Names, Vals: TArray<string>;
@@ -615,6 +830,7 @@ begin
   Result.FProxyHost := '';
   Result.FProxyPort := 0;
   Result.FCACertFile := '';
+  Result.FObserver := nil;
   Result.FSocketFactory := TDefaultSocketFactory.Create;
 end;
 
@@ -693,11 +909,18 @@ begin
   Result.FIdleTimeoutMs := AMs;
 end;
 
+function THttpClientFactory.WithObserver(
+  const AObserver: IHttp2Observer): THttpClientFactory;
+begin
+  Result := Self;
+  Result.FObserver := AObserver;
+end;
+
 function THttpClientFactory.Build: IHttpClient;
 begin
   Result := THttpClient.Create(FSocketFactory, FMaxConnections,
     FMaxStreamsPerConnection, FFollowRedirects, FMaxRedirects,
-    FConnectTimeoutMs, FHeaderTimeoutMs, FIdleTimeoutMs);
+    FConnectTimeoutMs, FHeaderTimeoutMs, FIdleTimeoutMs, FObserver);
 end;
 
 { TGuardedBody }
@@ -830,9 +1053,19 @@ end;
 
 function THttpConnection.Acquire(const ARequest: TStreamRequest;
   const ATimeoutMs: Integer; out AAcquired: Boolean): IHttpResponse;
+begin
+  Result := AcquireCancellable(ARequest, ATimeoutMs, nil, AAcquired);
+end;
+
+function THttpConnection.AcquireCancellable(const ARequest: TStreamRequest;
+  const ATimeoutMs: Integer; const AToken: ICancellationToken;
+  out AAcquired: Boolean): IHttpResponse;
 var
   Lease: TStreamLease;
   Keep: IConnectionStream;
+  Deadline: QWord;
+  Slice, Remaining: Integer;
+  Ok: Boolean;
 begin
   AAcquired := False;
   FLock.Acquire;
@@ -845,9 +1078,39 @@ begin
     Lease.TimeoutMs := ATimeoutMs;
     Lease.Start;
     AAcquired := True;
-    if not Lease.WaitForResponseHeader(ATimeoutMs) then
+    Deadline := GetTickCount64 + QWord(ATimeoutMs);
+    Ok := False;
+    while True do
     begin
+      if AToken = nil then
+        Slice := ATimeoutMs
+      else if AToken.IsCancelled then
+        Break
+      else
+        Slice := cCancelPollSliceMs;
+      if GetTickCount64 >= Deadline then
+        Slice := 0;
+      Ok := Lease.WaitForResponseHeader(Slice);
+      if Ok then
+        Break;
+      if AToken = nil then
+        Break;                       // a plain wait: the timeout is terminal
+      if AToken.IsCancelled then
+        Break;
+      if GetTickCount64 >= Deadline then
+        Break;
+      Remaining := Integer(Deadline - GetTickCount64);
+      if Remaining <= 0 then
+        Break;
+    end;
+    if not Ok then
+    begin
+      // a cancelled or expired stream is RESET, never orphaned (10.5-10.8)
+      FConn.PostFrame(BuildRstStreamFrame(Lease.StreamId, ecCancel));
       Lease.ReleaseLease;
+      if (AToken <> nil) and AToken.IsCancelled then
+        raise EHttpStreamError.Create('request cancelled', Lease.StreamId,
+          ecCancel);
       raise EHttpTimeout.Create('timed out waiting for response headers');
     end;
     Result := THttpResponse.Create(Lease, Keep, Self);
@@ -887,12 +1150,15 @@ end;
 
 constructor TConnectionPool.Create(const AFactory: IHttp2SocketFactory;
   const AMaxConnections, AMaxStreamsPerConnection, AConnectTimeoutMs,
-  AHeaderTimeoutMs, AIdleTimeoutMs: Integer);
+  AHeaderTimeoutMs, AIdleTimeoutMs: Integer;
+  const AObserver: IHttp2Observer);
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
   FByOrigin := TDictionary<string, TList<IPooledConnection>>.Create;
+  FIdleSince := TDictionary<Pointer, QWord>.Create;
   FFactory := AFactory;
+  FObserver := AObserver;
   FMaxConnections := AMaxConnections;
   FMaxStreamsPerConnection := AMaxStreamsPerConnection;
   FConnectTimeoutMs := AConnectTimeoutMs;
@@ -910,6 +1176,7 @@ begin
   for L in FByOrigin.Values do
     L.Free;
   FByOrigin.Free;
+  FIdleSince.Free;
   FLock.Free;
   inherited Destroy;
 end;
@@ -929,9 +1196,57 @@ begin
       C := L[I];
       if (C.Conn.State = csClosed) and (C.ActiveStreams = 0) then
       begin
+        FIdleSince.Remove(Pointer(C.Conn));
         L.Delete(I);
         Dec(FTotalConnections);
       end;
+    end;
+  end;
+end;
+
+procedure TConnectionPool.MarkUsed(const C: IPooledConnection);
+begin
+  FIdleSince.AddOrSetValue(Pointer(C.Conn), GetTickCount64);
+end;
+
+procedure TConnectionPool.ReapIdle;
+begin
+  FLock.Acquire;
+  try
+    ReapIdleLocked;
+  finally
+    FLock.Release;
+  end;
+end;
+
+procedure TConnectionPool.ReapIdleLocked;
+var
+  Origin: string;
+  L: TList<IPooledConnection>;
+  I: Integer;
+  C: IPooledConnection;
+  Since: QWord;
+  Now: QWord;
+begin
+  if FIdleTimeoutMs <= 0 then
+    Exit;
+  Now := GetTickCount64;
+  for Origin in FByOrigin.Keys do
+  begin
+    L := FByOrigin[Origin];
+    for I := L.Count - 1 downto 0 do
+    begin
+      C := L[I];
+      if C.ActiveStreams > 0 then
+        Continue;
+      if not FIdleSince.TryGetValue(Pointer(C.Conn), Since) then
+        Continue;
+      if Now - Since < QWord(FIdleTimeoutMs) then
+        Continue;
+      C.Drain;                       // closes now, since it is idle
+      FIdleSince.Remove(Pointer(C.Conn));
+      L.Delete(I);
+      Dec(FTotalConnections);
     end;
   end;
 end;
@@ -960,6 +1275,8 @@ var
 begin
   Sock := FFactory.Dial(AHost, APort, FConnectTimeoutMs);
   Conn := TConnection.Create(Sock);
+  if FObserver <> nil then
+    Conn.Observer := FObserver;
   if FIdleTimeoutMs > 0 then
   begin
     Conn.PingIntervalMs := FIdleTimeoutMs;
@@ -975,6 +1292,7 @@ begin
   Result := Pooled;
   ListFor(AOrigin).Add(Result);
   Inc(FTotalConnections);
+  MarkUsed(Result);
 end;
 
 function TConnectionPool.PickEligible(
@@ -1004,18 +1322,23 @@ end;
 
 function TConnectionPool.Acquire(const AOrigin, AHost: string;
   const APort: Word; const ARequest: TStreamRequest;
-  const AHeaderTimeoutMs: Integer): IHttpResponse;
+  const AHeaderTimeoutMs: Integer;
+  const AToken: ICancellationToken): IHttpResponse;
 var
   Deadline: QWord;
   Conn: IPooledConnection;
   Acquired: Boolean;
+  Sliced: Integer;
 begin
   Deadline := GetTickCount64 + QWord(AHeaderTimeoutMs);
   while True do
   begin
+    if (AToken <> nil) and AToken.IsCancelled then
+      raise EHttpStreamError.Create('request cancelled', 0, ecCancel);
     FLock.Acquire;
     try
       ReapClosed;
+      ReapIdleLocked;
       Conn := PickEligible(AOrigin);
       if (Conn = nil) and CanOpenNew then
         Conn := OpenConnection(AOrigin, AHost, APort);
@@ -1025,9 +1348,26 @@ begin
 
     if Conn <> nil then
     begin
-      Result := Conn.Acquire(ARequest, AHeaderTimeoutMs, Acquired);
+      if AToken <> nil then
+      begin
+        Sliced := AHeaderTimeoutMs;
+        if Sliced <= 0 then
+          Sliced := cDefaultHeaderTimeoutMs;
+        Result := (Conn as THttpConnection).AcquireCancellable(ARequest,
+          Sliced, AToken, Acquired);
+      end
+      else
+        Result := Conn.Acquire(ARequest, AHeaderTimeoutMs, Acquired);
       if Acquired then
+      begin
+        FLock.Acquire;
+        try
+          MarkUsed(Conn);
+        finally
+          FLock.Release;
+        end;
         Exit;
+      end;
       // the connection filled up between selection and registration; retry
       Sleep(1);
     end
@@ -1139,13 +1479,14 @@ end;
 constructor THttpClient.Create(const AFactory: IHttp2SocketFactory;
   const AMaxConnections, AMaxStreamsPerConnection: Integer;
   const AFollowRedirects: Boolean; const AMaxRedirects, AConnectTimeoutMs,
-  AHeaderTimeoutMs, AIdleTimeoutMs: Integer);
+  AHeaderTimeoutMs, AIdleTimeoutMs: Integer;
+  const AObserver: IHttp2Observer);
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
   FPool := TConnectionPool.Create(AFactory, AMaxConnections,
     AMaxStreamsPerConnection, AConnectTimeoutMs, AHeaderTimeoutMs,
-    AIdleTimeoutMs);
+    AIdleTimeoutMs, AObserver);
   FFollowRedirects := AFollowRedirects;
   FMaxRedirects := AMaxRedirects;
   FHeaderTimeoutMs := AHeaderTimeoutMs;
@@ -1162,9 +1503,11 @@ end;
 
 function THttpClient.Send(const ARequest: THttpRequest): IHttpResponse;
 var
-  Origin, Host, Path: string;
-  Port: Word;
-  R: TStreamRequest;
+  Current: THttpRequest;
+  Method: string;
+  Location, Target: string;
+  Redirects, Retries: Integer;
+  Idempotent: Boolean;
 begin
   if ARequest.Url = '' then
     raise EHttpProtocolError.Create('request URL is empty', ecProtocolError);
@@ -1175,10 +1518,89 @@ begin
   finally
     FLock.Release;
   end;
+
+  Current := ARequest;
+  Method := ARequest.MethodToken;
+  Idempotent := HttpMethodIsIdempotent(Method);
+  Redirects := 0;
+  Retries := 0;
+  while True do
+  begin
+    try
+      Result := SendOnce(Current);
+    except
+      // transparent retry: only an idempotent request with no body writer,
+      // and only when the peer refused the stream or sent GOAWAY so the
+      // stream was never processed (plan S10 task 10.9)
+      on E: EHttpStreamError do
+        if Idempotent and (E.ErrorCode = ecRefusedStream) and
+          (Current.BodyWriter = nil) and
+          (Retries < cMaxTransparentRetries) then
+        begin
+          Inc(Retries);
+          Sleep(1);
+          Continue;
+        end
+        else
+          raise;
+    end;
+
+    if (not FFollowRedirects) or (not HttpStatusIsRedirect(Result.StatusCode)) then
+      Break;
+    Location := Result.Headers.GetFirst('location');
+    if Location = '' then
+      Break;
+
+    Inc(Redirects);
+    if Redirects > FMaxRedirects then
+      raise EHttpTooManyRedirects.CreateFmt(
+        'redirect chain exceeded MaxRedirects (%d)', [FMaxRedirects]);
+
+    Target := ResolveLocation(Current.Url, Location);
+    case Result.StatusCode of
+      303:
+        begin
+          Method := 'GET';
+          Current := Current.DropBody;
+        end;
+      301, 302:
+        begin
+          // spec errors-redirects.md leaves 301/302 method rewriting to the
+          // "standard rules"; these preserve the method for GET/HEAD and
+          // rewrite every other method to GET, dropping the body (the
+          // behaviour every browser and curl use for a POST -> 301/302)
+          if (Method <> 'GET') and (Method <> 'HEAD') then
+          begin
+            Method := 'GET';
+            Current := Current.DropBody;
+          end;
+        end;
+      307, 308:
+        if Current.BodyWriter <> nil then
+          raise EHttpNotReplayable.Create(
+            'a body writer cannot be replayed on a ' +
+            IntToStr(Result.StatusCode) + ' redirect');
+    end;
+    Current := Current.WithMethodToken(Method);
+    Current := Current.WithUrl(Target);
+  end;
+end;
+
+function THttpClient.SendOnce(const ARequest: THttpRequest): IHttpResponse;
+var
+  Origin, Host, Path: string;
+  Port: Word;
+  R: TStreamRequest;
+  Timeout: Integer;
+begin
   ParseHttpUrl(ARequest.Url, Host, Port, Path);
   Origin := OriginOfUrl(ARequest.Url);
   R := ARequest.ToStreamRequest;
-  Result := FPool.Acquire(Origin, Host, Port, R, FHeaderTimeoutMs);
+  Timeout := FHeaderTimeoutMs;
+  if ARequest.HeaderTimeoutMs > 0 then
+    Timeout := ARequest.HeaderTimeoutMs;
+  Result := FPool.Acquire(Origin, Host, Port, R, Timeout,
+    ARequest.CancelToken);
 end;
 
 procedure THttpClient.Close;

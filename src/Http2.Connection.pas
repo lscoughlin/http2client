@@ -17,7 +17,7 @@ interface
 
 uses
   SysUtils, Classes, SyncObjs, Generics.Collections,
-  Http2.Errors, Http2.Frames, Http2.Tls;
+  Http2.Errors, Http2.Frames, Http2.Tls, Http2.Observer;
 
 const
   /// default bound on either frame queue (backpressure instead of growth)
@@ -93,6 +93,8 @@ type
     procedure ApplyPeerSettings(const ASettings: TConnectionSettings);
     procedure RouteInbound(const AFrame: TFrame);
     procedure DrainOutbound;
+    /// write one frame and emit the observer's frame-out event for it
+    procedure WriteTracked(const AFrame: TFrame);
     procedure CheckPingKeepAlive;
     procedure HandlePingAck(const APayload: TBytes);
     procedure Fail(const AMessage: string; const ACode: THttp2ErrorCode);
@@ -137,9 +139,28 @@ type
     FPingIntervalMs: Integer;
     FPingTimeoutMs: Integer;
     FLastActivity: QWord;
+    FObserver: IHttp2Observer;
+    FCloseObserved: Boolean;
     function GetState: TConnectionState;
     function GetPeerSettings: TConnectionSettings;
     procedure SetState(const AValue: TConnectionState);
+    function GetObserver: IHttp2Observer;
+    procedure SetObserver(const AValue: IHttp2Observer);
+    // observer fan-out helpers: each snapshots the observer reference under
+    // FLock, then invokes the callback OUTSIDE the lock (it may re-enter) and
+    // inside a try/except (a raising observer must not break the loop)
+    procedure EmitConnectionOpen;
+    procedure EmitConnectionClose(const AMessage: string;
+      const ACode: THttp2ErrorCode);
+    procedure EmitGoAway(const ALastStreamId: LongWord;
+      const ACode: THttp2ErrorCode);
+    procedure EmitStreamOpen(const AStreamId: LongWord);
+    procedure EmitStreamClose(const AStreamId: LongWord);
+    procedure EmitFrameIn(const AFrame: TFrame);
+    procedure EmitFrameOut(const AFrame: TFrame);
+    procedure EmitWindowUpdate(const AStreamId, AIncrement: LongWord);
+    procedure EmitRetry(const AStreamId: LongWord);
+    procedure EmitDiscarded(const AFrame: TFrame; const AReason: string);
   public
     constructor Create(const ASocket: IHttp2Socket); overload;
     constructor Create(const ASocket: IHttp2Socket;
@@ -196,6 +217,8 @@ type
     property ReadPollMs: Integer read FReadPollMs write FReadPollMs;
     property PingIntervalMs: Integer read FPingIntervalMs write FPingIntervalMs;
     property PingTimeoutMs: Integer read FPingTimeoutMs write FPingTimeoutMs;
+    /// optional observability sink; nil (the default) means no overhead
+    property Observer: IHttp2Observer read GetObserver write SetObserver;
   end;
 
 /// the 24-byte client connection preface (RFC 7540 section 3.5)
@@ -479,6 +502,7 @@ begin
   try
     DoPreface;
     TConnection(FConn).SetState(csOpen);
+    TConnection(FConn).EmitConnectionOpen;
     while not Terminated do
     begin
       DrainOutbound;
@@ -511,7 +535,13 @@ procedure TConnectionThread.DoPreface;
 begin
   FSocket.ReadTimeoutMs := FReadPollMs;
   FSocket.Write(cClientPreface, SizeOf(cClientPreface));
-  WriteFrame(FSockStream, BuildSettingsFrame(FLocalSettings));
+  WriteTracked(BuildSettingsFrame(FLocalSettings));
+end;
+
+procedure TConnectionThread.WriteTracked(const AFrame: TFrame);
+begin
+  WriteFrame(FSockStream, AFrame);
+  TConnection(FConn).EmitFrameOut(AFrame);
 end;
 
 procedure TConnectionThread.ApplyPeerSettings(
@@ -526,7 +556,9 @@ var
   LastStreamId: LongWord;
   Code: THttp2ErrorCode;
   Debug: TBytes;
+  Increment: LongWord;
 begin
+  TConnection(FConn).EmitFrameIn(AFrame);
   case AFrame.Header.FrameType of
     ftSettings:
       if AFrame.IsAck then
@@ -534,19 +566,37 @@ begin
       else
       begin
         ApplyPeerSettings(TConnectionSettings.Decode(AFrame.Payload));
-        WriteFrame(FSockStream, BuildSettingsAck);
+        WriteTracked(BuildSettingsAck);
       end;
     ftPing:
       if AFrame.IsAck then
         HandlePingAck(AFrame.Payload)
       else
-        WriteFrame(FSockStream, BuildPingFrame(AFrame.Payload, True));
+        WriteTracked(BuildPingFrame(AFrame.Payload, True));
     ftGoAway:
       begin
         ParseGoAway(AFrame, LastStreamId, Code, Debug);
         TConnection(FConn).MarkGoAway(LastStreamId);
       end;
   else
+  begin
+    // purely additive observability: report flow-control updates and frames
+    // the switch above ignores, then keep the original routing unchanged
+    if AFrame.Header.FrameType = ftWindowUpdate then
+    begin
+      try
+        Increment := ParseWindowUpdate(AFrame);
+        TConnection(FConn).EmitWindowUpdate(AFrame.Header.StreamId, Increment);
+      except
+        // a malformed WINDOW_UPDATE is left to the normal error path
+      end;
+    end;
+    if not IsKnownFrameType(AFrame.Header.FrameType) then
+      TConnection(FConn).EmitDiscarded(AFrame,
+        'unknown frame type ' + FrameTypeName(AFrame.Header.FrameType))
+    else if AFrame.Header.StreamId = 0 then
+      TConnection(FConn).EmitDiscarded(AFrame,
+        FrameTypeName(AFrame.Header.FrameType) + ' arrived on stream 0');
     // route stream-scoped frames to their owning lease; anything unclaimed
     // (no lease registered yet) stays on the shared inbound queue
     if AFrame.Header.StreamId <> 0 then
@@ -555,6 +605,7 @@ begin
         FInbound.Push(AFrame);
     end;
   end;
+  end;
 end;
 
 procedure TConnectionThread.DrainOutbound;
@@ -562,7 +613,10 @@ var
   Frame: TFrame;
 begin
   while FOutbound.TryPop(Frame) do
+  begin
     WriteFrame(FSockStream, Frame);
+    TConnection(FConn).EmitFrameOut(Frame);
+  end;
 end;
 
 procedure TConnectionThread.CheckPingKeepAlive;
@@ -590,7 +644,7 @@ begin
     FPendingPingPayload[0] := 8;
     FPendingPing := True;
     FPingSentAt := Now;
-    WriteFrame(FSockStream, BuildPingFrame(FPendingPingPayload, False));
+    WriteTracked(BuildPingFrame(FPendingPingPayload, False));
     TConnection(FConn).TouchActivity;
   end;
 end;
@@ -641,6 +695,8 @@ begin
   FPingIntervalMs := 0;
   FPingTimeoutMs := 0;
   FLastActivity := GetTickCount64;
+  FObserver := nil;
+  FCloseObserved := False;
   FStreams := TDictionary<LongWord, IConnectionStream>.Create;
 end;
 
@@ -667,7 +723,12 @@ begin
   if FClosed then
     Exit;
   FClosed := True;
-  if (FThread <> nil) and (GetState = csOpen) then
+  // GOAWAY must be queued even while the preface is still being written: the
+  // worker sets csOpen only *after* DoPreface returns, so a Close racing with
+  // startup would otherwise skip the GOAWAY entirely. Queued frames are
+  // drained after the preface, preserving the wire ordering (preface,
+  // SETTINGS, then GOAWAY).
+  if (FThread <> nil) and (GetState in [csOpening, csOpen]) then
     FOutbound.Push(BuildGoAwayFrame(FHighestStreamId, ecNoError, nil));
   if FThread <> nil then
   begin
@@ -681,6 +742,7 @@ begin
   if FSocket <> nil then
     FSocket.Close;
   SetState(csClosed);
+  EmitConnectionClose('', ecNoError);
 end;
 
 function TConnection.PostFrame(const AFrame: TFrame): Boolean;
@@ -702,6 +764,8 @@ begin
   S := GetState;
   Result := ((S = csGoAway) or (S = csClosed)) and
             (AStreamId > FGoAwayLastStreamId);
+  if Result then
+    EmitRetry(AStreamId);
 end;
 
 function TConnection.WaitForState(const AState: TConnectionState;
@@ -789,6 +853,7 @@ begin
     FLock.Release;
   end;
   RTLEventSetEvent(FStateEvent);
+  EmitGoAway(ALastStreamId, ecNoError);
   // notify OUTSIDE the lock: a lease must never call back into TConnection
   // (RegisterStream/UnregisterStream) while we hold FLock, or it deadlocks
   for S in Snapshot do
@@ -804,6 +869,7 @@ begin
   finally
     FLock.Release;
   end;
+  EmitStreamOpen(AStreamId);
 end;
 
 procedure TConnection.UnregisterStream(const AStreamId: LongWord);
@@ -814,6 +880,7 @@ begin
   finally
     FLock.Release;
   end;
+  EmitStreamClose(AStreamId);
 end;
 
 function TConnection.StreamCount: Integer;
@@ -865,6 +932,7 @@ begin
   FInbound.Shutdown;
   for S in Snapshot do
     S.OnConnectionFailed(AMessage, ACode);
+  EmitConnectionClose(AMessage, ACode);
 end;
 
 procedure TConnection.TouchActivity;
@@ -874,6 +942,172 @@ begin
     FLastActivity := GetTickCount64;
   finally
     FLock.Release;
+  end;
+end;
+
+{ observer fan-out }
+
+function TConnection.GetObserver: IHttp2Observer;
+begin
+  FLock.Acquire;
+  try
+    Result := FObserver;
+  finally
+    FLock.Release;
+  end;
+end;
+
+procedure TConnection.SetObserver(const AValue: IHttp2Observer);
+begin
+  FLock.Acquire;
+  try
+    FObserver := AValue;
+  finally
+    FLock.Release;
+  end;
+end;
+
+procedure TConnection.EmitConnectionOpen;
+var
+  Obs: IHttp2Observer;
+begin
+  Obs := GetObserver;
+  if Obs = nil then
+    Exit;
+  try
+    Obs.OnConnectionOpen;
+  except
+    // an observer must never break the connection loop
+  end;
+end;
+
+procedure TConnection.EmitConnectionClose(const AMessage: string;
+  const ACode: THttp2ErrorCode);
+var
+  Obs: IHttp2Observer;
+  Send: Boolean;
+begin
+  Obs := GetObserver;
+  if Obs = nil then
+    Exit;
+  FLock.Acquire;
+  try
+    Send := not FCloseObserved;
+    FCloseObserved := True;
+  finally
+    FLock.Release;
+  end;
+  if not Send then
+    Exit;
+  try
+    Obs.OnConnectionClose(AMessage, ACode);
+  except
+  end;
+end;
+
+procedure TConnection.EmitGoAway(const ALastStreamId: LongWord;
+  const ACode: THttp2ErrorCode);
+var
+  Obs: IHttp2Observer;
+begin
+  Obs := GetObserver;
+  if Obs = nil then
+    Exit;
+  try
+    Obs.OnGoAway(ALastStreamId, ACode);
+  except
+  end;
+end;
+
+procedure TConnection.EmitStreamOpen(const AStreamId: LongWord);
+var
+  Obs: IHttp2Observer;
+begin
+  Obs := GetObserver;
+  if Obs = nil then
+    Exit;
+  try
+    Obs.OnStreamOpen(AStreamId);
+  except
+  end;
+end;
+
+procedure TConnection.EmitStreamClose(const AStreamId: LongWord);
+var
+  Obs: IHttp2Observer;
+begin
+  Obs := GetObserver;
+  if Obs = nil then
+    Exit;
+  try
+    Obs.OnStreamClose(AStreamId);
+  except
+  end;
+end;
+
+procedure TConnection.EmitFrameIn(const AFrame: TFrame);
+var
+  Obs: IHttp2Observer;
+begin
+  Obs := GetObserver;
+  if Obs = nil then
+    Exit;
+  try
+    Obs.OnFrameIn(AFrame);
+  except
+  end;
+end;
+
+procedure TConnection.EmitFrameOut(const AFrame: TFrame);
+var
+  Obs: IHttp2Observer;
+begin
+  Obs := GetObserver;
+  if Obs = nil then
+    Exit;
+  try
+    Obs.OnFrameOut(AFrame);
+  except
+  end;
+end;
+
+procedure TConnection.EmitWindowUpdate(const AStreamId, AIncrement: LongWord);
+var
+  Obs: IHttp2Observer;
+begin
+  Obs := GetObserver;
+  if Obs = nil then
+    Exit;
+  try
+    Obs.OnWindowUpdate(AStreamId, AIncrement);
+  except
+  end;
+end;
+
+procedure TConnection.EmitRetry(const AStreamId: LongWord);
+var
+  Obs: IHttp2Observer;
+begin
+  Obs := GetObserver;
+  if Obs = nil then
+    Exit;
+  try
+    Obs.OnRetry(AStreamId);
+  except
+  end;
+end;
+
+procedure TConnection.EmitDiscarded(const AFrame: TFrame;
+  const AReason: string);
+var
+  Obs: IHttp2Observer;
+begin
+  Obs := GetObserver;
+  if Obs = nil then
+    Exit;
+  try
+    Obs.OnDiscarded(AFrame, AReason);
+  except
   end;
 end;
 
