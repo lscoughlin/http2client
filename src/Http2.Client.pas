@@ -74,8 +74,10 @@ type
   TDefaultSocketFactory = class(TInterfacedObject, IHttp2SocketFactory)
   private
     FCACertFile: string;
+    FInsecure: Boolean;
   public
-    constructor Create(const ACACertFile: string = '');
+    constructor Create(const ACACertFile: string = '';
+      const AInsecure: Boolean = False);
     function Dial(const AHost: string; const APort: Word;
       const ATimeoutMs: Integer): IHttp2Socket;
   end;
@@ -172,6 +174,7 @@ type
     FProxyPort: Word;
     FSocketFactory: IHttp2SocketFactory;
     FCACertFile: string;
+    FInsecure: Boolean;
     FObserver: IHttp2Observer;
   public
     class function Create: THttpClientFactory; static;
@@ -189,6 +192,10 @@ type
     /// PEM bundle used to verify the peer's certificate; '' = system trust
     /// store. Needed whenever the origin uses a private CA.
     function WithCACertFile(const AFileName: string): THttpClientFactory;
+    /// disable peer certificate verification. Dangerous, intended for test
+    /// harnesses whose cert has no SAN (e.g. the h2 conformance harness,
+    /// which self-signs with CN=localhost only).
+    function WithInsecureTls(const AInsecure: Boolean = True): THttpClientFactory;
     /// observability seam: every connection opened by Build reports its
     /// connection/stream/frame events to AObserver (doc/design/
     /// testing-observability.md). Nil disables observation.
@@ -205,6 +212,7 @@ type
     property ProxyHost: string read FProxyHost;
     property ProxyPort: Word read FProxyPort;
     property CACertFile: string read FCACertFile;
+    property InsecureTls: Boolean read FInsecure;
     property Observer: IHttp2Observer read FObserver;
   end;
 
@@ -642,16 +650,18 @@ end;
 
 { IHttp2SocketFactory }
 
-constructor TDefaultSocketFactory.Create(const ACACertFile: string);
+constructor TDefaultSocketFactory.Create(const ACACertFile: string;
+  const AInsecure: Boolean);
 begin
   inherited Create;
   FCACertFile := ACACertFile;
+  FInsecure := AInsecure;
 end;
 
 function TDefaultSocketFactory.Dial(const AHost: string; const APort: Word;
   const ATimeoutMs: Integer): IHttp2Socket;
 begin
-  Result := TTlsSocket.Dial(AHost, APort, False, ATimeoutMs, FCACertFile);
+  Result := TTlsSocket.Dial(AHost, APort, FInsecure, ATimeoutMs, FCACertFile);
 end;
 
 { THttpRequest }
@@ -830,6 +840,7 @@ begin
   Result.FProxyHost := '';
   Result.FProxyPort := 0;
   Result.FCACertFile := '';
+  Result.FInsecure := False;
   Result.FObserver := nil;
   Result.FSocketFactory := TDefaultSocketFactory.Create;
 end;
@@ -882,10 +893,20 @@ function THttpClientFactory.WithCACertFile(
 begin
   Result := Self;
   Result.FCACertFile := AFileName;
-  // an explicitly injected factory still wins; otherwise use the PEM bundle
+  // an explicitly injected factory still wins; otherwise rebuild the default
   if not (Result.FSocketFactory is TDefaultSocketFactory) then
     Exit;
-  Result.FSocketFactory := TDefaultSocketFactory.Create(AFileName);
+  Result.FSocketFactory := TDefaultSocketFactory.Create(AFileName, Result.FInsecure);
+end;
+
+function THttpClientFactory.WithInsecureTls(
+  const AInsecure: Boolean): THttpClientFactory;
+begin
+  Result := Self;
+  Result.FInsecure := AInsecure;
+  if not (Result.FSocketFactory is TDefaultSocketFactory) then
+    Exit;
+  Result.FSocketFactory := TDefaultSocketFactory.Create(Result.FCACertFile, AInsecure);
 end;
 
 function THttpClientFactory.WithConnectTimeout(
