@@ -96,3 +96,22 @@ docker run --rm h2-test-harness --list   # lists the case ids
   a vault (repo is not git anyway); regenerate with the openssl CLI.
 - Cite versions exactly as in the table when a story's acceptance depends on
   them.
+
+## Prerequisites for a fresh clone (expanded)
+
+The pinned checkouts under `third_party/` are **not** committed (see
+`.gitignore`) — they are external, revision-pinned dependencies. To rebuild
+the environment from a fresh clone:
+
+```sh
+git clone --depth 1 https://github.com/synopse/mORMot2.git third_party/mORMot2
+git clone --depth 1 https://github.com/nomadlabsinc/h2-client-test-harness.git \
+    third_party/h2-client-test-harness
+brew install nghttp2
+docker build -t h2-test-harness third_party/h2-client-test-harness
+make && make test
+```
+
+`OPENSSL_LIBPATH` must be exported for any binary that loads TLS (the
+Makefile does this). Verified on this machine: `docker run --rm
+h2-test-harness --list` lists **146** case ids, matching the harness README.
