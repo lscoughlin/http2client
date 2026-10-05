@@ -1,0 +1,12 @@
+# Build artifacts
+*.o
+*.ppu
+*.a
+*.compiled
+bin/
+lib/
+# Local secrets of no interest
+.DS_Store
+# Vendored third-party: keep, but ignore build outputs within
+third_party/**/*.o
+third_party/**/*.ppu

@@ -1,0 +1,224 @@
+---
+title: "Messages"
+aliases:
+  - "messages"
+tags:
+  - http2client
+  - design
+  - api
+status: draft
+up: "[[http2client]]"
+related:
+  - "[[client-api]]"
+  - "[[protocol]]"
+  - "[[open-questions]]"
+updated: 2026-10-05
+---
+
+# Messages
+
+## HttpResponse
+
+```pascal
+type
+  IHttpResponse = interface
+    function GetStatusCode: LongInt;
+    function GetHeaders: IHttpHeaders;
+    function GetBody: IHttpBodyStream;
+    property StatusCode: LongInt read GetStatusCode;
+    property Headers: IHttpHeaders read GetHeaders;
+    property Body: IHttpBodyStream read GetBody;
+  end;
+
+  IHttpBodyStream = interface
+    function Read(var ABuffer; const ACount: LongInt): LongInt;
+    function Eof: Boolean;
+  end;
+```
+
+The generic read helper (see the syntax note below) maps a response body to
+a `T`:
+
+```pascal
+{$mode delphi}
+type
+  IResponseReader<T> = interface
+    function Read(const AResponse: IHttpResponse): T;
+  end;
+
+  TResponseReader<T> = class(TInterfacedObject, IResponseReader<T>)
+  public
+    class procedure Read(const AResponse: IHttpResponse; out AValue: T);
+  end;
+
+class procedure TResponseReader<T>.Read(const AResponse: IHttpResponse;
+  out AValue: T);
+begin
+  // Pull from AResponse.Body until Eof or enough bytes for T, then decode.
+  // A malformed/short body raises EHttpProtocolError here, not in Send.
+end;
+```
+
+Usage:
+
+```pascal
+var
+  Dto: TMyDto;
+begin
+  Response := Client.Send(Request);
+  TResponseReader<TMyDto>.Read(Response, Dto);
+end;
+```
+
+**Syntax note (verified).** The original
+`Read( reader: ResponseReader<T>, <T> value)` was pseudo-syntax. FPC 3.2.4
+**cannot parse a generic method under `{$mode objfpc}`** — the probe
+`probe.pas` fails with `Syntax error, ";" expected but "<" found`, and
+adding `{$modeswitch genericmethods}` (`probe10.pas`) does not help. Under
+`{$mode delphi}` a generic method *does* compile (`probe9.pas`: generic
+`class procedure Foo<T>` called as `TUtil.Foo<Integer>`). The design
+therefore uses **`{$mode delphi}`** and puts the generic on a **class**
+(`TResponseReader<T>`) so it also works as a specialized class when a
+method-level generic is undesirable. `IResponseReader<T>` remains the
+interface form for dependency injection. See [[fpc-runtime]] for the full
+verified-facts table.
+
+- `StatusCode` is the HTTP/2 `:status` pseudo-header (exactly one required
+  on a response).
+- Pseudo-headers are **not** exposed in the public `Headers` map; they are
+  surfaced through typed properties (`StatusCode`, etc.).
+- **Body consumption:** the body is a stream. `Read` blocks until enough
+  DATA bytes are available or `END_STREAM` is seen. A second read after EOF
+  raises deterministically rather than hanging.
+- The response object stays valid after `Send` returns even while other
+  threads use the client.
+
+## HttpRequest
+
+```pascal
+type
+  THttpMethod = (hmGet, hmHead, hmPost, hmPut, hmDelete, hmConnect,
+    hmOptions, hmTrace, hmPatch);
+
+  IBodyWriter = interface
+    function NextChunk(out ABuffer: TBytes): Boolean;
+  end;
+
+  THttpBody = record
+  private
+    FData: TBytes;
+    FIsSet: Boolean;
+  public
+    class function FromBytes(const AData: TBytes): THttpBody; static;
+    class function FromString(const AData: string): THttpBody; static;
+    function IsSet: Boolean;
+    function Data: TBytes;
+  end;
+
+  THttpRequest = record
+  private
+    FMethod: THttpMethod;
+    FMethodOverride: string;   // extension verbs, uppercase token
+    FUrl: string;
+    FHeaders: IHttpHeaders;
+    FBody: THttpBody;
+    FBodyWriter: IBodyWriter;
+  public
+    class function Create(const AMethod: THttpMethod;
+      const AUrl: string): THttpRequest; static;
+    function WithMethod(const AMethod: THttpMethod): THttpRequest;
+    function WithMethodToken(const AToken: string): THttpRequest;  // escape hatch
+    function WithHeader(const AName, AValue: string): THttpRequest;
+    function WithBody(const ABody: THttpBody): THttpRequest;
+    function WithBodyWriter(const AWriter: IBodyWriter): THttpRequest;
+    function Url: string;
+    function Method: THttpMethod;
+    function Headers: IHttpHeaders;
+    function Body: THttpBody;
+    function BodyWriter: IBodyWriter;
+  end;
+```
+
+- `WithMethodToken` is the escape hatch for extension verbs. The token is
+  validated and **uppercased** before it reaches HPACK; a lowercase method
+  on the wire is a protocol error.
+- `FBody` and `FBodyWriter` are mutually exclusive: `FBodyWriter` wins and
+  `FBody.IsSet=False` is required; setting both raises.
+- `FHeaders` is an interface, so copying a `THttpRequest` shares the header
+  map. Whether to share or copy-on-write is an open question — see
+  [[open-questions]].
+- Pseudo-header mapping happens at encode time:
+  `:method` ← method token, `:scheme` ← `'https'`, `:path` ← path+query
+  (`'/'` when empty), `:authority` ← `host[:port]` (port omitted when the
+  scheme default). Regular headers follow, all names lowercased.
+- A `FBodyWriter` body is single-use / non-replayable (see
+  [[errors-redirects]]).
+
+## Headers and header names
+
+`IHttpHeaders` is a map of `string` → list of `string`:
+
+```pascal
+type
+  IHttpHeaders = interface
+    procedure Add(const AName, AValue: string);
+    procedure SetValue(const AName, AValue: string);
+    function GetValues(const AName: string): TArray<string>;
+    function GetFirst(const AName: string): string;
+    function Contains(const AName: string): Boolean;
+    procedure Remove(const AName: string);
+    function Names: TArray<string>;
+  end;
+```
+
+Implementation uses `TDictionary<string, TStringList>` (or
+`TFPGMap<string, TStringList>`) inside a `TInterfacedObject`. Header names
+are normalized to lowercase on `Add`/`SetValue`; values are preserved
+verbatim.
+
+Header names are a set of constants of common HTTP header names:
+
+```pascal
+const
+  // Pseudo-headers (never mixed into the regular map).
+  HeaderMethod    = ':method';
+  HeaderPath      = ':path';
+  HeaderScheme    = ':scheme';
+  HeaderAuthority = ':authority';
+  HeaderStatus    = ':status';
+
+  // Regular headers, lowercase (HTTP/2 wire form).
+  HeaderContentType   = 'content-type';
+  HeaderContentLength = 'content-length';
+  HeaderContentEncoding = 'content-encoding';
+  HeaderAccept        = 'accept';
+  HeaderAcceptEncoding = 'accept-encoding';
+  HeaderUserAgent     = 'user-agent';
+  HeaderAuthorization = 'authorization';
+  HeaderCookie        = 'cookie';
+  HeaderSetCookie     = 'set-cookie';
+  HeaderCacheControl  = 'cache-control';
+  HeaderLocation      = 'location';
+  HeaderHost          = 'host';
+  HeaderTe            = 'te';
+```
+
+Do not include connection-specific headers (`connection`, `keep-alive`,
+`transfer-encoding`) — they are forbidden in HTTP/2.
+
+## Request and response streaming
+
+- **Request:** a `THttpBody` is sent in one or more `ftData` frames; an
+  `IBodyWriter` is pulled by the connection thread until
+  `NextChunk` returns `False`, then `END_STREAM` is set on the last DATA
+  frame (or on `HEADERS` when there is no body). A writer body is single-use
+  and non-replayable.
+- **Response:** `Send` returns after HEADERS. The caller reads `Body` until
+  `Eof`. `END_STREAM` (or a bodyless `HEADERS`) ends the body;
+  `ftRstStream` mid-body surfaces from `Read`, not from the already-returned
+  `Send`.
+- `HEAD` responses and `204`/`304` have no body by definition; `Body.Eof` is
+  immediately `True`.
+- Buffered vs. streamed is an explicit choice of reader: a buffering
+  `IResponseReader<T>` reads to EOF then decodes; an incremental one decodes
+  per chunk.
