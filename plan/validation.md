@@ -42,10 +42,16 @@ quietly substitute:
 ## A. nghttpd interop (first real green)
 
 ```sh
-nghttpd -d /tmp/h2root --no-tls 8080            # sanity only
-nghttpd -d /tmp/h2root -n test/certs 8443       # TLS + ALPN h2 (gate)
-test/testclient https://localhost:8443/         # uses insecure test mode
+export OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib
+tools/validate/interop.sh          # or: make validate-interop
 ```
+
+The script starts `nghttpd` twice itself: `--echo-upload` with TLS+ALPN
+`h2` on `INTEROP_PORT` (default 18443), and `--no-tls` on
+`INTEROP_PLAIN_PORT` (default 18080) for the ALPN-negative case. Certs are
+`test/certs/localhost.{crt,key}`; note **nghttpd takes the key before the
+cert**. `INTEROP_HTDOCS` (default `/tmp/nghttpd-root`) holds `index.html`
+(10 bytes) and `big.bin` (100000 bytes).
 
 | ID | Case | Expected |
 |---|---|---|
@@ -60,6 +66,24 @@ test/testclient https://localhost:8443/         # uses insecure test mode
 | A.9 | TLS ALPN | `SSL_get0_alpn_selected == h2`; an http/1.1-only server raises |
 
 Acceptance command: `make validate-interop` (wraps the above) exits 0.
+
+**Result (2026-10-05): `PASS=8 FAIL=0 SKIP=1` → `RESULT: interop gate GREEN`.**
+A.1–A.7 and A.9 PASS; **A.8 is SKIP**. A.3 was closed by adding a
+`--body-writer` mode to `test/h2probe.pas` (`TChunkWriter`, 7-byte chunks)
+and a matching `run_probe ... --body-writer=...` case in `interop.sh`. A.7
+exposed and fixed a real client bug — see the S12 note below. A.8 has no
+nghttpd trigger to force a mid-flight GOAWAY; the same semantics are covered
+by unit tests (`TStreamLease.OnConnectionGoAway` sets
+`FRetryable := FStreamId > ALastStreamId`; `TestGoAwayNotifiesEveryStream`
+in `test/Http2.ConnectionLifecycle.Test.pas`).
+
+**A.7 found a real bug: flow control was never wired.** `TFlowControl` was
+implemented and unit-tested but referenced by no runtime code, so the client
+never returned window credit after receiving DATA; a 100 KB response stalled
+at the 65535-byte initial window with `EHttpTimeout`. The fix lives in
+`src/Http2.Connection.pas` (`TrackReceivedData` / `SendWindowUpdate`, batched
+at `cWindowUpdateBatchSize = 32768`) and is documented in
+`doc/design/flow-control.md` under "Validation finding (S12)".
 
 ## B. h2-client-test-harness (primary conformance)
 
@@ -140,6 +164,23 @@ Record: toolchain versions, harness revision/image digest, the B results
 table, A command output summary, C port list, E comparison notes, and every
 skip with its reason. Update the `status:` front matter to `validated` only
 when A and B are green.
+
+### Toolchain and suite revisions (2026-10-05)
+
+| Component | Version / revision |
+|---|---|
+| Free Pascal | `fpc 3.2.4`, target `aarch64-darwin` (`ppca64`) |
+| OpenSSL | Homebrew `openssl@3` (`OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib`) |
+| nghttp2 (`nghttpd`/`nghttp`) | `1.70.0` |
+| `h2-client-test-harness` image | `h2-test-harness`, digest `sha256:745149517ede…` |
+| `third_party/h2-client-test-harness` | git `0bc075c` |
+| Container runtime | Rancher Desktop `docker` (`~/.rd/bin/docker`) |
+| Unit suite | 247 tests, 0 errors, 0 failures |
+
+Skips, each with its reason: **A.8** (no nghttpd GOAWAY trigger; covered by
+unit tests), **C.6** (draft-09 plaintext `h2c`; client is TLS-only), **D**
+(h2spec is server-conformance only). No conformance claim rests on the
+draft-09 suite.
 
 ## Done when
 
