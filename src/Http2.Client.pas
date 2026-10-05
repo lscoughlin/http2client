@@ -48,7 +48,10 @@ type
 
   /// the production factory: TCP then TLS handshake offering ALPN "h2"
   TDefaultSocketFactory = class(TInterfacedObject, IHttp2SocketFactory)
+  private
+    FCACertFile: string;
   public
+    constructor Create(const ACACertFile: string = '');
     function Dial(const AHost: string; const APort: Word;
       const ATimeoutMs: Integer): IHttp2Socket;
   end;
@@ -130,6 +133,7 @@ type
     FProxyHost: string;
     FProxyPort: Word;
     FSocketFactory: IHttp2SocketFactory;
+    FCACertFile: string;
   public
     class function Create: THttpClientFactory; static;
     function WithMaxConnections(const AMax: Integer): THttpClientFactory;
@@ -143,6 +147,9 @@ type
     function WithIdleTimeout(const AMs: Integer): THttpClientFactory;
     /// test seam: inject the transport factory (no real sockets)
     function WithSocketFactory(const AFactory: IHttp2SocketFactory): THttpClientFactory;
+    /// PEM bundle used to verify the peer's certificate; '' = system trust
+    /// store. Needed whenever the origin uses a private CA.
+    function WithCACertFile(const AFileName: string): THttpClientFactory;
     function Build: IHttpClient;
 
     property MaxConnections: Integer read FMaxConnections;
@@ -154,6 +161,7 @@ type
     property IdleTimeoutMs: Integer read FIdleTimeoutMs;
     property ProxyHost: string read FProxyHost;
     property ProxyPort: Word read FProxyPort;
+    property CACertFile: string read FCACertFile;
   end;
 
   /// one pooled connection, exposed as an interface so an outstanding response
@@ -447,10 +455,16 @@ end;
 
 { IHttp2SocketFactory }
 
+constructor TDefaultSocketFactory.Create(const ACACertFile: string);
+begin
+  inherited Create;
+  FCACertFile := ACACertFile;
+end;
+
 function TDefaultSocketFactory.Dial(const AHost: string; const APort: Word;
   const ATimeoutMs: Integer): IHttp2Socket;
 begin
-  Result := TTlsSocket.Dial(AHost, APort, False, ATimeoutMs);
+  Result := TTlsSocket.Dial(AHost, APort, False, ATimeoutMs, FCACertFile);
 end;
 
 { THttpRequest }
@@ -600,6 +614,7 @@ begin
   Result.FIdleTimeoutMs := cDefaultIdleTimeoutMs;
   Result.FProxyHost := '';
   Result.FProxyPort := 0;
+  Result.FCACertFile := '';
   Result.FSocketFactory := TDefaultSocketFactory.Create;
 end;
 
@@ -644,6 +659,17 @@ function THttpClientFactory.WithSocketFactory(
 begin
   Result := Self;
   Result.FSocketFactory := AFactory;
+end;
+
+function THttpClientFactory.WithCACertFile(
+  const AFileName: string): THttpClientFactory;
+begin
+  Result := Self;
+  Result.FCACertFile := AFileName;
+  // an explicitly injected factory still wins; otherwise use the PEM bundle
+  if not (Result.FSocketFactory is TDefaultSocketFactory) then
+    Exit;
+  Result.FSocketFactory := TDefaultSocketFactory.Create(AFileName);
 end;
 
 function THttpClientFactory.WithConnectTimeout(

@@ -109,6 +109,7 @@ type
     FTransport: IHttp2Socket;
     FHost: string;
     FInsecure: Boolean;
+    FCACertFile: string;
     FCtx: PSSL_CTX;
     FSsl: PSSL;
     FHandshaked: Boolean;
@@ -140,7 +141,7 @@ type
     function GetSocketFd: Integer; virtual;
   public
     constructor Create(const ATransport: IHttp2Socket; const AHost: string;
-      const AInsecure: Boolean = False);
+      const AInsecure: Boolean = False; const ACACertFile: string = '');
     destructor Destroy; override;
     /// perform the TLS handshake and verify ALPN; raises on failure
     procedure Establish;
@@ -148,8 +149,11 @@ type
     /// explicit verify-off toggle (default False = verify the peer)
     class function Dial(const AHost: string; const APort: Word;
       const AInsecure: Boolean = False;
-      const AConnectTimeoutMs: Integer = cDefaultSocketTimeoutMs): IHttp2Socket;
+      const AConnectTimeoutMs: Integer = cDefaultSocketTimeoutMs;
+      const ACACertFile: string = ''): IHttp2Socket;
     property Insecure: Boolean read FInsecure;
+    /// PEM bundle used to verify the peer; '' = the system trust store
+    property CACertFile: string read FCACertFile;
     property SelectedProtocol: string read FSelectedProtocol;
     function Read(var ABuffer; ACount: Integer): Integer;
     function Write(const ABuffer; ACount: Integer): Integer;
@@ -407,12 +411,13 @@ end;
 { TTlsSocket }
 
 constructor TTlsSocket.Create(const ATransport: IHttp2Socket;
-  const AHost: string; const AInsecure: Boolean);
+  const AHost: string; const AInsecure: Boolean; const ACACertFile: string);
 begin
   inherited Create;
   FTransport := ATransport;
   FHost := AHost;
   FInsecure := AInsecure;
+  FCACertFile := ACACertFile;
   FConnectTimeoutMs := cDefaultSocketTimeoutMs;
   FReadTimeoutMs := cDefaultSocketTimeoutMs;
   FWriteTimeoutMs := cDefaultSocketTimeoutMs;
@@ -472,7 +477,17 @@ procedure TTlsSocket.ApplyVerifyMode(const ACtx: PSSL_CTX;
   const AMode: Integer);
 begin
   if AMode <> SSL_VERIFY_NONE then
-    SSL_CTX_set_default_verify_paths(ACtx);
+    // an explicit PEM bundle (private CA, or a test certificate) replaces the
+    // system trust store rather than adding to it
+    if FCACertFile <> '' then
+    begin
+      if SSL_CTX_load_verify_locations(ACtx, PUtf8Char(UTF8String(FCACertFile)),
+         nil) <> 1 then
+        raise EHttpConnectionError.CreateFmt(
+          'SSL_CTX_load_verify_locations failed for "%s"', [FCACertFile]);
+    end
+    else
+      SSL_CTX_set_default_verify_paths(ACtx);
   SSL_CTX_set_verify(ACtx, AMode, nil);
 end;
 
@@ -593,13 +608,14 @@ begin
 end;
 
 class function TTlsSocket.Dial(const AHost: string; const APort: Word;
-  const AInsecure: Boolean; const AConnectTimeoutMs: Integer): IHttp2Socket;
+  const AInsecure: Boolean; const AConnectTimeoutMs: Integer;
+  const ACACertFile: string): IHttp2Socket;
 var
   Transport: TPlainSocket;
   Sock: TTlsSocket;
 begin
   Transport := TPlainSocket.Create(AHost, APort, AConnectTimeoutMs);
-  Sock := TTlsSocket.Create(Transport, AHost, AInsecure);
+  Sock := TTlsSocket.Create(Transport, AHost, AInsecure, ACACertFile);
   Sock.ConnectTimeoutMs := AConnectTimeoutMs;
   Sock.ReadTimeoutMs := AConnectTimeoutMs;
   try

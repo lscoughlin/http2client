@@ -178,6 +178,7 @@ type
     procedure TestCloseKeepsOutstandingBodyReadable;
     // 09.10 / integration (opt-in: set HTTP2_LIVE_ITEST=1 and run nghttpd)
     procedure TestLiveGetAgainstNghttpd;
+    procedure TestLivePostEchoAgainstNghttpd;
   end;
 
 implementation
@@ -982,10 +983,40 @@ begin
   Url := GetEnvironmentVariable('HTTP2_LIVE_ITEST_URL');
   if Url = '' then
     Url := 'https://127.0.0.1:8080/';
-  Client := THttpClientFactory.Create.Build;
+  Client := THttpClientFactory.Create
+    .WithCACertFile(GetEnvironmentVariable('HTTP2_LIVE_ITEST_CA'))
+    .Build;
   try
     R := Client.Send(THttpRequest.Create(hmGet, Url));
     AssertEquals('live GET returns 200', 200, R.StatusCode);
+  finally
+    Client.Close;
+  end;
+end;
+
+procedure TClientTest.TestLivePostEchoAgainstNghttpd;
+var
+  Client: IHttpClient;
+  R: IHttpResponse;
+  Url, Echoed, Sent: string;
+begin
+  // nghttpd must be started with --echo-upload so a POST is echoed back
+  if GetEnvironmentVariable('HTTP2_LIVE_ITEST') <> '1' then
+    Exit;
+  Url := GetEnvironmentVariable('HTTP2_LIVE_ITEST_URL');
+  if Url = '' then
+    Url := 'https://127.0.0.1:8080/';
+  Sent := 'http2client-echo-body';
+  Client := THttpClientFactory.Create
+    .WithCACertFile(GetEnvironmentVariable('HTTP2_LIVE_ITEST_CA'))
+    .Build;
+  try
+    R := Client.Send(THttpRequest.Create(hmPost, Url)
+      .WithHeader('content-type', 'text/plain')
+      .WithBody(THttpBody.FromString(Sent)));
+    AssertEquals('live POST returns 200', 200, R.StatusCode);
+    Echoed := string(AnsiString(PAnsiChar(ReadAllBodyBytes(R.Body))));
+    AssertEquals('nghttpd echoed the uploaded POST body', Sent, Echoed);
   finally
     Client.Close;
   end;
