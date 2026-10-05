@@ -10,3 +10,6 @@ lib/
 # Vendored third-party: keep, but ignore build outputs within
 third_party/**/*.o
 third_party/**/*.ppu
+# Pinned upstream checkouts (revisions recorded in plan/toolchain.md)
+third_party/mORMot2/
+third_party/h2-client-test-harness/

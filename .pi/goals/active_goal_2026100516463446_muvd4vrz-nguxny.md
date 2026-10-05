@@ -5,14 +5,14 @@
   "status": "active",
   "autoContinue": true,
   "usage": {
-    "tokensUsed": 276435,
-    "activeSeconds": 37
+    "tokensUsed": 279136,
+    "activeSeconds": 38
   },
   "sisyphus": false,
   "createdAt": "2026-10-05T14:46:34.463Z",
-  "updatedAt": "2026-10-05T14:47:22.482Z",
+  "updatedAt": "2026-10-05T14:47:23.968Z",
   "activePath": ".pi/goals/active_goal_2026100516463446_muvd4vrz-nguxny.md",
-  "revision": 27,
+  "revision": 28,
   "scheduler": {
     "version": 1,
     "owner": "01a10c49-6455-75dd-a27f-500acef91d00",
@@ -126,8 +126,8 @@ Implement the HTTP/2 client specified in doc/design/ and planned in plan/README.
 - Status: running
 - Auto-continue: on
 - Sisyphus mode: no
-- Time spent: 37s
-- Tokens used: 276K (276,435) tokens
+- Time spent: 38s
+- Tokens used: 279K (279,136) tokens
 ## Tasks
 
 <!-- blockCompletion: true -->
