@@ -802,17 +802,26 @@ var
   Fields: THeaderBlock;
   F: THttpHeaderField;
   I, St: Integer;
+  SawRegular: Boolean;
 begin
   Fields := FDecoder.Decode(ABlock);
   if not FHeadersDecoded then
   begin
     FStatusCode := -1;
     FExpectedLength := -1;
+    SawRegular := False;
     for I := 0 to High(Fields) do
     begin
       F := Fields[I];
       if F.Name = ':status' then
       begin
+        // RFC 7540 section 8.1.2.1: pseudo-header fields MUST appear before
+        // regular fields; a :status arriving after a regular field is a
+        // malformed response -> STREAM PROTOCOL_ERROR (harness 8.1.2.1/4).
+        if SawRegular then
+          raise EHttpStreamError.Create(
+            ':status pseudo-header after a regular header field', FStreamId,
+            ecProtocolError);
         St := StrToIntDef(F.Value, -1);
         if (St < 100) or (St > 599) then
           // RFC 7540 section 8.1.2.6: a malformed response is a STREAM error
@@ -827,6 +836,14 @@ begin
           ecProtocolError)
       else
       begin
+        SawRegular := True;
+        // RFC 7540 section 8.1.2: header field names MUST be lowercase; a
+        // response with an uppercase name is malformed -> STREAM
+        // PROTOCOL_ERROR (harness 8.1.2/1).
+        if F.Name <> LowerCase(F.Name) then
+          raise EHttpStreamError.Create(
+            'header field name is not lowercase: ' + F.Name, FStreamId,
+            ecProtocolError);
         if SameText(F.Name, 'content-length') then
           FExpectedLength := StrToInt64Def(F.Value, -1);
         FResponseHeaders.Add(F.Name, F.Value);
@@ -836,16 +853,20 @@ begin
       raise EHttpStreamError.Create('response has no :status', FStreamId,
         ecProtocolError);
     FHeadersDecoded := True;
-    // bodyless responses: 1xx, 204, 304 and every HEAD request. A declared
-    // content-length on these describes the entity that a GET *would* return
-    // (RFC 9110 section 8.6), NOT the bytes transferred, so it must not be
-    // compared against the received DATA length.
-    if RequestIsBodyless or ((FStatusCode >= 100) and (FStatusCode < 200)) or
-       (FStatusCode = 204) or (FStatusCode = 304) then
+    // bodyless responses: 1xx, 204, 304 and every HEAD request.
+    //  * HEAD and 1xx: a declared content-length describes the entity a GET
+    //    *would* return (RFC 9110 section 8.6), so exempt it from the length
+    //    check entirely.
+    //  * 204/304: no body is sent, but a non-zero declared content-length is
+    //    still malformed (RFC 7540 section 8.1.2.6); keep the value so
+    //    MarkResponseComplete can compare it against the zero bytes received.
+    if RequestIsBodyless or ((FStatusCode >= 100) and (FStatusCode < 200)) then
     begin
       FExpectedLength := -1;
       MarkResponseComplete;
     end
+    else if (FStatusCode = 204) or (FStatusCode = 304) then
+      MarkResponseComplete
     else
       FResponseState := rsBodyOpen;
   end  else
@@ -896,8 +917,14 @@ begin
   if FResponseState = rsIdle then
     raise EHttpProtocolError.Create('DATA before response HEADERS',
       ecProtocolError);
+  // DATA on a stream that already saw END_STREAM is a STREAM error, not a
+  // connection error: only this stream is broken (RFC 7540 section 5.1,
+  // "closed (remote)" / "half-closed (remote)"), and the peer is told with
+  // RST_STREAM. Raising a connection error here aborted the whole connection
+  // and the harness scored it as a level mismatch (8.1.2.6/2).
   if (FResponseState = rsBodyComplete) or FBodyEof then
-    raise EHttpProtocolError.Create('DATA after END_STREAM', ecProtocolError);
+    raise EHttpStreamError.Create('DATA after END_STREAM', FStreamId,
+      ecStreamClosed);
   FBodyPending := ExtractDataPayload(AFrame);
   FBodyPendingOfs := 0;
   Inc(FBodyReceived, Length(FBodyPending));

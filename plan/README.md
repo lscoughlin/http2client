@@ -6,7 +6,7 @@ aliases:
 tags:
   - http2client
   - plan
-status: ready
+status: complete
 spec: "[[http2client]]"
 updated: 2026-10-05
 ---

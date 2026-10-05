@@ -21,9 +21,11 @@
 #            timed out / stayed open (a real client bug).
 #   UNKNOWN: neither side resolves to an outcome class.
 #
-# harness_wrote_status: whether the harness case ever writes a response
-# HEADERS frame carrying a :status (source-derived; only these 21 ids can
-# possibly yield a successful request for a compliant client).
+# The outcome class for every id is DECLARED in plan/harness-expectations.tsv,
+# generated from the harness verifier sources. The reference run only tells us
+# whether it demonstrated that declared outcome; where it could not (Go's
+# verifier fails, or the whole oracle was invalid) a declared outcome we DO meet
+# still counts as BETTER rather than being scored against a broken oracle.
 set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -56,167 +58,34 @@ if [ -z "$DOCKER" ]; then
 fi
 
 # --- static expectation annotation (from verifier/cases/*.go source) --------
-# id=intent where intent is success|conn-error|stream-error|MULTI:...|UNKNOWN
-STATIC_EXPECT="$(cat <<'EOF'
-3.5/1=MULTI:conn-error/success
-3.5/2=MULTI:conn-error/success
-4.1/1=MULTI:success
-4.1/2=MULTI:success
-4.1/3=MULTI:success
-4.2/1=MULTI:conn-error/stream-error/success
-4.2/2=MULTI:conn-error/stream-error/success
-4.2/3=MULTI:conn-error/stream-error/success
-5.1.1/1=conn-error
-5.1.1/2=conn-error
-5.1.2/1=MULTI:conn-error/stream-error
-5.1/1=MULTI:conn-error/stream-error
-5.1/10=MULTI:conn-error/stream-error
-5.1/11=MULTI:conn-error/stream-error
-5.1/12=MULTI:conn-error/stream-error
-5.1/13=MULTI:conn-error/stream-error
-5.1/2=MULTI:conn-error/stream-error
-5.1/3=MULTI:conn-error/stream-error
-5.1/4=MULTI:conn-error/stream-error
-5.1/5=MULTI:conn-error/stream-error
-5.1/6=MULTI:conn-error/stream-error
-5.1/7=MULTI:conn-error/stream-error
-5.1/8=MULTI:conn-error/stream-error
-5.1/9=MULTI:conn-error/stream-error
-5.3.1/1=stream-error
-5.3.1/2=stream-error
-5.4.1/1=conn-error
-5.4.1/2=conn-error
-6.1/1=MULTI:conn-error/stream-error
-6.1/2=MULTI:conn-error/stream-error
-6.1/3=MULTI:conn-error/stream-error
-6.10/2=conn-error
-6.10/3=UNKNOWN
-6.10/4=UNKNOWN
-6.10/5=UNKNOWN
-6.10/6=UNKNOWN
-6.2/1=conn-error
-6.2/2=conn-error
-6.2/3=conn-error
-6.2/4=conn-error
-6.3/1=MULTI:conn-error/stream-error
-6.3/2=MULTI:conn-error/stream-error
-6.4/1=conn-error
-6.4/2=conn-error
-6.4/3=conn-error
-6.5/1=UNKNOWN
-6.5/2=UNKNOWN
-6.5/3=UNKNOWN
-6.5.2/1=UNKNOWN
-6.5.2/2=UNKNOWN
-6.5.2/3=UNKNOWN
-6.5.2/4=UNKNOWN
-6.5.2/5=UNKNOWN
-6.5.3/2=UNKNOWN
-6.7/1=UNKNOWN
-6.7/2=UNKNOWN
-6.7/3=UNKNOWN
-6.7/4=UNKNOWN
-6.8/1=UNKNOWN
-6.9.1/1=MULTI:conn-error/stream-error/success
-6.9.1/2=MULTI:conn-error/stream-error/success
-6.9.1/3=MULTI:conn-error/stream-error/success
-6.9.2/3=UNKNOWN
-6.9/1=UNKNOWN
-6.9/2=UNKNOWN
-6.9/3=UNKNOWN
-8.1/1=UNKNOWN
-8.1.2/1=UNKNOWN
-8.1.2.1/1=UNKNOWN
-8.1.2.1/2=UNKNOWN
-8.1.2.1/3=UNKNOWN
-8.1.2.1/4=UNKNOWN
-8.1.2.2/1=UNKNOWN
-8.1.2.2/2=UNKNOWN
-8.1.2.3/1=UNKNOWN
-8.1.2.3/2=UNKNOWN
-8.1.2.3/3=UNKNOWN
-8.1.2.3/4=UNKNOWN
-8.1.2.3/5=UNKNOWN
-8.1.2.3/6=UNKNOWN
-8.1.2.3/7=UNKNOWN
-8.1.2.6/1=UNKNOWN
-8.1.2.6/2=UNKNOWN
-8.2/1=UNKNOWN
-generic/1/1=MULTI:conn-error/success
-generic/2/1=MULTI:conn-error/success
-generic/3.1/1=MULTI:success
-generic/3.1/2=MULTI:success
-generic/3.1/3=MULTI:success
-generic/3.10/1=MULTI:success
-generic/3.2/1=MULTI:success
-generic/3.2/2=MULTI:success
-generic/3.2/3=MULTI:success
-generic/3.3/1=MULTI:success
-generic/3.3/2=MULTI:success
-generic/3.3/3=MULTI:success
-generic/3.3/4=MULTI:success
-generic/3.3/5=MULTI:success
-generic/3.4/1=MULTI:success
-generic/3.5/1=success
-generic/3.7/1=success
-generic/3.8/1=success
-generic/3.9/1=MULTI:success
-generic/4/1=MULTI:success
-generic/4/2=MULTI:success
-generic/5/1=MULTI:conn-error/success
-generic/misc/1=MULTI:success
-hpack/2.3.3/1=UNKNOWN
-hpack/2.3.3/2=UNKNOWN
-hpack/2.3/1=MULTI:success
-hpack/4.1/1=MULTI:success
-hpack/4.2/1=UNKNOWN
-hpack/5.2/1=MULTI:conn-error
-hpack/5.2/2=MULTI:conn-error
-hpack/5.2/3=MULTI:conn-error
-hpack/6.1/1=conn-error
-hpack/6.2.2/1=MULTI:success
-hpack/6.2.3/1=MULTI:success
-hpack/6.2/1=MULTI:success
-hpack/6.3/1=conn-error
-hpack/misc/1=MULTI:success
-http2/4.3/1=MULTI:conn-error/success
-http2/5.5/1=MULTI:conn-error/success
-http2/7/1=MULTI:conn-error/success
-http2/8.1.2.4/1=MULTI:conn-error/success
-http2/8.1.2.5/1=MULTI:conn-error/success
-complete/1=MULTI:success
-complete/10=MULTI:success
-complete/11=MULTI:success
-complete/12=MULTI:success
-complete/13=MULTI:success
-complete/2=MULTI:success
-complete/3=MULTI:success
-complete/4=MULTI:success
-complete/5=MULTI:success
-complete/6=MULTI:success
-complete/7=MULTI:success
-complete/8=MULTI:success
-complete/9=MULTI:success
-extra/1=MULTI:success
-extra/2=MULTI:success
-extra/3=MULTI:success
-extra/4=MULTI:success
-extra/5=MULTI:success
-final/1=MULTI:success
-final/2=MULTI:success
-EOF
-)"
+# --- declared expectations (authority: the verifier's own sources) ----------
+# plan/harness-expectations.tsv is generated from
+# third_party/h2-client-test-harness/verifier/cases/*.go by
+# tools/validate/extract_expectations.py. Each row is "<id>\t<expectation>"
+# with expectation in {success, conn-error, stream-error}.
+#
+# Why the declared table and not the reference run's own wording: the image's
+# verifier matches SUBSTRINGS of the Go client's error text, so a case declared
+# as ExpectConnectionError can still log "Verifier passed" while Go actually
+# reported a *stream* error (e.g. 5.1/1, 6.2/4). Scoring us against that
+# observed wording would import Go's imprecision; the declaration is the rule.
+EXPECTATIONS="$REPO_ROOT/plan/harness-expectations.tsv"
+if [ ! -f "$EXPECTATIONS" ]; then
+  echo "ERROR: $EXPECTATIONS missing; regenerate with:" >&2
+  echo "  python3 tools/validate/extract_expectations.py \\" >&2
+  echo "      third_party/h2-client-test-harness/verifier/cases \\" >&2
+  echo "      > plan/harness-expectations.tsv" >&2
+  exit 1
+fi
+
+declared_intent() { # id -> success|conn-error|stream-error|'' (absent)
+  awk -F'\t' -v id="$1" '$1 == id { print $2; exit }' "$EXPECTATIONS"
+}
 
 # ids whose harness case writes a response :status (source-derived)
 STATUS_WRITERS="6.10/2 6.9/2 8.1/1 8.1.2/1 8.1.2.1/1 8.1.2.1/2 8.1.2.1/3 \
 8.1.2.1/4 8.1.2.2/1 8.1.2.2/2 8.1.2.3/1 8.1.2.6/1 8.1.2.6/2 hpack/2.3.3/1 \
 hpack/2.3.3/2 hpack/4.2/1 http2/8.1.2.4/1 6.10/3 6.10/4 6.10/5 6.10/6"
-
-static_intent() { # id -> intent string
-  local line
-  line="$(echo "$STATIC_EXPECT" | grep -m1 "^$1=" || true)"
-  if [ -z "$line" ]; then echo "UNKNOWN"; else echo "${line#*=}"; fi
-}
 
 wrote_status() { # id -> yes/no
   local x
@@ -233,28 +102,23 @@ compile_probe() {
 }
 
 classify_ref_log() { # logfile id -> "pass|fail class"
-  # The reference resolves to an outcome class ONLY when its verifier passed.
+  # The reference run tells us only whether the reference client produced the
+  # declared outcome. The EXPECTED class itself comes from the declarations in
+  # plan/harness-expectations.tsv (see declared_intent), NOT from the reference
+  # log: the image's verifier matches error SUBSTRINGS, so its own wording can
+  # disagree with the case author's expectation.
   #
-  # The expected class comes from the verifier's OWN success/failure message,
-  # falling back to the curated table only when the log is silent; that keeps
-  # the oracle honest when the image is rebuilt. A positive control
-  # (BASELINE_ID) must pass first; if it does not, the reference is not
-  # trustworthy and every row is downgraded to fail/invalid rather than being
-  # scored against a broken oracle.
-  local log="$1" intent cls
+  # A positive control (BASELINE_ID) must pass first; if it does not, the
+  # reference is not trustworthy and every row is downgraded to fail/invalid.
+  local log="$1"
   if [ "${BASELINE_OK:-}" != yes ]; then echo "fail invalid"; return; fi
   if grep -q 'Got successful response as expected' "$log"; then
     echo "pass success"; return
   fi
-  if grep -q 'Got expected error' "$log"; then
-    if grep -q 'connection error:' "$log"; then echo "pass conn-error"; return; fi
-    if grep -q 'stream error:' "$log"; then echo "pass stream-error"; return; fi
-    intent="$(static_intent "$2")"
-    case "$intent" in
-      *conn-error*) echo "pass conn-error"; return;;
-      *stream-error*) echo "pass stream-error"; return;;
-    esac
-    echo "pass error"; return
+  if grep -q 'Got expected error\|Got expected stream error' "$log"; then
+    # record the level Go happened to produce (fallback scoring only)
+    if grep -q 'stream error' "$log"; then echo "pass stream-error"; return; fi
+    echo "pass conn-error"; return
   fi
   if grep -q 'unexpected EOF' "$log"; then
     echo "fail eof"
@@ -273,35 +137,42 @@ classify_our_line() { # RESULT line (+ msg) -> class
 }
 
 verdict_for() { # ref_state ref_class our id -> verdict
-  local rstate="$1" rclass="$2" our="$3" id="$4"
+  local rstate="$1" rclass="$2" our="$3" id="$4" expected
   local our_err=false
   { [ "$our" = conn-error ] || [ "$our" = stream-error ]; } && our_err=true
-  # The reference did not resolve a class (verifier failed, or the whole oracle
-  # was invalid): we cannot score against it. A clean error of ours still shows
-  # a rule was enforced -> BETTER; otherwise both sides are inconclusive.
-  if [ "$rstate" = fail ]; then
-    if [ "$our_err" = true ]; then echo "BETTER"; else echo "UNKNOWN"; fi
+  expected="$(declared_intent "$id")"
+
+  # No declaration for this id: fall back to whatever class the reference run
+  # happened to demonstrate.
+  if [ -z "$expected" ]; then
+    if [ "$rstate" = fail ]; then
+      if [ "$our_err" = true ]; then echo "BETTER"; else echo "UNKNOWN"; fi
+    elif [ "$our" = "$rclass" ]; then
+      echo "MATCH"
+    else
+      echo "UNKNOWN"
+    fi
     return
   fi
-  # The reference PASSED, so the expected outcome class is authoritative.
-  case "$rclass" in
-    success)
-      if [ "$our" = success ]; then echo "MATCH"; else echo "WORSE"; fi;;
-    conn-error|stream-error)
-      if [ "$our" = "$rclass" ]; then
-        echo "MATCH"
-      elif [ "$our_err" = true ]; then
-        # both are errors, but at different levels. The harness's own verifier
-        # distinguishes these ("got an unexpected error type: ConnectionError,
-        # expected StreamError"), so a mismatch is a real divergence to justify
-        # rather than a MATCH.
-        echo "CLASS-DIFF"
-      else
-        echo "WORSE"
-      fi;;
-    *)
-      if [ "$our" = success ]; then echo "MATCH"; else echo "UNKNOWN"; fi;;
-  esac
+
+  if [ "$our" = "$expected" ]; then
+    # We produced exactly what the case declares. When the reference ALSO
+    # demonstrated it, that is a MATCH; when the reference could not, the
+    # declaration is still satisfied -> BETTER.
+    if [ "$rstate" = pass ]; then echo "MATCH"; else echo "BETTER"; fi
+    return
+  fi
+
+  if [ "$expected" != success ] && [ "$our_err" = true ]; then
+    # both are errors, at different levels: a real divergence to justify
+    echo "CLASS-DIFF"
+    return
+  fi
+
+  # We did not meet the declared outcome. That is a genuine failure only when
+  # the reference demonstrated the declared outcome; otherwise it is
+  # inconclusive (the environment could not show either side).
+  if [ "$rstate" = pass ]; then echo "WORSE"; else echo "UNKNOWN"; fi
 }
 
 wait_harness_ready() {
@@ -409,7 +280,7 @@ for id in "${IDS[@]}"; do
   esac
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$id" "$ref_state" "$ref_class" "$our_rc" "$our_class" \
-    "$(static_intent "$id")" "$verdict" "$our_line" \
+    "$(declared_intent "$id")" "$verdict" "$our_line" \
     >> "$RESULTS_TSV"
   printf '  %-16s ref=%-4s/%-12s ours=%-13s %s\n' \
     "$id" "$ref_state" "$ref_class" "$our_class" "$verdict" >&2

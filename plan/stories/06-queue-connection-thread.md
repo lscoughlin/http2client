@@ -8,7 +8,7 @@ tags:
   - http2client
   - plan
   - story
-status: ready
+status: done
 up: "[[http2client]]"
 depends-on:
   - "01-errors-frames"

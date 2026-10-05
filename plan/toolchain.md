@@ -5,7 +5,7 @@ aliases:
 tags:
   - http2client
   - plan
-status: ready
+status: done
 up: "[[http2client]]"
 updated: 2026-10-05
 ---
