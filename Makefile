@@ -20,7 +20,7 @@ SRC        = $(wildcard src/*.pas)
 TESTSRC    = $(wildcard test/*.pas)
 BIN        = bin
 
-.PHONY: all test clean
+.PHONY: all test clean validate-interop validate-harness validate
 
 all: $(BIN)/libhttp2.a
 
@@ -36,3 +36,14 @@ test: all | $(BIN)
 
 clean:
 	rm -rf $(BIN) src/*.o src/*.ppu test/*.o test/*.ppu
+
+# S12 gates. validate-interop is the mandatory nghttpd TLS+ALPN gate;
+# validate-harness runs the 146-id h2-client-test-harness sweep (needs
+# Docker/Rancher Desktop and takes ~30 minutes).
+validate-interop:
+	bash tools/validate/interop.sh
+
+validate-harness:
+	bash tools/validate/harness.sh
+
+validate: validate-interop validate-harness
