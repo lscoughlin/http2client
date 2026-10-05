@@ -88,11 +88,24 @@ at `cWindowUpdateBatchSize = 32768`) and is documented in
 ## B. h2-client-test-harness (primary conformance)
 
 ```sh
-docker run --rm h2-test-harness --list                  # enumerate 146 ids
-docker run --rm -p 8080:8080 h2-test-harness \
-  --harness-only --test=6.5/1                            # one case, server up
-test/h2probe --insecure https://localhost:8080/          # our single-shot client
+# the whole sweep (reference verifier + our probe for every id). Needs
+# Docker/Rancher Desktop; ~30 minutes. Writes plan/validation-results.md.
+tools/validate/harness.sh                 # or: make validate-harness
+
+# one id by hand
+docker run --rm h2-test-harness --list                 # enumerate 146 ids
+docker run -d --name h2-harness --network host h2-test-harness \
+  --harness-only --test=6.5/1                           # one case, server up
+bin/h2probe --url=https://127.0.0.1:8080/ --insecure --timeout-ms=5000
+docker rm -f h2-harness
 ```
+
+The harness container is a TLS server on `127.0.0.1:8080` that accepts ONE
+connection then exits, so `--network host` is required. Its self-signed cert
+has a CN but no subjectAltName, so hostname verification cannot succeed — the
+probe runs `--insecure` deliberately. Each id is run twice: once with the
+Go reference verifier (defines the expected outcome class) and once with our
+probe; the two are compared.
 
 | ID | Case | Expected |
 |---|---|---|
@@ -102,8 +115,18 @@ test/h2probe --insecure https://localhost:8080/          # our single-shot clien
 | B.4 | Compliance cases | client handles the edge-case frame and keeps the connection. |
 | B.5 | HPACK cases | compression/dynamic-table cases pass. |
 
-Acceptance: a results table in this file with counts and the failing id list
-(empty = green) at the pinned harness revision.
+Acceptance: a results table with counts and the failing id list
+(empty = green) at the pinned harness revision. The generated table lives in
+[[validation-results]] (`plan/validation-results.md`); this file records the
+interpretation and the justification for every non-MATCH row.
+
+Verdicts: **MATCH** = our outcome class equals the reference's; **BETTER** =
+the reference's verifier timed out/errored while we produced a clean
+connection or stream error (we enforced a rule it missed); **WORSE** = the
+reference detected an error (or succeeded) and we produced no error or a
+timeout — these are the only real failures; **UNKNOWN** = neither side
+resolved a class (typically the reference verifier hit EOF and we timed out),
+so the case cannot be scored either way.
 
 ## C. http2/http2-test (ported intents)
 
