@@ -5,30 +5,21 @@
   "status": "active",
   "autoContinue": true,
   "usage": {
-    "tokensUsed": 400477,
-    "activeSeconds": 199
+    "tokensUsed": 645336,
+    "activeSeconds": 1781
   },
   "sisyphus": false,
   "createdAt": "2026-10-05T14:46:34.463Z",
-  "updatedAt": "2026-10-05T14:50:22.082Z",
+  "updatedAt": "2026-10-05T15:16:51.201Z",
   "activePath": ".pi/goals/active_goal_2026100516463446_muvd4vrz-nguxny.md",
-  "revision": 59,
+  "revision": 89,
   "scheduler": {
     "version": 1,
     "owner": "01a10c49-6455-75dd-a27f-500acef91d00",
-    "generation": "abe4c506-6f97-45b3-91cf-2ee69dc6bb96",
-    "used": 1,
-    "phase": "running",
-    "repairUsed": false,
-    "decision": {
-      "kind": "ready",
-      "purpose": "ready"
-    },
-    "dispatch": {
-      "id": "94b571f5-9c7b-41e2-b8cb-06f04a1cf23c",
-      "kind": "ready",
-      "claimedAt": 1791211594484
-    }
+    "generation": "74325e8a-1845-45dd-880e-5c20190a847c",
+    "used": 3,
+    "phase": "idle",
+    "repairUsed": false
   },
   "taskList": {
     "tasks": [
@@ -43,8 +34,10 @@
       {
         "id": "task-s01",
         "title": "S01 — Error model and frame codec (Http2.Errors, Http2.Frames)",
-        "status": "pending",
-        "verificationContract": "Every frame type byte-round-trips; exception hierarchy matches doc/design/errors-redirects.md; make test green."
+        "status": "complete",
+        "verificationContract": "Every frame type byte-round-trips; exception hierarchy matches doc/design/errors-redirects.md; make test green.",
+        "completedAt": "2026-10-05T14:50:25.204Z",
+        "evidence": "Http2.Errors + Http2.Frames written; 38 fpcunit tests green (0 errors/0 failures) via `make test`; all 10 frame types byte-round-trip; settings round-trip; oversized/zero-stream-id/misaligned-SETTINGS"
       },
       {
         "id": "task-s02",
@@ -115,8 +108,7 @@
     ],
     "blockCompletion": true,
     "proposedAt": "2026-10-05T14:46:31.581Z"
-  },
-  "currentTaskId": "task-s01"
+  }
 }
 
 # Goal Prompt
@@ -128,13 +120,13 @@ Implement the HTTP/2 client specified in doc/design/ and planned in plan/README.
 - Status: running
 - Auto-continue: on
 - Sisyphus mode: no
-- Time spent: 3m19s
-- Tokens used: 400K (400,477) tokens
+- Time spent: 29m41s
+- Tokens used: 645K (645,336) tokens
 ## Tasks
 
 <!-- blockCompletion: true -->
 - [x] task-s00: S00 — Toolchain, build, and harness bootstrap — evidence: make + make test exit 0 (fpcunit 1 test, 0 errors/0 failures); nghttpd nghttp2/1.70.0 at /opt/homebrew/bin; docker run --rm h2-test-harness --list prints 146 case ids; mormot pinned @2ccea1a0e5d7be85b
-- [ ] task-s01: S01 — Error model and frame codec (Http2.Errors, Http2.Frames) — contract: Every frame type byte-round-trips; exception hierarchy matches doc/design/errors-redirects.md; make test green.
+- [x] task-s01: S01 — Error model and frame codec (Http2.Errors, Http2.Frames) — evidence: Http2.Errors + Http2.Frames written; 38 fpcunit tests green (0 errors/0 failures) via `make test`; all 10 frame types byte-round-trip; settings round-trip; oversized/zero-stream-id/misaligned-SETTINGS
 - [ ] task-s02: S02 — Headers and header names (Http2.Headers) — contract: Header API complete; case-insensitivity and forbidden-header rejection tested; make test green.
 - [ ] task-s03: S03 — HPACK codec (Http2.Hpack) — contract: RFC 7541 Appendix C vectors pass byte-for-byte; malformed input is connection-fatal; make test green.
 - [ ] task-s04: S04 — Flow control (Http2.FlowControl) — contract: Window arithmetic, overflow, initial-window deltas, batching, and per-stream isolation tested; make test green.

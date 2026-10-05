@@ -3,3 +3,4 @@
 {"type":"task_started","goalId":"muvd4vrz-nguxny","taskId":"task-s00","at":"2026-10-05T14:46:40.304Z"}
 {"type":"task_complete","goalId":"muvd4vrz-nguxny","taskId":"task-s00","evidence":"make + make test exit 0 (fpcunit 1 test, 0 errors/0 failures); nghttpd nghttp2/1.70.0 at /opt/homebrew/bin; docker run --rm h2-test-harness --list prints 146 case ids; mormot pinned @2ccea1a0e5d7be85b","at":"2026-10-05T14:47:33.155Z"}
 {"type":"task_started","goalId":"muvd4vrz-nguxny","taskId":"task-s01","at":"2026-10-05T14:47:35.058Z"}
+{"type":"task_complete","goalId":"muvd4vrz-nguxny","taskId":"task-s01","evidence":"Http2.Errors + Http2.Frames written; 38 fpcunit tests green (0 errors/0 failures) via `make test`; all 10 frame types byte-round-trip; settings round-trip; oversized/zero-stream-id/misaligned-SETTINGS","at":"2026-10-05T14:50:25.205Z"}
