@@ -5,19 +5,19 @@
   "status": "active",
   "autoContinue": true,
   "usage": {
-    "tokensUsed": 645336,
-    "activeSeconds": 1781
+    "tokensUsed": 2696433,
+    "activeSeconds": 11821
   },
   "sisyphus": false,
   "createdAt": "2026-10-05T14:46:34.463Z",
-  "updatedAt": "2026-10-05T15:16:51.201Z",
+  "updatedAt": "2026-10-05T18:47:39.634Z",
   "activePath": ".pi/goals/active_goal_2026100516463446_muvd4vrz-nguxny.md",
-  "revision": 89,
+  "revision": 620,
   "scheduler": {
     "version": 1,
     "owner": "01a10c49-6455-75dd-a27f-500acef91d00",
-    "generation": "74325e8a-1845-45dd-880e-5c20190a847c",
-    "used": 3,
+    "generation": "79ecd4d5-7e84-4ac1-82c9-b2b01e26a716",
+    "used": 1,
     "phase": "idle",
     "repairUsed": false
   },
@@ -42,62 +42,82 @@
       {
         "id": "task-s02",
         "title": "S02 — Headers and header names (Http2.Headers)",
-        "status": "pending",
-        "verificationContract": "Header API complete; case-insensitivity and forbidden-header rejection tested; make test green."
+        "status": "complete",
+        "verificationContract": "Header API complete; case-insensitivity and forbidden-header rejection tested; make test green.",
+        "completedAt": "2026-10-05T15:16:55.500Z",
+        "evidence": "src/Http2.Headers.pas + 16 tests green; case-insensitive multi-value map, 18 constants verbatim, 5 forbidden headers raise EHttpProtocolError, pseudo-headers kept in separate map and excluded from Nam"
       },
       {
         "id": "task-s03",
         "title": "S03 — HPACK codec (Http2.Hpack)",
-        "status": "pending",
-        "verificationContract": "RFC 7541 Appendix C vectors pass byte-for-byte; malformed input is connection-fatal; make test green."
+        "status": "complete",
+        "verificationContract": "RFC 7541 Appendix C vectors pass byte-for-byte; malformed input is connection-fatal; make test green.",
+        "completedAt": "2026-10-05T15:16:55.502Z",
+        "evidence": "src/Http2.Hpack.pas + 24 tests green; RFC 7541 Appendix C.1-C.6 reproduced byte-for-byte (incl. C.6 Huffman), all 61 static entries, eviction + oversized-clears rules, bad padding -> EHttpProtocolErro"
       },
       {
         "id": "task-s04",
         "title": "S04 — Flow control (Http2.FlowControl)",
-        "status": "pending",
-        "verificationContract": "Window arithmetic, overflow, initial-window deltas, batching, and per-stream isolation tested; make test green."
+        "status": "complete",
+        "verificationContract": "Window arithmetic, overflow, initial-window deltas, batching, and per-stream isolation tested; make test green.",
+        "completedAt": "2026-10-05T15:16:55.503Z",
+        "evidence": "src/Http2.FlowControl.pas + 22 tests green; TWindow/TFlowControl arithmetic, overflow -> EHttpProtocolError(ecFlowControlError), zero increment -> ecProtocolError, half-window batching predicate, per-"
       },
       {
         "id": "task-s05",
         "title": "S05 — TLS, ALPN, and socket abstraction (Http2.Tls)",
-        "status": "pending",
-        "verificationContract": "Real TLS connection to nghttpd negotiates h2 and asserts SSL_get0_alpn_selected; an http/1.1-only server raises; vendored mormot compiles standalone."
+        "status": "complete",
+        "verificationContract": "Real TLS connection to nghttpd negotiates h2 and asserts SSL_get0_alpn_selected; an http/1.1-only server raises; vendored mormot compiles standalone.",
+        "completedAt": "2026-10-05T15:16:55.504Z",
+        "evidence": "src/Http2.Tls.pas + 21 tests green; IHttp2Socket/TPlainSocket/TTlsSocket on mormot.lib.openssl11, ALPN wire bytes 02 68 32 asserted, SNI, verify-on default with insecure toggle, RequireH2Alpn raises o"
       },
       {
         "id": "task-s06",
         "title": "S06 — Blocking queue and connection thread",
-        "status": "pending",
-        "verificationContract": "No TThreadedQueue/TMonitor/TEvent; weak connection reference (no ARC cycle); deterministic concurrency tests green."
+        "status": "complete",
+        "verificationContract": "No TThreadedQueue/TMonitor/TEvent; weak connection reference (no ARC cycle); deterministic concurrency tests green.",
+        "completedAt": "2026-10-05T15:57:38.788Z",
+        "evidence": "commit 14a368a; make test 143 tests 0E/0F; multi-waiter mutation hangs (non-vacuous)"
       },
       {
         "id": "task-s07",
         "title": "S07 — Connection lifecycle",
-        "status": "pending",
-        "verificationContract": "Preface and SETTINGS byte-exact; GOAWAY may-retry set correct; every in-flight stream terminated exactly once on failure."
+        "status": "complete",
+        "verificationContract": "Preface and SETTINGS byte-exact; GOAWAY may-retry set correct; every in-flight stream terminated exactly once on failure.",
+        "completedAt": "2026-10-05T15:58:44.100Z",
+        "evidence": "commit 8f67a86; make test 147 tests 0E/0F; preface/SETTINGS byte-exact, fan-out exactly once, GOAWAY may-retry verified"
       },
       {
         "id": "task-s08",
         "title": "S08 — Stream lease state machine (Http2.Stream)",
-        "status": "pending",
-        "verificationContract": "Single lease completes end-to-end over a mock connection; stream transitions match RFC 7540 §5.1; no queue/response-state leaks."
+        "status": "complete",
+        "verificationContract": "Single lease completes end-to-end over a mock connection; stream transitions match RFC 7540 §5.1; no queue/response-state leaks.",
+        "completedAt": "2026-10-05T16:08:29.359Z",
+        "evidence": "commit 8eab6a1; make test 163 tests 0E/0F; 16 lease tests incl. id-concurrency and exactly-once cleanup, both mutation-verified"
       },
       {
         "id": "task-s09",
         "title": "S09 — Public API, pool, request/response (Http2.Client)",
-        "status": "pending",
-        "verificationContract": "Documented fluent example compiles and runs; live GET and POST succeed against nghttpd; pool never exceeds MaxConnections or per-connection stream caps."
+        "status": "complete",
+        "verificationContract": "Documented fluent example compiles and runs; live GET and POST succeed against nghttpd; pool never exceeds MaxConnections or per-connection stream caps.",
+        "completedAt": "2026-10-05T16:49:31.891Z",
+        "evidence": "7fb38ee; TClientTest N:15 live vs nghttpd (GET 200 + POST echo byte-exact, TLS ALPN h2); suite 186 tests 0/0; fluent example compiles/runs (test/testclient.pas); pool-cap + per-conn-cap tests"
       },
       {
         "id": "task-s10",
         "title": "S10 — Redirects, timeouts, cancellation",
-        "status": "pending",
-        "verificationContract": "Redirect status table matches spec; every timeout enforced as EHttpTimeout; no non-idempotent request transparently retried."
+        "status": "complete",
+        "verificationContract": "Redirect status table matches spec; every timeout enforced as EHttpTimeout; no non-idempotent request transparently retried.",
+        "completedAt": "2026-10-05T17:41:16.646Z",
+        "evidence": "8174133; redirect matrix 301/302/303/307/308 + EHttpNotReplayable/EHttpTooManyRedirects; timeouts->EHttpTimeout; cancellation RST(CANCEL); idempotent-only retry. TRedirectTest 12 + TTimeoutsTest 7. Mu"
       },
       {
         "id": "task-s11",
         "title": "S11 — Observability and test seams",
-        "status": "pending",
-        "verificationContract": "No protocol test needs a real socket; deterministic race-free concurrency tests; mock socket drives full Send path."
+        "status": "complete",
+        "verificationContract": "No protocol test needs a real socket; deterministic race-free concurrency tests; mock socket drives full Send path.",
+        "completedAt": "2026-10-05T17:46:47.660Z",
+        "evidence": "8174133 + 44c1b84; IHttp2Observer + TRecordingObserver (event-driven WaitForCount) wired at connection/stream/frame/goaway/window/retry/discard points, callbacks outside locks and exception-guarded; T"
       },
       {
         "id": "task-s12",
@@ -120,22 +140,22 @@ Implement the HTTP/2 client specified in doc/design/ and planned in plan/README.
 - Status: running
 - Auto-continue: on
 - Sisyphus mode: no
-- Time spent: 29m41s
-- Tokens used: 645K (645,336) tokens
+- Time spent: 3h17m01s
+- Tokens used: 2.7M (2,696,433) tokens
 ## Tasks
 
 <!-- blockCompletion: true -->
 - [x] task-s00: S00 — Toolchain, build, and harness bootstrap — evidence: make + make test exit 0 (fpcunit 1 test, 0 errors/0 failures); nghttpd nghttp2/1.70.0 at /opt/homebrew/bin; docker run --rm h2-test-harness --list prints 146 case ids; mormot pinned @2ccea1a0e5d7be85b
 - [x] task-s01: S01 — Error model and frame codec (Http2.Errors, Http2.Frames) — evidence: Http2.Errors + Http2.Frames written; 38 fpcunit tests green (0 errors/0 failures) via `make test`; all 10 frame types byte-round-trip; settings round-trip; oversized/zero-stream-id/misaligned-SETTINGS
-- [ ] task-s02: S02 — Headers and header names (Http2.Headers) — contract: Header API complete; case-insensitivity and forbidden-header rejection tested; make test green.
-- [ ] task-s03: S03 — HPACK codec (Http2.Hpack) — contract: RFC 7541 Appendix C vectors pass byte-for-byte; malformed input is connection-fatal; make test green.
-- [ ] task-s04: S04 — Flow control (Http2.FlowControl) — contract: Window arithmetic, overflow, initial-window deltas, batching, and per-stream isolation tested; make test green.
-- [ ] task-s05: S05 — TLS, ALPN, and socket abstraction (Http2.Tls) — contract: Real TLS connection to nghttpd negotiates h2 and asserts SSL_get0_alpn_selected; an http/1.1-only server raises; vendored mormot compiles standalone.
-- [ ] task-s06: S06 — Blocking queue and connection thread — contract: No TThreadedQueue/TMonitor/TEvent; weak connection reference (no ARC cycle); deterministic concurrency tests green.
-- [ ] task-s07: S07 — Connection lifecycle — contract: Preface and SETTINGS byte-exact; GOAWAY may-retry set correct; every in-flight stream terminated exactly once on failure.
-- [ ] task-s08: S08 — Stream lease state machine (Http2.Stream) — contract: Single lease completes end-to-end over a mock connection; stream transitions match RFC 7540 §5.1; no queue/response-state leaks.
-- [ ] task-s09: S09 — Public API, pool, request/response (Http2.Client) — contract: Documented fluent example compiles and runs; live GET and POST succeed against nghttpd; pool never exceeds MaxConnections or per-connection stream caps.
-- [ ] task-s10: S10 — Redirects, timeouts, cancellation — contract: Redirect status table matches spec; every timeout enforced as EHttpTimeout; no non-idempotent request transparently retried.
-- [ ] task-s11: S11 — Observability and test seams — contract: No protocol test needs a real socket; deterministic race-free concurrency tests; mock socket drives full Send path.
+- [x] task-s02: S02 — Headers and header names (Http2.Headers) — evidence: src/Http2.Headers.pas + 16 tests green; case-insensitive multi-value map, 18 constants verbatim, 5 forbidden headers raise EHttpProtocolError, pseudo-headers kept in separate map and excluded from Nam
+- [x] task-s03: S03 — HPACK codec (Http2.Hpack) — evidence: src/Http2.Hpack.pas + 24 tests green; RFC 7541 Appendix C.1-C.6 reproduced byte-for-byte (incl. C.6 Huffman), all 61 static entries, eviction + oversized-clears rules, bad padding -> EHttpProtocolErro
+- [x] task-s04: S04 — Flow control (Http2.FlowControl) — evidence: src/Http2.FlowControl.pas + 22 tests green; TWindow/TFlowControl arithmetic, overflow -> EHttpProtocolError(ecFlowControlError), zero increment -> ecProtocolError, half-window batching predicate, per-
+- [x] task-s05: S05 — TLS, ALPN, and socket abstraction (Http2.Tls) — evidence: src/Http2.Tls.pas + 21 tests green; IHttp2Socket/TPlainSocket/TTlsSocket on mormot.lib.openssl11, ALPN wire bytes 02 68 32 asserted, SNI, verify-on default with insecure toggle, RequireH2Alpn raises o
+- [x] task-s06: S06 — Blocking queue and connection thread — evidence: commit 14a368a; make test 143 tests 0E/0F; multi-waiter mutation hangs (non-vacuous)
+- [x] task-s07: S07 — Connection lifecycle — evidence: commit 8f67a86; make test 147 tests 0E/0F; preface/SETTINGS byte-exact, fan-out exactly once, GOAWAY may-retry verified
+- [x] task-s08: S08 — Stream lease state machine (Http2.Stream) — evidence: commit 8eab6a1; make test 163 tests 0E/0F; 16 lease tests incl. id-concurrency and exactly-once cleanup, both mutation-verified
+- [x] task-s09: S09 — Public API, pool, request/response (Http2.Client) — evidence: 7fb38ee; TClientTest N:15 live vs nghttpd (GET 200 + POST echo byte-exact, TLS ALPN h2); suite 186 tests 0/0; fluent example compiles/runs (test/testclient.pas); pool-cap + per-conn-cap tests
+- [x] task-s10: S10 — Redirects, timeouts, cancellation — evidence: 8174133; redirect matrix 301/302/303/307/308 + EHttpNotReplayable/EHttpTooManyRedirects; timeouts->EHttpTimeout; cancellation RST(CANCEL); idempotent-only retry. TRedirectTest 12 + TTimeoutsTest 7. Mu
+- [x] task-s11: S11 — Observability and test seams — evidence: 8174133 + 44c1b84; IHttp2Observer + TRecordingObserver (event-driven WaitForCount) wired at connection/stream/frame/goaway/window/retry/discard points, callbacks outside locks and exception-guarded; T
 - [ ] task-s12: S12 — Validation against external suites — contract: nghttpd TLS/ALPN interop (validation.md §A) exits 0; h2-client-test-harness all 146 ids run with results table recorded (failures empty or justified); http2/http2-test intents ported; nghttp oracle notes recorded.
 

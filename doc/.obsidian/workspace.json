@@ -190,6 +190,7 @@
   },
   "active": "aa98c1e2ce62b671",
   "lastOpenFiles": [
+    "design/flow-control.md",
     "design/open-questions.md",
     "design/errors-redirects.md",
     "design/testing-observability.md",

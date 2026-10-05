@@ -535,6 +535,10 @@ begin
         Break;
       try
         Frame := ReadFrame(FSockStream, FPeerMaxFrameSize);
+        // RFC 7540 structural rules the decoder cannot enforce on its own:
+        // frame-type/stream-id pairing, mandatory payload sizes, zero
+        // WINDOW_UPDATE increments. A violation is a connection error.
+        ValidateFrame(Frame, FPeerMaxFrameSize);
       except
         on E: EHttpTimeout do
           Continue;                 // idle poll: loop back to outbound work
