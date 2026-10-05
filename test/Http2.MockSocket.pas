@@ -32,9 +32,9 @@ unit Http2.MockSocket;
 interface
 
 uses
-  SysUtils, Classes, SyncObjs, fpcunit, testregistry,
+  SysUtils, Classes, SyncObjs, Generics.Collections, fpcunit, testregistry,
   Http2.Errors, Http2.Frames, Http2.Hpack, Http2.Tls, Http2.Observer,
-  Http2.Connection, Http2.Stream;
+  Http2.Connection, Http2.Stream, Http2.Client;
 
 type
   /// how the mock answers a Read when no canned bytes are available:
@@ -241,6 +241,36 @@ function WaitForObserverEvent(const AObs: TRecordingObserver;
   const AKind: TObserverEventKind; const ACount, ATimeoutMs: Integer): Boolean;
 
 type
+  /// hands out a fresh TMockSocket on every Dial, so the PUBLIC client
+  /// (THttpClientFactory.WithSocketFactory) can drive the whole Send path
+  /// with no real socket (plan S11 "Done when: the mock socket can drive the
+  /// full Send path to completion").
+  TMockSocketFactory = class(TInterfacedObject, IHttp2SocketFactory)
+  private
+    FLock: TCriticalSection;
+    /// non-owning raw pointers, only for assertions from the test thread
+    FSockets: TList<TMockSocket>;
+    /// owning interface references, so a handed-out socket stays alive even
+    /// after every connection released it (TMockSocket is refcounted)
+    FKeepAlive: TList<IHttp2Socket>;
+    FDials: Integer;
+    FStatus: string;
+    FBody: TBytes;
+    FEndStream: Boolean;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    /// configure the canned response every handed-out socket will produce
+    procedure SetResponse(const AStatus: string; const ABody: TBytes;
+      const AEndStream: Boolean);
+    function Dial(const AHost: string; const APort: Word;
+      const ATimeoutMs: Integer): IHttp2Socket;
+    function Dials: Integer;
+    /// the socket handed out on the 0-based AIndex-th dial
+    function Socket(const AIndex: Integer): TMockSocket;
+  end;
+
+type
   /// recorded observer events (11.1)
 TObserverEmissionTest = class(TTestCase)
 private
@@ -275,6 +305,8 @@ published
   procedure TestScenarioRstStream;
   procedure TestScenarioZeroWindowStallsBodyRead;
   procedure TestScenarioMalformedFrameClosesConnection;
+  /// the contractual one: the PUBLIC Send path over the mock socket
+  procedure TestScenarioFullSendPathOverMockSocket;
 end;
 
 implementation
@@ -1640,6 +1672,147 @@ begin
     Server.Free;
     Conn.Free;
   end;
+end;
+
+{ TMockSocketFactory }
+
+constructor TMockSocketFactory.Create;
+begin
+  inherited Create;
+  FLock := TCriticalSection.Create;
+  FSockets := TList<TMockSocket>.Create;
+  FKeepAlive := TList<IHttp2Socket>.Create;
+  FDials := 0;
+  FStatus := '200';
+  FBody := nil;
+  FEndStream := True;
+end;
+
+destructor TMockSocketFactory.Destroy;
+begin
+  // release our owning interface references; the sockets are refcounted and
+  // must never be Free'd directly
+  FKeepAlive.Clear;
+  FKeepAlive.Free;
+  FSockets.Free;
+  FLock.Free;
+  inherited Destroy;
+end;
+
+procedure TMockSocketFactory.SetResponse(const AStatus: string;
+  const ABody: TBytes; const AEndStream: Boolean);
+begin
+  FLock.Acquire;
+  try
+    FStatus := AStatus;
+    FBody := ABody;
+    FEndStream := AEndStream;
+  finally
+    FLock.Release;
+  end;
+end;
+
+function TMockSocketFactory.Dial(const AHost: string; const APort: Word;
+  const ATimeoutMs: Integer): IHttp2Socket;
+var
+  S: TMockSocket;
+  St: string;
+  Bd: TBytes;
+  ES: Boolean;
+begin
+  S := TMockSocket.Create;
+  FLock.Acquire;
+  try
+    Inc(FDials);
+    FSockets.Add(S);
+    St := FStatus;
+    Bd := FBody;
+    ES := FEndStream;
+  finally
+    FLock.Release;
+  end;
+  // the mock answers the client preface + SETTINGS and every request HEADERS
+  S.AutoRespondToRequestHeaders(St, Bd, ES);
+  Result := S;
+  FLock.Acquire;
+  try
+    FKeepAlive.Add(Result);
+  finally
+    FLock.Release;
+  end;
+end;
+
+function TMockSocketFactory.Dials: Integer;
+begin
+  FLock.Acquire;
+  try
+    Result := FDials;
+  finally
+    FLock.Release;
+  end;
+end;
+
+function TMockSocketFactory.Socket(const AIndex: Integer): TMockSocket;
+begin
+  FLock.Acquire;
+  try
+    if (AIndex >= 0) and (AIndex < FSockets.Count) then
+      Result := FSockets[AIndex]
+    else
+      Result := nil;
+  finally
+    FLock.Release;
+  end;
+end;
+
+procedure TScriptedScenarioTest.TestScenarioFullSendPathOverMockSocket;
+var
+  Factory: TMockSocketFactory;      // non-owning view, valid while FactoryRef lives
+  FactoryRef: IHttp2SocketFactory;  // owns the factory
+  Client: IHttpClient;
+  R: IHttpResponse;
+  Sock: TMockSocket;
+  Frames: TArray<TFrame>;
+  SawHeaders, SawGoAway: Boolean;
+  I: Integer;
+begin
+  // the S11 contract: the mock socket drives the FULL public Send path to
+  // completion, with no real socket anywhere (IHttp2SocketFactory seam).
+  FactoryRef := TMockSocketFactory.Create;
+  Factory := FactoryRef as TMockSocketFactory;
+  Factory.SetResponse('200', BytesOfString('payload'), True);
+  Client := THttpClientFactory.Create
+    .WithSocketFactory(FactoryRef)
+    .Build;
+  R := Client.Send(THttpRequest.Create(hmGet, 'https://api.example/x'));
+  AssertEquals('public Send returned the mock status', 200, R.StatusCode);
+  AssertEquals('public Send streamed the mock body', 'payload',
+    ReadAllBodyText(R.Body));
+  AssertEquals('exactly one connection was dialled', 1, Factory.Dials);
+
+  Sock := Factory.Socket(0);
+  AssertTrue('the mock captured the client preface',
+    Sock.WaitForWrites(2, 3000));
+  Frames := Sock.OutboundFrames(True);
+  SawHeaders := False;
+  for I := 0 to Length(Frames) - 1 do
+    if Frames[I].Header.FrameType = ftHeaders then
+      SawHeaders := True;
+  AssertTrue('the request HEADERS frame was captured on the wire',
+    SawHeaders);
+
+  Client.Close;
+  Frames := Sock.OutboundFrames(True);
+  SawGoAway := False;
+  for I := 0 to Length(Frames) - 1 do
+    if Frames[I].Header.FrameType = ftGoAway then
+      SawGoAway := True;
+  AssertTrue('Close sent a GOAWAY on the mock connection', SawGoAway);
+  // ownership is entirely by interface; nothing to Free (the factory and its
+  // handed-out mock sockets are refcounted)
+  R := nil;
+  Client := nil;
+  FactoryRef := nil;
 end;
 
 initialization
