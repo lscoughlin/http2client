@@ -1,5 +1,11 @@
-/// Connection pool, blocking queue, connection thread (plan S06/S07)
-// - this unit is part of the http2client project (see doc/design/)
+/// Connection, blocking queue, and connection thread (plan S06/S07)
+// - this unit is part of the http2client project (see doc/design/transport.md,
+//   sections "Threading and queues" and "Connection lifecycle").
+// - FPC 3.2.4 has no TThreadedQueue<T> and no TMonitor; TEvent/TSimpleEvent
+//   raise ESyncObjectException on macOS. The bounded queue is therefore built
+//   from TQueue<T> + TCriticalSection + two RTLEvents (see probe12.pas).
+// - one TConnectionThread owns BOTH directions of one socket: callers only
+//   enqueue frames onto the outbound queue, the thread is the sole writer.
 unit Http2.Connection;
 
 {$mode delphi}{$H+}
@@ -9,6 +15,777 @@ unit Http2.Connection;
 
 interface
 
+uses
+  SysUtils, Classes, SyncObjs, Generics.Collections,
+  Http2.Errors, Http2.Frames, Http2.Tls;
+
+const
+  /// default bound on either frame queue (backpressure instead of growth)
+  cDefaultQueueCapacity = 128;
+  /// how long a socket read blocks before the thread re-checks outbound work
+  cDefaultReadPollMs = 20;
+
+type
+  /// an ARC-safe, bounded, blocking queue of T
+  // - Shutdown releases every blocked waiter; a later Pop returns False
+  IBlockingQueue<T> = interface
+    procedure Push(const AItem: T);
+    /// block until an item is available or the queue is shut down + empty
+    function Pop(out AItem: T): Boolean;
+    /// return an item only if one is already available (never blocks)
+    function TryPop(out AItem: T): Boolean;
+    /// wake every blocked waiter; pending and future operations fail fast
+    procedure Shutdown;
+  end;
+
+  /// TQueue<T> + TCriticalSection + two RTLEvents (TThreadedQueue is absent
+  /// in FPC 3.2.4). A capacity <= 0 means unbounded.
+  TBlockingQueue<T> = class(TInterfacedObject, IBlockingQueue<T>)
+  private
+    FLock: TCriticalSection;
+    FNotEmpty: PRTLEvent;
+    FNotFull: PRTLEvent;
+    FItems: TQueue<T>;
+    FCapacity: Integer;
+    FShutdown: Boolean;
+    FWaitersParked: Integer;
+  public
+    constructor Create(const ACapacity: Integer = cDefaultQueueCapacity);
+    destructor Destroy; override;
+    procedure Push(const AItem: T);
+    function Pop(out AItem: T): Boolean;
+    function TryPop(out AItem: T): Boolean;
+    procedure Shutdown;
+    /// items currently buffered (introspection for tests)
+    function Count: Integer;
+    /// number of consumers currently blocked inside Pop (test seam)
+    function WaitersParked: Integer;
+    /// bounded, event-driven wait until at least one item is available;
+    /// returns False on shutdown or when the deadline expires
+    function WaitForItem(const ATimeoutMs: Integer): Boolean;
+    function IsShutdown: Boolean;
+  end;
+
+  TConnection = class;
+
+  /// the lifecycle state exposed for connection-pool eligibility
+  TConnectionState = (csOpening, csOpen, csGoAway, csClosed);
+
+  /// one background thread per connection; it is the sole writer to the
+  /// socket. It holds ONLY a weak (raw Pointer) reference to TConnection so
+  /// the TConnection <-> thread pair cannot form an ARC cycle.
+  TConnectionThread = class(TThread)
+  private
+    FConn: Pointer;                    // weak ref to TConnection, never AddRef'd
+    FOutbound: IBlockingQueue<TFrame>;
+    FInbound: IBlockingQueue<TFrame>;
+    FSocket: IHttp2Socket;
+    FSockStream: TStream;              // IHttp2Socket -> TStream adapter
+    FLocalSettings: TConnectionSettings;
+    FReadPollMs: Integer;
+    FPeerMaxFrameSize: LongWord;
+    FPendingPing: Boolean;
+    FPendingPingPayload: TBytes;
+    FPingSentAt: QWord;
+  protected
+    procedure Execute; override;
+    procedure DoPreface;
+    procedure ApplyPeerSettings(const ASettings: TConnectionSettings);
+    procedure RouteInbound(const AFrame: TFrame);
+    procedure DrainOutbound;
+    procedure CheckPingKeepAlive;
+    procedure HandlePingAck(const APayload: TBytes);
+    procedure Fail(const AMessage: string; const ACode: THttp2ErrorCode);
+  public
+    constructor Create(AConn: TConnection);
+  end;
+
+  /// the minimal connection object S06/S07 need: state, the two frame queues,
+  /// the socket, and the thread. S08 extends it with stream leases.
+  TConnection = class
+  private
+    FLock: TCriticalSection;
+    FStateEvent: PRTLEvent;
+    FSocket: IHttp2Socket;
+    FOutbound: IBlockingQueue<TFrame>;
+    FInbound: IBlockingQueue<TFrame>;
+    FThread: TConnectionThread;
+    FState: TConnectionState;
+    FLocalSettings: TConnectionSettings;
+    FPeerSettings: TConnectionSettings;
+    FSettingsAcked: Boolean;
+    FGoAwayLastStreamId: LongWord;
+    FHighestStreamId: LongWord;
+    FError: string;
+    FErrorCode: THttp2ErrorCode;
+    FClosed: Boolean;
+    FReadPollMs: Integer;
+    FPingIntervalMs: Integer;
+    FPingTimeoutMs: Integer;
+    FLastActivity: QWord;
+    function GetState: TConnectionState;
+    function GetPeerSettings: TConnectionSettings;
+    procedure SetState(const AValue: TConnectionState);
+  public
+    constructor Create(const ASocket: IHttp2Socket); overload;
+    constructor Create(const ASocket: IHttp2Socket;
+      const ALocalSettings: TConnectionSettings); overload;
+    destructor Destroy; override;
+    /// spawn the connection thread (sends preface + initial SETTINGS)
+    procedure Start;
+    /// graceful, idempotent shutdown: sends GOAWAY (highest processed
+    /// stream), Terminate+WaitFor the thread, then closes the socket
+    procedure Close;
+    /// enqueue a frame for the thread to write; False once closed
+    function PostFrame(const AFrame: TFrame): Boolean;
+    /// may a new stream still be opened on this connection?
+    function CanOpenStream: Boolean;
+    /// RFC 7540 section 6.8: after GOAWAY, a stream with an id strictly above
+    /// last-stream-id was never processed and MAY be safely retried
+    function IsStreamRetryable(const AStreamId: LongWord): Boolean;
+    /// bounded, event-driven wait for a lifecycle state (test/pool seam)
+    function WaitForState(const AState: TConnectionState;
+      const ATimeoutMs: Integer): Boolean;
+    /// record a peer GOAWAY; stops new streams, marks higher ids retryable
+    procedure MarkGoAway(const ALastStreamId: LongWord);
+    /// move to a failed state and unblock every waiter (thread-internal seam)
+    procedure FailWith(const AMessage: string; const ACode: THttp2ErrorCode);
+    /// record peer SETTINGS under the connection lock (thread-internal seam)
+    procedure ApplyPeerSettingsValue(const ASettings: TConnectionSettings);
+    /// record the peer's SETTINGS ACK (thread-internal seam)
+    procedure MarkSettingsAcked;
+    /// update the idle clock used by the PING keep-alive schedule
+    procedure TouchActivity;
+
+    property State: TConnectionState read GetState;
+    property PeerSettings: TConnectionSettings read GetPeerSettings;
+    property Thread: TConnectionThread read FThread;
+    property Outbound: IBlockingQueue<TFrame> read FOutbound;
+    property Inbound: IBlockingQueue<TFrame> read FInbound;
+    property Socket: IHttp2Socket read FSocket;
+    property SettingsAcked: Boolean read FSettingsAcked;
+    property GoAwayLastStreamId: LongWord read FGoAwayLastStreamId;
+    property HighestStreamId: LongWord read FHighestStreamId
+      write FHighestStreamId;
+    property ErrorMessage: string read FError;
+    property ErrorCode: THttp2ErrorCode read FErrorCode;
+    property ReadPollMs: Integer read FReadPollMs write FReadPollMs;
+    property PingIntervalMs: Integer read FPingIntervalMs write FPingIntervalMs;
+    property PingTimeoutMs: Integer read FPingTimeoutMs write FPingTimeoutMs;
+  end;
+
+/// the 24-byte client connection preface (RFC 7540 section 3.5)
+function ClientPrefaceBytes: TBytes;
+
 implementation
+
+const
+  cClientPreface: array[0..23] of Byte = (
+    $50, $52, $49, $20, $2A, $20, $48, $54, $54, $50, $2F, $32, $2E, $30,
+    $0D, $0A, $0D, $0A, $53, $4D, $0D, $0A, $0D, $0A);
+
+function ClientPrefaceBytes: TBytes;
+var
+  I: Integer;
+begin
+  Result := nil;
+  SetLength(Result, SizeOf(cClientPreface));
+  for I := 0 to High(cClientPreface) do
+    Result[I] := cClientPreface[I];
+end;
+
+{ TSocketStream: adapts an IHttp2Socket to the TStream ReadFrame/WriteFrame
+  API. A read timeout with no bytes yet is re-raised so the thread can poll
+  outbound work; once a frame has started arriving the read blocks through to
+  completion so no partial frame is ever abandoned. }
+
+type
+  TSocketStream = class(TStream)
+  private
+    FSocket: IHttp2Socket;
+  public
+    constructor Create(const ASocket: IHttp2Socket);
+    function Read(var ABuffer; ACount: LongInt): LongInt; override;
+    function Write(const ABuffer; ACount: LongInt): LongInt; override;
+    function Seek(const AOffset: Int64; AOrigin: TSeekOrigin): Int64;
+      override;
+  end;
+
+constructor TSocketStream.Create(const ASocket: IHttp2Socket);
+begin
+  inherited Create;
+  FSocket := ASocket;
+end;
+
+function TSocketStream.Read(var ABuffer; ACount: LongInt): LongInt;
+var
+  Got, N: LongInt;
+  P: PByte;
+begin
+  if ACount <= 0 then
+    Exit(0);
+  Result := 0;
+  P := @ABuffer;
+  Got := 0;
+  while Got < ACount do
+  begin
+    try
+      N := FSocket.Read(P[Got], ACount - Got);
+    except
+      on E: EHttpTimeout do
+        if Got = 0 then
+          raise                 // idle poll: no bytes yet, surface the timeout
+        else
+          Break;                // partial frame; caller re-invokes Read
+    end;
+    if N <= 0 then
+    begin
+      if Got = 0 then
+        Exit(0);              // end of stream, nothing buffered
+      Break;                  // partial read; caller re-invokes Read
+    end;
+    Inc(Got, N);
+  end;
+  Result := Got;
+end;
+
+function TSocketStream.Write(const ABuffer; ACount: LongInt): LongInt;
+begin
+  Result := FSocket.Write(ABuffer, ACount);
+end;
+
+function TSocketStream.Seek(const AOffset: Int64;
+  AOrigin: TSeekOrigin): Int64;
+begin
+  Result := 0;
+  raise EStreamError.Create('TSocketStream is not seekable');
+end;
+
+{ TBlockingQueue<T> }
+
+constructor TBlockingQueue<T>.Create(const ACapacity: Integer);
+begin
+  inherited Create;
+  FLock := TCriticalSection.Create;
+  FNotEmpty := RTLEventCreate;
+  FNotFull := RTLEventCreate;
+  FItems := TQueue<T>.Create;
+  FCapacity := ACapacity;
+  FShutdown := False;
+end;
+
+destructor TBlockingQueue<T>.Destroy;
+begin
+  FItems.Free;
+  RTLEventDestroy(FNotEmpty);
+  RTLEventDestroy(FNotFull);
+  FLock.Free;
+  inherited Destroy;
+end;
+
+procedure TBlockingQueue<T>.Push(const AItem: T);
+var
+  WokenByShutdown: Boolean;
+begin
+  WokenByShutdown := False;
+  FLock.Acquire;
+  try
+    while (not FShutdown) and (FCapacity > 0) and (FItems.Count >= FCapacity) do
+    begin
+      FLock.Release;
+      try
+        RTLEventWaitFor(FNotFull);
+      finally
+        FLock.Acquire;
+      end;
+    end;
+    if not FShutdown then
+      FItems.Enqueue(AItem)
+    else
+      WokenByShutdown := True;
+  finally
+    FLock.Release;
+  end;
+  // chain-wake the next blocked producer on the SAME event, then a consumer
+  if WokenByShutdown then
+    RTLEventSetEvent(FNotFull);
+  RTLEventSetEvent(FNotEmpty);
+end;
+
+function TBlockingQueue<T>.Pop(out AItem: T): Boolean;
+var
+  WokenByShutdown: Boolean;
+begin
+  Result := False;
+  WokenByShutdown := False;
+  FLock.Acquire;
+  try
+    while (not FShutdown) and (FItems.Count = 0) do
+    begin
+      Inc(FWaitersParked);
+      FLock.Release;
+      try
+        RTLEventWaitFor(FNotEmpty);
+      finally
+        FLock.Acquire;
+        Dec(FWaitersParked);
+      end;
+    end;
+    if FItems.Count > 0 then
+    begin
+      AItem := FItems.Dequeue;
+      Result := True;
+    end
+    else if FShutdown then
+      WokenByShutdown := True;
+  finally
+    FLock.Release;
+  end;
+  // chain-wake the next blocked consumer on the SAME event, then release a
+  // producer slot. Signalling FNotFull here would leave sibling consumers
+  // waiting on FNotEmpty blocked forever after Shutdown.
+  if WokenByShutdown then
+    RTLEventSetEvent(FNotEmpty);
+  RTLEventSetEvent(FNotFull);
+end;
+
+function TBlockingQueue<T>.TryPop(out AItem: T): Boolean;
+begin
+  FLock.Acquire;
+  try
+    Result := FItems.Count > 0;
+    if Result then
+      AItem := FItems.Dequeue;
+  finally
+    FLock.Release;
+  end;
+  if Result then
+    RTLEventSetEvent(FNotFull);
+end;
+
+procedure TBlockingQueue<T>.Shutdown;
+begin
+  FLock.Acquire;
+  try
+    FShutdown := True;
+  finally
+    FLock.Release;
+  end;
+  // RTLEvent wakes one waiter at a time; each released waiter re-signals
+  // the SAME event in its Pop/Push epilogue, so the full set unblocks.
+  RTLEventSetEvent(FNotEmpty);
+  RTLEventSetEvent(FNotFull);
+end;
+
+function TBlockingQueue<T>.Count: Integer;
+begin
+  FLock.Acquire;
+  try
+    Result := FItems.Count;
+  finally
+    FLock.Release;
+  end;
+end;
+
+function TBlockingQueue<T>.WaitersParked: Integer;
+begin
+  FLock.Acquire;
+  try
+    Result := FWaitersParked;
+  finally
+    FLock.Release;
+  end;
+end;
+
+function TBlockingQueue<T>.WaitForItem(const ATimeoutMs: Integer): Boolean;
+var
+  Deadline: QWord;
+  Remaining: Integer;
+begin
+  Deadline := GetTickCount64 + QWord(ATimeoutMs);
+  while True do
+  begin
+    FLock.Acquire;
+    try
+      if FItems.Count > 0 then
+        Exit(True);
+      if FShutdown then
+        Exit(False);
+    finally
+      FLock.Release;
+    end;
+    if GetTickCount64 >= Deadline then
+      Exit(False);
+    Remaining := Integer(Deadline - GetTickCount64);
+    RTLEventWaitFor(FNotEmpty, Remaining);
+  end;
+end;
+
+function TBlockingQueue<T>.IsShutdown: Boolean;
+begin
+  FLock.Acquire;
+  try
+    Result := FShutdown;
+  finally
+    FLock.Release;
+  end;
+end;
+
+{ TConnectionThread }
+
+constructor TConnectionThread.Create(AConn: TConnection);
+begin
+  inherited Create(True);           // start suspended; caller calls Start
+  FreeOnTerminate := False;
+  FConn := AConn;                   // weak reference: no AddRef
+  FSocket := AConn.FSocket;
+  FOutbound := AConn.FOutbound;
+  FInbound := AConn.FInbound;
+  FLocalSettings := AConn.FLocalSettings;
+  FReadPollMs := AConn.FReadPollMs;
+  FPeerMaxFrameSize := DefaultMaxFrameSize;
+  FPendingPing := False;
+  FSockStream := TSocketStream.Create(FSocket);
+end;
+
+procedure TConnectionThread.Execute;
+var
+  Frame: TFrame;
+begin
+  try
+    DoPreface;
+    TConnection(FConn).SetState(csOpen);
+    while not Terminated do
+    begin
+      DrainOutbound;
+      if Terminated then
+        Break;
+      CheckPingKeepAlive;
+      if Terminated then
+        Break;
+      try
+        Frame := ReadFrame(FSockStream, FPeerMaxFrameSize);
+      except
+        on E: EHttpTimeout do
+          Continue;                 // idle poll: loop back to outbound work
+        on E: EHttpError do
+        begin
+          Fail(E.Message, E.ErrorCode);
+          Break;
+        end;
+      end;
+      RouteInbound(Frame);
+    end;
+    DrainOutbound;                  // flush anything pending after Terminate
+  except
+    on E: Exception do
+      Fail(E.ClassName + ': ' + E.Message, ecInternalError);
+  end;
+end;
+
+procedure TConnectionThread.DoPreface;
+begin
+  FSocket.ReadTimeoutMs := FReadPollMs;
+  FSocket.Write(cClientPreface, SizeOf(cClientPreface));
+  WriteFrame(FSockStream, BuildSettingsFrame(FLocalSettings));
+end;
+
+procedure TConnectionThread.ApplyPeerSettings(
+  const ASettings: TConnectionSettings);
+begin
+  TConnection(FConn).ApplyPeerSettingsValue(ASettings);
+  FPeerMaxFrameSize := ASettings.MaxFrameSize;
+end;
+
+procedure TConnectionThread.RouteInbound(const AFrame: TFrame);
+var
+  LastStreamId: LongWord;
+  Code: THttp2ErrorCode;
+  Debug: TBytes;
+begin
+  case AFrame.Header.FrameType of
+    ftSettings:
+      if AFrame.IsAck then
+        TConnection(FConn).MarkSettingsAcked
+      else
+      begin
+        ApplyPeerSettings(TConnectionSettings.Decode(AFrame.Payload));
+        WriteFrame(FSockStream, BuildSettingsAck);
+      end;
+    ftPing:
+      if AFrame.IsAck then
+        HandlePingAck(AFrame.Payload)
+      else
+        WriteFrame(FSockStream, BuildPingFrame(AFrame.Payload, True));
+    ftGoAway:
+      begin
+        ParseGoAway(AFrame, LastStreamId, Code, Debug);
+        TConnection(FConn).MarkGoAway(LastStreamId);
+      end;
+  else
+    // route stream-scoped frames to the inbound queue; stream-0 frames of a
+    // type we do not track are ignored for now
+    if AFrame.Header.StreamId <> 0 then
+      FInbound.Push(AFrame);
+  end;
+end;
+
+procedure TConnectionThread.DrainOutbound;
+var
+  Frame: TFrame;
+begin
+  while FOutbound.TryPop(Frame) do
+    WriteFrame(FSockStream, Frame);
+end;
+
+procedure TConnectionThread.CheckPingKeepAlive;
+var
+  Now: QWord;
+  Interval, Timeout: Integer;
+begin
+  Interval := TConnection(FConn).FPingIntervalMs;
+  if Interval <= 0 then
+    Exit;
+  Timeout := TConnection(FConn).FPingTimeoutMs;
+  Now := GetTickCount64;
+  if FPendingPing then
+  begin
+    if (Timeout > 0) and (Now - FPingSentAt >= QWord(Timeout)) then
+    begin
+      Fail('PING acknowledgement timed out', ecNoError);
+      Terminate;
+    end;
+    Exit;
+  end;
+  if Now - TConnection(FConn).FLastActivity >= QWord(Interval) then
+  begin
+    SetLength(FPendingPingPayload, 8);
+    FPendingPingPayload[0] := 8;
+    FPendingPing := True;
+    FPingSentAt := Now;
+    WriteFrame(FSockStream, BuildPingFrame(FPendingPingPayload, False));
+    TConnection(FConn).TouchActivity;
+  end;
+end;
+
+procedure TConnectionThread.HandlePingAck(const APayload: TBytes);
+begin
+  if FPendingPing and (Length(APayload) = 8) and
+     (CompareMem(@APayload[0], @FPendingPingPayload[0], 8)) then
+  begin
+    FPendingPing := False;
+    TConnection(FConn).TouchActivity;
+  end;
+end;
+
+procedure TConnectionThread.Fail(const AMessage: string;
+  const ACode: THttp2ErrorCode);
+begin
+  if FConn <> nil then
+    TConnection(FConn).FailWith(AMessage, ACode);
+end;
+
+{ TConnection }
+
+constructor TConnection.Create(const ASocket: IHttp2Socket);
+begin
+  Create(ASocket, TConnectionSettings.Defaults);
+end;
+
+constructor TConnection.Create(const ASocket: IHttp2Socket;
+  const ALocalSettings: TConnectionSettings);
+begin
+  inherited Create;
+  FLock := TCriticalSection.Create;
+  FStateEvent := RTLEventCreate;
+  FSocket := ASocket;
+  FOutbound := TBlockingQueue<TFrame>.Create(cDefaultQueueCapacity);
+  FInbound := TBlockingQueue<TFrame>.Create(cDefaultQueueCapacity);
+  FLocalSettings := ALocalSettings;
+  FPeerSettings := TConnectionSettings.Defaults;
+  FState := csOpening;
+  FSettingsAcked := False;
+  FGoAwayLastStreamId := MaxStreamId;
+  FHighestStreamId := 0;
+  FError := '';
+  FErrorCode := ecNoError;
+  FClosed := False;
+  FReadPollMs := cDefaultReadPollMs;
+  FPingIntervalMs := 0;
+  FPingTimeoutMs := 0;
+  FLastActivity := GetTickCount64;
+end;
+
+destructor TConnection.Destroy;
+begin
+  Close;
+  RTLEventDestroy(FStateEvent);
+  FLock.Free;
+  inherited Destroy;
+end;
+
+procedure TConnection.Start;
+begin
+  if FThread = nil then
+  begin
+    FThread := TConnectionThread.Create(Self);
+    FThread.Start;
+  end;
+end;
+
+procedure TConnection.Close;
+begin
+  if FClosed then
+    Exit;
+  FClosed := True;
+  if (FThread <> nil) and (GetState = csOpen) then
+    FOutbound.Push(BuildGoAwayFrame(FHighestStreamId, ecNoError, nil));
+  if FThread <> nil then
+  begin
+    FThread.Terminate;
+    FThread.WaitFor;
+    FThread.Free;
+    FThread := nil;
+  end;
+  FOutbound.Shutdown;
+  FInbound.Shutdown;
+  if FSocket <> nil then
+    FSocket.Close;
+  SetState(csClosed);
+end;
+
+function TConnection.PostFrame(const AFrame: TFrame): Boolean;
+begin
+  Result := not FClosed;
+  if Result then
+    FOutbound.Push(AFrame);
+end;
+
+function TConnection.CanOpenStream: Boolean;
+begin
+  Result := GetState = csOpen;
+end;
+
+function TConnection.IsStreamRetryable(const AStreamId: LongWord): Boolean;
+var
+  S: TConnectionState;
+begin
+  S := GetState;
+  Result := ((S = csGoAway) or (S = csClosed)) and
+            (AStreamId > FGoAwayLastStreamId);
+end;
+
+function TConnection.WaitForState(const AState: TConnectionState;
+  const ATimeoutMs: Integer): Boolean;
+var
+  Deadline: QWord;
+  Remaining: Integer;
+begin
+  Deadline := GetTickCount64 + QWord(ATimeoutMs);
+  while True do
+  begin
+    if GetState = AState then
+      Exit(True);
+    if GetTickCount64 >= Deadline then
+      Exit(False);
+    Remaining := Integer(Deadline - GetTickCount64);
+    RTLEventWaitFor(FStateEvent, Remaining);
+  end;
+end;
+
+function TConnection.GetState: TConnectionState;
+begin
+  FLock.Acquire;
+  try
+    Result := FState;
+  finally
+    FLock.Release;
+  end;
+end;
+
+function TConnection.GetPeerSettings: TConnectionSettings;
+begin
+  FLock.Acquire;
+  try
+    Result := FPeerSettings;
+  finally
+    FLock.Release;
+  end;
+end;
+
+procedure TConnection.SetState(const AValue: TConnectionState);
+begin
+  FLock.Acquire;
+  try
+    FState := AValue;
+  finally
+    FLock.Release;
+  end;
+  RTLEventSetEvent(FStateEvent);
+end;
+
+procedure TConnection.MarkSettingsAcked;
+begin
+  FLock.Acquire;
+  try
+    FSettingsAcked := True;
+  finally
+    FLock.Release;
+  end;
+end;
+
+procedure TConnection.ApplyPeerSettingsValue(
+  const ASettings: TConnectionSettings);
+begin
+  FLock.Acquire;
+  try
+    FPeerSettings := ASettings;
+  finally
+    FLock.Release;
+  end;
+end;
+
+procedure TConnection.MarkGoAway(const ALastStreamId: LongWord);
+begin
+  FLock.Acquire;
+  try
+    FGoAwayLastStreamId := ALastStreamId;
+    if FState = csOpen then
+      FState := csGoAway;
+  finally
+    FLock.Release;
+  end;
+  RTLEventSetEvent(FStateEvent);
+end;
+
+procedure TConnection.TouchActivity;
+begin
+  FLock.Acquire;
+  try
+    FLastActivity := GetTickCount64;
+  finally
+    FLock.Release;
+  end;
+end;
+
+procedure TConnection.FailWith(const AMessage: string;
+  const ACode: THttp2ErrorCode);
+begin
+  FLock.Acquire;
+  try
+    if FState <> csClosed then
+    begin
+      FState := csClosed;
+      FError := AMessage;
+      FErrorCode := ACode;
+    end;
+  finally
+    FLock.Release;
+  end;
+  RTLEventSetEvent(FStateEvent);
+  // fail every in-flight stream and release every blocked waiter
+  FOutbound.Shutdown;
+  FInbound.Shutdown;
+end;
 
 end.
