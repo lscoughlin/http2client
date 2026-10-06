@@ -42,10 +42,7 @@ const
   cDefaultHttp1Fallback           = False;
 
 type
-  /// how the client treats a cleartext ("http") origin (doc/design/
-  /// fallback.md "Factory surface").  ctReject is the default: a cleartext
-  /// request raises instead of silently sending bytes in the clear.
-  TClearTextPolicy = (ctReject, ctPriorKnowledge, ctUpgrade);
+  // TClearTextPolicy and TNegotiatedProtocol come from Http2.Messages.pas
 
   THttpResponse = class;
 
