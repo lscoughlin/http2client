@@ -8,7 +8,7 @@ tags:
   - http2client
   - plan
   - story
-status: todo
+status: done
 up: "[[http2client]]"
 depends-on:
   - "05-tls-alpn-socket"
@@ -60,3 +60,36 @@ work.
 - An `http/1.1`-only TLS server returns a response when fallback is on.
 - The default still rejects a cleartext request with `EHttpProtocolError`.
 - `make validate-interop` exits 0 with cases A.10-A.13 passing.
+
+## Status (2026-10-06)
+
+All tasks are implemented. `make test` reports **292 tests, 0 errors, 0
+failures** and `make validate-interop` exits 0 with **PASS=12 FAIL=0 SKIP=1**
+(A.1-A.7 and A.9-A.13 PASS; A.8 is the only SKIP, as before).
+
+- 13.1 factory surface — commit `43a266f`.
+- 13.2 h2c prior knowledge — `test/Http2.ClearText.Test.pas`
+  `TestPriorKnowledgeGetReachesHttp2OnTheSameSocket`; interop A.10 PASS against
+  `nghttpd --no-tls`.
+- 13.3 h2c upgrade — `TestUpgradeSendsH2cHeadersAndSettings` and
+  `TestUpgradeNon101ReturnsTheHttp1Response`; interop A.11 PASS against Apache
+  `httpd:2.4` with `Protocols h2c http/1.1` + `H2Upgrade on` (101, then an
+  HTTP/2 200 on the same connection). The upgrade request is adopted as stream
+  1 (`TConnection.AdoptStreamOne` / `TStreamLease.AdoptUpgradedStream`,
+  RFC 7540 section 3.2) and never re-sent.
+- 13.4 HTTP/1.1 codec — commits `c1efd63` + `8630492`.
+- 13.5 ALPN fallback — `test/Http2.Tls.Test.pas`
+  `TestAlpnOfferForStrictOffersH2Only` / `TestAlpnOfferForFallbackOffersHttp11Too`
+  / `TestAlpnNegotiatedNameMapsKnownAndUnknown`, plus
+  `TestDialProtocolHttp1TlsSelectsTheTextCodec`; interop A.9 still PASS (strict
+  mode raises).
+- 13.6 pool keys and the HTTP/1.1 stream limit of 1 —
+  `TestPoolKeepsHttpAndHttpsOriginsApart` and
+  `TestHttp1PooledConnectionReportsStreamLimitOne`.
+- 13.7 interop cases — `tools/validate/interop.sh` A.10-A.13; interop A.12 PASS
+  against an HTTP/1.1-only Apache server.
+
+Both capabilities stay off by default: `WithClearText(ctReject)` is the
+initial policy and `WithHttp1Fallback` defaults to False, so an `http` origin
+raises `EHttpProtocolError` and an `https` origin still offers only `h2`
+(interop A.9 and A.13 PASS).

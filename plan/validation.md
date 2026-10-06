@@ -71,6 +71,22 @@ cert**. `INTEROP_HTDOCS` (default `/tmp/nghttpd-root`) holds `index.html`
 
 Acceptance command: `make validate-interop` (wraps the above) exits 0.
 
+The S13 cases (A.10–A.13) need two cleartext servers, which `nghttpd`
+cannot provide for the upgrade: `nghttpd` is HTTP/2-only, so it cannot
+answer an HTTP/1.1 `Upgrade` request. The script starts
+`httpd:2.4` (Apache, `mod_http2`) under docker instead. One container runs
+`Protocols h2c http/1.1` with `H2Upgrade on` on `INTEROP_H2C_PORT` (default
+18481), and one runs `Protocols http/1.1` on `INTEROP_H1_PORT` (default
+18482). Both use `--network host`; the generated `httpd.conf` and the
+docroot are copied in with `docker cp` (a bind-mount source inside the repo
+is intermittently deleted by Rancher Desktop, which left the container
+serving 404). The ports default away from 18080–18082 because an unrelated
+dev proxy on `127.0.0.1` would shadow Lima's `*:<port>` tunnel and silently
+answer the probe; the script refuses a busy port instead of reporting a
+false pass. A.10 uses the existing `nghttpd --no-tls` server on
+`INTEROP_PLAIN_PORT` (default 18480). When docker is unavailable, A.11 and
+A.12 report SKIP with that reason.
+
 **Result (2026-10-05): `PASS=8 FAIL=0 SKIP=1` → `RESULT: interop gate GREEN`.**
 A.1–A.7 and A.9 PASS; **A.8 is SKIP**. A.3 was closed by adding a
 `--body-writer` mode to `test/h2probe.pas` (`TChunkWriter`, 7-byte chunks)
