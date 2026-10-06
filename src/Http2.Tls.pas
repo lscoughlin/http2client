@@ -935,7 +935,11 @@ begin
   // codec.  DialWithAlpn skips the strict check so we can map the name here.
   Sock := TTlsSocket.DialWithAlpn(AHost, APort, AlpnOfferFor(AHttp1Fallback),
     FInsecure, ATimeoutMs, FCACertFile);
-  Name := TTlsSocket(Sock).SelectedProtocol;
+  // $interfaces com: an interface reference points past the object's VMT, so
+  // `TTlsSocket(Sock)` (a raw hard cast) would read the wrong memory.  Recover
+  // the object with `as TObject` before the class cast so the property read
+  // returns the name Establish recorded.
+  Name := TTlsSocket(Sock as TObject).SelectedProtocol;
   if Name = cHttp11AlpnProtocol then
     AProtocol := npHttp1Tls
   else if Name = cHttp2AlpnProtocol then
