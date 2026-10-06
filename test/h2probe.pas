@@ -18,7 +18,8 @@ program h2probe;
 
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
-  SysUtils, Classes, TypInfo, Http2.Errors, Http2.Messages, Http2.Client, Http2.Stream,
+  SysUtils, Classes, TypInfo, Http2.Errors, Http2.Tls, Http2.Messages, Http2.Client,
+  Http2.Stream,
   Http2.ProbeOutcome, Http2.Frames, Http2.Observer;
 
 const
@@ -36,6 +37,10 @@ var
   GBodySet: Boolean;
   GBodyWriterSet: Boolean;
   GTraceFrames: Boolean;
+  /// S13: cleartext policy for an http:// URL (default ctReject)
+  GClearTextPolicy: TClearTextPolicy;
+  /// S13: offer http/1.1 as an ALPN alternative on https
+  GHttp1Fallback: Boolean;
 
 function ReadOptionValue(const AArg: string): string;
 var
@@ -69,6 +74,8 @@ begin
   GBodyWriterSet := False;
   GInsecure := False;
   GTraceFrames := False;
+  GClearTextPolicy := ctReject;
+  GHttp1Fallback := False;
   GTimeoutMs := cDefaultTimeoutMs;
   GKeepOpenMs := cDefaultKeepOpenMs;
   GParallel := 1;
@@ -83,6 +90,19 @@ begin
       GInsecure := True
     else if (Arg = '--trace-frames') then
       GTraceFrames := True
+    else if (Arg = '--http1-fallback') then
+      GHttp1Fallback := True
+    else if Name = '--clear-text' then
+    begin
+      if Value = 'prior-knowledge' then
+        GClearTextPolicy := ctPriorKnowledge
+      else if Value = 'upgrade' then
+        GClearTextPolicy := ctUpgrade
+      else if Value = 'reject' then
+        GClearTextPolicy := ctReject
+      else
+        UsageError('--clear-text must be reject|prior-knowledge|upgrade');
+    end
     else if Name = '--url' then
       GUrl := Value
     else if Name = '--method' then
@@ -343,7 +363,9 @@ begin
     .WithConnectTimeout(GTimeoutMs)
     .WithHeaderTimeout(GTimeoutMs)
     .WithIdleTimeout(0)
-    .WithInsecureTls(GInsecure);
+    .WithInsecureTls(GInsecure)
+    .WithClearText(GClearTextPolicy)
+    .WithHttp1Fallback(GHttp1Fallback);
   if GTraceFrames then
     Factory := Factory.WithObserver(TFrameTraceObserver.Create);
   Client := Factory.Build;

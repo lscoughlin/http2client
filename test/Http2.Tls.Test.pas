@@ -128,6 +128,9 @@ type
     // 05.4 ALPN wire bytes and verification
     procedure TestAlpnWireBytesAreExact;
     procedure TestAlpnProtocolListOfTwo;
+    procedure TestAlpnOfferForStrictOffersH2Only;          // 13.5
+    procedure TestAlpnOfferForFallbackOffersHttp11Too;     // 13.5
+    procedure TestAlpnNegotiatedNameMapsKnownAndUnknown;   // 13.5
     procedure TestAlpnNameDecodes;
     procedure TestRequireH2AlpnAcceptsH2;
     procedure TestRequireH2AlpnRejectsHttp11;
@@ -574,6 +577,43 @@ begin
   AssertEquals('h2 length', $02, Wire[0]);
   AssertEquals('second length', 8, Wire[3]);
   AssertEquals('second first char', Ord('h'), Wire[4]);
+end;
+
+procedure TTlsTest.TestAlpnOfferForStrictOffersH2Only;
+var
+  Wire: TBytes;
+begin
+  // fallback off (the strict default) offers "h2" alone (doc/design/fallback.md
+  // "Negotiation" step 2)
+  Wire := AlpnOfferFor(False);
+  AssertEquals('strict offer is 3 bytes', 3, Length(Wire));
+  AssertEquals('strict offer length byte', $02, Wire[0]);
+  AssertEquals('strict offer spells h2', 'h2',
+    AlpnSelectedName(RawPtrOf(Wire) + 1, 2));
+end;
+
+procedure TTlsTest.TestAlpnOfferForFallbackOffersHttp11Too;
+var
+  Wire: TBytes;
+begin
+  // fallback on offers "h2" then "http/1.1", in that preference order
+  Wire := AlpnOfferFor(True);
+  AssertEquals('fallback offer is 12 bytes', 1 + 2 + 1 + 8, Length(Wire));
+  AssertEquals('h2 is first', $02, Wire[0]);
+  AssertEquals(' then http/1.1', 8, Wire[3]);
+  AssertEquals('http/1.1 bytes follow', 'http/1.1',
+    AlpnSelectedName(RawPtrOf(Wire) + 4, 8));
+end;
+
+procedure TTlsTest.TestAlpnNegotiatedNameMapsKnownAndUnknown;
+begin
+  // only the two known names survive; anything else (including the empty
+  // selection) normalises to '' so the caller applies its fallback policy
+  AssertEquals('h2 is kept', 'h2', AlpnNegotiatedName('h2'));
+  AssertEquals('http/1.1 is kept', 'http/1.1', AlpnNegotiatedName('http/1.1'));
+  AssertEquals('empty maps to empty', '', AlpnNegotiatedName(''));
+  AssertEquals('an unknown protocol maps to empty', '',
+    AlpnNegotiatedName('spdy/3.1'));
 end;
 
 procedure TTlsTest.TestAlpnNameDecodes;

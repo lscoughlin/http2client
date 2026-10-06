@@ -103,11 +103,15 @@ type
     function Eligible: Boolean;
     function Acquire(const ARequest: TStreamRequest; const ATimeoutMs: Integer;
       out AAcquired: Boolean): IHttpResponse;
+    function AcquireUpgraded(const ARequest: TStreamRequest;
+      const ATimeoutMs: Integer): IHttpResponse;
+    function Closed: Boolean;
     procedure Drain;
     procedure ReleaseIfIdle;
     function GetConn: TConnection;
     function GetOrigin: string;
     function GetLock: TCriticalSection;
+    function GetKey: Pointer;
   end;
 
   /// a fake response + body stream for TResponseReader<T> tests
@@ -483,6 +487,24 @@ end;
 function TFakePooledConnection.Eligible: Boolean;
 begin
   Result := FEligible;
+end;
+
+function TFakePooledConnection.AcquireUpgraded(
+  const ARequest: TStreamRequest;
+  const ATimeoutMs: Integer): IHttpResponse;
+begin
+  raise EHttpProtocolError.Create('fake pooled connection: no h2c upgrade',
+    ecInternalError);
+end;
+
+function TFakePooledConnection.Closed: Boolean;
+begin
+  Result := FConn.State = csClosed;
+end;
+
+function TFakePooledConnection.GetKey: Pointer;
+begin
+  Result := Pointer(FConn);
 end;
 
 function TFakePooledConnection.Acquire(const ARequest: TStreamRequest;

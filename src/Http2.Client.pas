@@ -19,9 +19,11 @@ unit Http2.Client;
 interface
 
 uses
-  SysUtils, Classes, SyncObjs, Generics.Collections, TypInfo,
+  SysUtils, Classes, SyncObjs, Generics.Collections, TypInfo, BaseUnix,
+  Sockets,
   Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack,
-  Http2.Tls, Http2.Connection, Http2.Stream, Http2.Observer, Http2.Messages;
+  Http2.Tls, Http2.Connection, Http2.Stream, Http2.Observer, Http2.Messages,
+  Http2.Http1;
 
 const
   /// documented factory defaults (doc/design/client-api.md "HttpClientFactory")
@@ -34,12 +36,18 @@ const
   cDefaultIdleTimeoutMs           = 60000;
   /// the default TLS port; omitted from :authority when the URL port matches
   cDefaultHttpsPort               = 443;
+  /// the default cleartext port (doc/design/fallback.md "Terms")
+  cDefaultHttpPort                = 80;
   /// transparent retries allowed for an idempotent request on a refused stream
   cMaxTransparentRetries          = 2;
   /// a cancellable wait polls its token in slices of this many milliseconds
   cCancelPollSliceMs              = 20;
   /// default for the HTTP/1.1 ALPN fallback (doc/design/fallback.md)
   cDefaultHttp1Fallback           = False;
+  /// an HTTP/1.1 connection carries one request at a time (doc/design/
+  /// fallback.md "HTTP/1.1 codec"): the effective stream limit is 1, so the
+  /// pool opens more connections for concurrency, still capped by MaxConnections
+  cHttp1StreamLimit               = 1;
 
 type
   // TClearTextPolicy and TNegotiatedProtocol come from Http2.Messages.pas
@@ -73,16 +81,28 @@ type
     function IsCancelled: Boolean;
   end;
 
-  /// the production factory: TCP then TLS handshake offering ALPN "h2"
-  TDefaultSocketFactory = class(TInterfacedObject, IHttp2SocketFactory)
+  /// the production factory: TCP then TLS handshake offering ALPN "h2" (and
+  /// "http/1.1" when fallback is on).  It also implements the extended
+  /// ICleartextSocketFactory contract (plan S13) by delegating to an owned
+  /// TProtocolSocketFactory, so the pool can select TLS vs cleartext and the
+  /// HTTP/1.1 vs HTTP/2 codec from one call.  Dial keeps its original
+  /// behaviour byte-for-byte: an injected test factory that only knows
+  /// IHttp2SocketFactory still works unchanged on the https path.
+  TDefaultSocketFactory = class(TInterfacedObject, IHttp2SocketFactory,
+    ICleartextSocketFactory)
   private
     FCACertFile: string;
     FInsecure: Boolean;
+    FProtocols: TProtocolSocketFactory;
   public
     constructor Create(const ACACertFile: string = '';
       const AInsecure: Boolean = False);
     function Dial(const AHost: string; const APort: Word;
       const ATimeoutMs: Integer): IHttp2Socket;
+    function DialProtocol(const AHost: string; const APort: Word;
+      const AScheme: string; const AHttp1Fallback: Boolean;
+      const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
+      out AProtocol: TNegotiatedProtocol): IHttp2Socket;
   end;
 
   /// an HTTP/2 response. Pseudo-headers
@@ -221,6 +241,11 @@ type
 
   /// one pooled connection, exposed as an interface so an outstanding response
   /// can keep it (and its TConnection) alive after the pool releases it.
+  ///
+  /// Protocol-neutral (plan S13 task 13.5): both the HTTP/2 wrapper
+  /// (THttpConnection) and the HTTP/1.1 wrapper (THttp1PooledConnection)
+  /// satisfy it, so TConnectionPool never branches on the codec.  An HTTP/1.1
+  /// entry has no TConnection: its Conn is nil.
   IPooledConnection = interface
     function ActiveStreams: Integer;
     /// eligible = open(ing) and below the per-connection stream cap
@@ -230,6 +255,16 @@ type
     /// ineligible, so the pool retries with another connection.
     function Acquire(const ARequest: TStreamRequest;
       const ATimeoutMs: Integer; out AAcquired: Boolean): IHttpResponse;
+    /// adopt the h2c upgrade request (RFC 7540 section 3.2): the peer already
+    /// received it as stream 1, so nothing is re-sent and the response arrives
+    /// on stream 1.  Only an HTTP/2 entry implements this (an HTTP/1.1 entry
+    /// raises EHttpProtocolError).
+    function AcquireUpgraded(const ARequest: TStreamRequest;
+      const ATimeoutMs: Integer): IHttpResponse;
+    /// the transport is finished (peer closed it, a failure was observed, or
+    /// the codec consumed it); the pool may drop the entry once ActiveStreams
+    /// is 0.  Protocol-neutral replacement for inspecting Conn.State.
+    function Closed: Boolean;
     /// stop accepting new leases; close now when idle, else when the last
     /// outstanding body is released
     procedure Drain;
@@ -239,9 +274,13 @@ type
     function GetConn: TConnection;
     function GetOrigin: string;
     function GetLock: TCriticalSection;
+    /// stable per-connection identity used to key the idle-time map; an
+    /// HTTP/1.1 entry has no TConnection, so it keys on its codec object
+    function GetKey: Pointer;
     property Conn: TConnection read GetConn;
     property Origin: string read GetOrigin;
     property Lock: TCriticalSection read GetLock;
+    property Key: Pointer read GetKey;
   end;
 
   /// IHttpBodyStream facade over a lease body that holds the pooled
@@ -305,11 +344,82 @@ type
     function AcquireCancellable(const ARequest: TStreamRequest;
       const ATimeoutMs: Integer; const AToken: ICancellationToken;
       out AAcquired: Boolean): IHttpResponse;
+    /// adopt the h2c upgrade request: the peer already received it as stream 1
+    /// during the HTTP/1.1 Upgrade, so no request frame is emitted and the 101
+    /// is not the response; the response arrives on stream 1 (RFC 7540 s 3.2)
+    function AcquireUpgraded(const ARequest: TStreamRequest;
+      const ATimeoutMs: Integer): IHttpResponse;
+    function Closed: Boolean;
     procedure Drain;
     procedure ReleaseIfIdle;
     function GetConn: TConnection;
     function GetOrigin: string;
     function GetLock: TCriticalSection;
+    function GetKey: Pointer;
+  end;
+
+  /// an IHttp2Socket adapter that turns an exact-count Read into a SINGLE
+  /// underlying read, returning as soon as ANY bytes are available.
+  ///
+  /// The HTTP/2 reader wants an exact-count Read (a partial frame must be read
+  /// to completion), but the HTTP/1.1 codec's TBufferedReader.Fill asks for a
+  /// whole 16 KiB buffer and a keep-alive peer (Apache) sends ~235 bytes and
+  /// then waits: against an exact-count transport that Fill blocks until the
+  /// read deadline expires.  Wrapping the cleartext transport for the HTTP/1.1
+  /// path fixes that without touching the transport itself.  A transport with
+  /// no exposed raw handle (TLS) is used unchanged.
+  TSingleReadSocket = class(TInterfacedObject, IHttp2Socket)
+  private
+    FInner: IHttp2Socket;
+    FFd: Integer;            // -1 when FInner exposes no raw socket handle
+    FConnectTimeoutMs: Integer;
+    FReadTimeoutMs: Integer;
+    FWriteTimeoutMs: Integer;
+  public
+    constructor Create(const AInner: IHttp2Socket);
+    destructor Destroy; override;
+    function Read(var ABuffer; ACount: Integer): Integer;
+    function Write(const ABuffer; ACount: Integer): Integer;
+    procedure Close;
+    function GetConnected: Boolean;
+    function GetConnectTimeoutMs: Integer;
+    procedure SetConnectTimeoutMs(const AValue: Integer);
+    function GetReadTimeoutMs: Integer;
+    procedure SetReadTimeoutMs(const AValue: Integer);
+    function GetWriteTimeoutMs: Integer;
+    procedure SetWriteTimeoutMs(const AValue: Integer);
+  end;
+
+  /// the HTTP/1.1 pooled connection (plan S13 task 13.5): the codec-selection
+  /// counterpart of THttpConnection, so the pool stays protocol-neutral.  It
+  /// carries one request at a time (cHttp1StreamLimit).
+  THttp1PooledConnection = class(TInterfacedObject, IPooledConnection)
+  private
+    FH1: THttp1Connection;
+    FLock: TCriticalSection;
+    FOrigin: string;
+    FClosing: Boolean;
+    /// the in-flight response body, if any: the connection is only eligible
+    /// for reuse once it is drained
+    FLastBody: IHttpBodyStream;
+  public
+    constructor Create(const AH1: THttp1Connection; const AOrigin: string);
+    destructor Destroy; override;
+    function ActiveStreams: Integer;
+    function Eligible: Boolean;
+    function Acquire(const ARequest: TStreamRequest;
+      const ATimeoutMs: Integer; out AAcquired: Boolean): IHttpResponse;
+    /// an HTTP/1.1 entry never adopts an h2c stream: the upgrade only happens
+    /// on a fresh connection (UnsupportedOperation is the honest answer)
+    function AcquireUpgraded(const ARequest: TStreamRequest;
+      const ATimeoutMs: Integer): IHttpResponse;
+    function Closed: Boolean;
+    procedure Drain;
+    procedure ReleaseIfIdle;
+    function GetConn: TConnection;
+    function GetOrigin: string;
+    function GetLock: TCriticalSection;
+    function GetKey: Pointer;
   end;
 
   /// the connection pool (doc/design/client-api.md "Lease acquisition"):
@@ -328,24 +438,64 @@ type
     FTotalConnections: Integer;
     FClosed: Boolean;
     FObserver: IHttp2Observer;
-    /// last time a pooled connection was used, keyed by its TConnection
+    /// ALPN fallback and cleartext policy, applied to every request by scheme
+    /// (doc/design/fallback.md)
+    FHttp1Fallback: Boolean;
+    FClearTextPolicy: TClearTextPolicy;
+    /// last time a pooled connection was used, keyed by IPooledConnection.Key
     FIdleSince: TDictionary<Pointer, QWord>;
+    /// the TCP+TLS-or-cleartext dial for ARequest's scheme (fallback on https,
+    /// the policy on http); out AProtocol names the negotiated wire protocol.
+    /// Uses the extended ICleartextSocketFactory contract when the factory
+    /// supports it, else the legacy Dial (npHttp2Tls) so an injected test
+    /// factory keeps working
+    function DialFor(const AHost: string; const APort: Word;
+      const AScheme: string; const ATimeoutMs: Integer;
+      out AProtocol: TNegotiatedProtocol): IHttp2Socket;
+    /// wrap Sock as an HTTP/2 pooled connection.  AStart True runs the thread
+    /// and waits for csOpen (preface + SETTINGS written by DoPreface); False
+    /// leaves it unstarted so the h2c upgrade can adopt stream 1 before any
+    /// inbound frame is read
+    function StartHttp2(const Sock: IHttp2Socket; const AOrigin: string;
+      const AStart: Boolean): IPooledConnection;
+    /// online the HTTP/1.1 codec over a socket and pool it
+    function WrapHttp1(const Sock: IHttp2Socket;
+      const AOrigin: string): IPooledConnection;
+    /// the one transport-selection point (plan S13 tasks 13.2/13.3/13.5):
+    /// dial, choose the codec from the negotiated protocol, run the h2c
+    /// Upgrade when the policy asks for it, and register the result under
+    /// AOrigin.  AUpgraded is True when the connection is an unstarted HTTP/2
+    /// connection on which the caller must adopt stream 1 via AcquireUpgraded.
+    function OpenForTxn(const AOrigin, AHost: string; const APort: Word;
+      const ARequest: TStreamRequest; const AHeaderTimeoutMs: Integer;
+      const AScheme: string; out AConn: IPooledConnection;
+      out AUpgraded: Boolean): Boolean;
+    /// write the h2c Upgrade request on Sock and read the whole response head
+    /// byte by byte.  True => 101 and the socket sits exactly at the HTTP/2
+    /// boundary; False => the peer declined and Sock must be discarded (its
+    /// exchange is half-read), so the pool re-dials for plain HTTP/1.1.
+    // (RFC 7540 section 3.2 / doc/design/fallback.md "h2c upgrade procedure")
+    function TryH2cUpgrade(const Sock: IHttp2Socket;
+      const ARequest: TStreamRequest): Boolean;
     procedure ReapClosed;
     procedure ReapIdleLocked;
     procedure MarkUsed(const C: IPooledConnection);
     function ListFor(const AOrigin: string): TList<IPooledConnection>;
-    function OpenConnection(const AOrigin, AHost: string;
-      const APort: Word): IPooledConnection;
     function PickEligible(const AOrigin: string): IPooledConnection;
     function CanOpenNew: Boolean;
+    procedure Register(const AOrigin: string;
+      const AConn: IPooledConnection);
   public
     constructor Create(const AFactory: IHttp2SocketFactory; const AMaxConnections,
       AMaxStreamsPerConnection, AConnectTimeoutMs, AHeaderTimeoutMs,
-      AIdleTimeoutMs: Integer; const AObserver: IHttp2Observer = nil);
+      AIdleTimeoutMs: Integer; const AObserver: IHttp2Observer = nil;
+      const AHttp1Fallback: Boolean = False;
+      const AClearTextPolicy: TClearTextPolicy = ctReject);
     destructor Destroy; override;
     /// acquire a lease on the least-loaded eligible connection, opening a new
     /// one or waiting for a slot per doc/design/client-api.md. When AToken is
-    /// non-nil the wait is cancellable (plan S10 task 10.8).
+    /// non-nil the wait is cancellable (plan S10 task 10.8).  The request's
+    /// scheme selects TLS vs cleartext and the HTTP/2 vs HTTP/1.1 codec.
     function Acquire(const AOrigin, AHost: string; const APort: Word;
       const ARequest: TStreamRequest; const AHeaderTimeoutMs: Integer;
       const AToken: ICancellationToken = nil): IHttpResponse;
@@ -415,12 +565,38 @@ function OriginOfUrl(const AUrl: string): string;
 /// lowercased scheme of AUrl ('https' when the URL carries none)
 function SchemeOfUrl(const AUrl: string): string;
 
+/// the default port for a scheme: 80 for http, 443 for anything else
+function DefaultPortForScheme(const AScheme: string): Word;
+
 /// resolve a redirect Location against the URL that produced it: absolute,
 /// protocol-relative, root-relative or path-relative (plan S10 task 10.1)
 function ResolveLocation(const ABaseUrl, ALocation: string): string;
 
 /// read a response body to EOF into a byte array (used by TResponseReader<T>)
 function ReadAllBodyBytes(const ABody: IHttpBodyStream): TBytes;
+
+/// base64url (RFC 4648 section 5) of AData: standard base64 with '+'->'-',
+/// '/'->'_' and NO '=' padding
+function Base64UrlEncode(const AData: TBytes): string;
+
+/// the value of the h2c `HTTP2-Settings` header: the base64url (unpadded)
+/// encoding of the client's initial SETTINGS wire payload
+// (RFC 7540 section 3.2.1).  It is exactly the payload the connection preface
+// sends, so the client never later emits a conflicting SETTINGS frame.
+function Http2SettingsBase64Url: string;
+
+/// build the raw bytes of the h2c Upgrade request: request line, Host, the
+/// caller's headers, then Upgrade/Connection/HTTP2-Settings
+// (doc/design/fallback.md "h2c upgrade procedure").  The Upgrade and
+// Connection headers cannot travel through TStreamRequest.Headers (the shared
+// header map forbids connection-specific fields), so they are written here.
+function BuildH2cUpgradeRequest(const ARequest: TStreamRequest): TBytes;
+
+/// read one CRLF/LF-terminated line byte by byte from AScope, never reading
+/// past the terminator, so an h2c upgrade leaves any following HTTP/2 bytes in
+/// the socket.  False when the stream ends before any byte arrives.
+function ReadHeadLineBytewise(const ASock: IHttp2Socket;
+  out ALine: string): Boolean;
 
 { ---- implementation ---- }
 
@@ -467,10 +643,15 @@ var
   Port: LongInt;
 begin
   AHost := '';
-  APort := cDefaultHttpsPort;
   APath := '/';
   Rest := AUrl;
+  // the default port follows the scheme: 80 for http, 443 for https
+  // (doc/design/fallback.md "Terms")
   P := Pos('://', Rest);
+  if (P > 0) and (LowerCase(Copy(Rest, 1, P - 1)) = 'http') then
+    APort := cDefaultHttpPort
+  else
+    APort := cDefaultHttpsPort;
   if P > 0 then
     Rest := Copy(Rest, P + 3, Length(Rest));    // drop "scheme://"
   PathPart := '';
@@ -494,7 +675,7 @@ begin
   begin
     AHost := Copy(AuthorityPart, 1, Colon - 1);
     PortStr := Copy(AuthorityPart, Colon + 1, Length(AuthorityPart));
-    Port := StrToIntDef(PortStr, cDefaultHttpsPort);
+    Port := StrToIntDef(PortStr, APort);
     if (Port <= 0) or (Port > 65535) then
       raise EHttpProtocolError.Create('invalid URL port: ' + PortStr,
         ecProtocolError);
@@ -518,19 +699,29 @@ begin
     Result := 'https';
 end;
 
+function DefaultPortForScheme(const AScheme: string): Word;
+begin
+  // the origin/authority omit the port only when it is the scheme default,
+  // so 80 is default for http and 443 for everything else
+  if LowerCase(AScheme) = 'http' then
+    Result := cDefaultHttpPort
+  else
+    Result := cDefaultHttpsPort;
+end;
+
 function OriginOfUrl(const AUrl: string): string;
 var
   Host, Path, Scheme: string;
   Port: Word;
 begin
   ParseHttpUrl(AUrl, Host, Port, Path);
-  if Port = cDefaultHttpsPort then
+  Scheme := SchemeOfUrl(AUrl);
+  if Port = DefaultPortForScheme(Scheme) then
     Result := Host
   else
     Result := Host + ':' + IntToStr(Port);
   // a different scheme is a different origin even on the same host:port, so
   // an http redirect target never reuses a pooled https connection
-  Scheme := SchemeOfUrl(AUrl);
   if Scheme <> 'https' then
     Result := Scheme + '://' + Result;
 end;
@@ -608,6 +799,131 @@ begin
   end;
 end;
 
+function Base64UrlEncode(const AData: TBytes): string;
+const
+  cStd = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+var
+  I, N: Integer;
+  B0, B1, B2: Byte;
+begin
+  Result := '';
+  I := 0;
+  N := Length(AData);
+  while I < N do
+  begin
+    B0 := AData[I];
+    if I + 1 < N then B1 := AData[I + 1] else B1 := 0;
+    if I + 2 < N then B2 := AData[I + 2] else B2 := 0;
+    Result := Result + cStd[(B0 shr 2) + 1];
+    Result := Result + cStd[(((B0 and $03) shl 4) or (B1 shr 4)) + 1];
+    if I + 1 < N then
+      Result := Result + cStd[(((B1 and $0F) shl 2) or (B2 shr 6)) + 1];
+    if I + 2 < N then
+      Result := Result + cStd[(B2 and $3F) + 1];
+    Inc(I, 3);
+  end;
+  // base64url alphabet, no '=' padding (RFC 4648 section 5)
+  for N := 1 to Length(Result) do
+    if Result[N] = '+' then
+      Result[N] := '-'
+    else if Result[N] = '/' then
+      Result[N] := '_';
+end;
+
+function Http2SettingsBase64Url: string;
+begin
+  // exactly the SETTINGS payload DoPreface writes, so the HTTP2-Settings value
+  // and the first SETTINGS frame carry the same settings (RFC 7540 s 3.2.1)
+  Result := Base64UrlEncode(TConnectionSettings.Defaults.Encode);
+end;
+
+function BuildH2cUpgradeRequest(const ARequest: TStreamRequest): TBytes;
+var
+  Head, Host, Value: string;
+  Names, Vals: TArray<string>;
+  I, J: Integer;
+  B: TBytes;
+begin
+  Head := ARequest.Method;
+  if Head = '' then
+    Head := 'GET';
+  if ARequest.Path = '' then
+    Head := Head + ' / HTTP/1.1' + #13#10
+  else
+    Head := Head + ' ' + ARequest.Path + ' HTTP/1.1' + #13#10;
+
+  Host := '';
+  if ARequest.Headers <> nil then
+    Host := ARequest.Headers.GetFirst(HeaderHost);
+  if Host = '' then
+    Host := ARequest.Authority;
+  if Host = '' then
+    raise EHttpProtocolError.Create('h2c upgrade request has no Host',
+      ecProtocolError);
+  Head := Head + 'Host: ' + Host + #13#10;
+
+  if ARequest.Headers <> nil then
+  begin
+    Names := ARequest.Headers.Names;
+    for I := 0 to High(Names) do
+    begin
+      if SameText(Names[I], HeaderHost) then
+        Continue;
+      Vals := ARequest.Headers.GetValues(Names[I]);
+      for J := 0 to High(Vals) do
+      begin
+        Value := Vals[J];
+        Head := Head + Names[I] + ': ' + Value + #13#10;
+      end;
+    end;
+  end;
+
+  Head := Head + 'Upgrade: h2c' + #13#10;
+  Head := Head + 'Connection: Upgrade, HTTP2-Settings' + #13#10;
+  Head := Head + 'HTTP2-Settings: ' + Http2SettingsBase64Url + #13#10;
+  Head := Head + #13#10;
+
+  SetLength(B, Length(Head));
+  if Length(B) > 0 then
+    Move(Head[1], B[0], Length(B));
+  Result := B;
+end;
+
+function ReadHeadLineBytewise(const ASock: IHttp2Socket;
+  out ALine: string): Boolean;
+var
+  One: array[0..0] of Byte;
+  Buf: TBytes;
+  N: Integer;
+begin
+  ALine := '';
+  Buf := nil;
+  while True do
+  begin
+    N := ASock.Read(One[0], 1);
+    if N <= 0 then
+      Break;
+    SetLength(Buf, Length(Buf) + 1);
+    Buf[High(Buf)] := One[0];
+    if One[0] = 10 then
+      Break;
+    if Length(Buf) > cHttp1MaxHeaderBytes then
+      raise EHttpProtocolError.Create(
+        'h2c upgrade status line exceeds the header-size limit',
+        ecProtocolError);
+  end;
+  if Length(Buf) = 0 then
+    Exit(False);
+  if Buf[High(Buf)] = 10 then
+    SetLength(Buf, Length(Buf) - 1);
+  if (Length(Buf) > 0) and (Buf[High(Buf)] = 13) then
+    SetLength(Buf, Length(Buf) - 1);
+  SetLength(ALine, Length(Buf));
+  if Length(Buf) > 0 then
+    Move(Buf[0], ALine[1], Length(Buf));
+  Result := True;
+end;
+
 function HttpMethodIsIdempotent(const AToken: string): Boolean;
 begin
   Result := (AToken = 'GET') or (AToken = 'HEAD') or (AToken = 'PUT') or
@@ -663,12 +979,55 @@ begin
   inherited Create;
   FCACertFile := ACACertFile;
   FInsecure := AInsecure;
+  FProtocols := TProtocolSocketFactory.Create(ACACertFile, AInsecure);
 end;
 
 function TDefaultSocketFactory.Dial(const AHost: string; const APort: Word;
   const ATimeoutMs: Integer): IHttp2Socket;
 begin
   Result := TTlsSocket.Dial(AHost, APort, FInsecure, ATimeoutMs, FCACertFile);
+end;
+
+function TDefaultSocketFactory.DialProtocol(const AHost: string;
+  const APort: Word; const AScheme: string; const AHttp1Fallback: Boolean;
+  const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
+  out AProtocol: TNegotiatedProtocol): IHttp2Socket;
+var
+  Sock: IHttp2Socket;
+  TlsObj: TObject;
+  Name: string;
+begin
+  // cleartext never involves ALPN, so the shared selector is correct there
+  if AScheme = 'http' then
+    Exit(FProtocols.DialProtocol(AHost, APort, AScheme, AHttp1Fallback,
+      APolicy, ATimeoutMs, AProtocol));
+
+  // https: offer the ALPN list the fallback policy asks for, then map the
+  // selected name to a codec.  DialWithAlpn reports the name instead of
+  // enforcing "h2", so the mapping happens here
+  // (doc/design/fallback.md "Negotiation").
+  Sock := TTlsSocket.DialWithAlpn(AHost, APort, AlpnOfferFor(AHttp1Fallback),
+    FInsecure, ATimeoutMs, FCACertFile);
+  // downcast with Supports, NOT a hard class cast: a hard cast reinterprets
+  // the interface pointer (which is not the object base) and reads garbage
+  Name := '';
+  if Supports(Sock, TTlsSocket, TlsObj) then
+    Name := TTlsSocket(TlsObj).SelectedProtocol;
+  if Name = cHttp11AlpnProtocol then
+    AProtocol := npHttp1Tls
+  else if Name = cHttp2AlpnProtocol then
+    AProtocol := npHttp2Tls
+  else if AHttp1Fallback then
+    // RFC 7301: no ALPN result means the peer speaks HTTP/1.1
+    AProtocol := npHttp1Tls
+  else
+  begin
+    Sock.Close;
+    raise EHttpProtocolError.CreateFmt(
+      'peer did not negotiate ALPN "%s" (selected "%s")',
+      [cHttp2AlpnProtocol, Name]);
+  end;
+  Result := Sock;
 end;
 
 { THttpRequest }
@@ -700,7 +1059,7 @@ var
   Port: Word;
 begin
   ParseHttpUrl(FUrl, Host, Port, Path);
-  if Port = cDefaultHttpsPort then
+  if Port = DefaultPortForScheme(SchemeOfUrl(FUrl)) then
     Result := Host
   else
     Result := Host + ':' + IntToStr(Port);
@@ -791,7 +1150,10 @@ var
   I, J: Integer;
 begin
   Result := TStreamRequest.Create(GetMethodToken, GetAuthority);
-  Result := Result.WithScheme('https').WithPath(GetPath);
+  // the URL scheme drives transport selection and the codec (plan S13):
+  // ':scheme' stays 'http'/'https' while a cleartext origin also picks the
+  // cleartext policy path in the pool
+  Result := Result.WithScheme(SchemeOfUrl(FUrl)).WithPath(GetPath);
   if FHeaders <> nil then
   begin
     Names := FHeaders.Names;
@@ -1191,12 +1553,311 @@ begin
   end;
 end;
 
+function THttpConnection.Closed: Boolean;
+begin
+  Result := FConn.State = csClosed;
+end;
+
+function THttpConnection.GetKey: Pointer;
+begin
+  Result := Pointer(FConn);
+end;
+
+function THttpConnection.AcquireUpgraded(const ARequest: TStreamRequest;
+  const ATimeoutMs: Integer): IHttpResponse;
+var
+  Lease: TStreamLease;
+  Keep: IConnectionStream;
+  Deadline: QWord;
+  Slice: Integer;
+  Ok: Boolean;
+begin
+  FLock.Acquire;
+  try
+    Lease := TStreamLease.Create(FConn, FAllocator, ARequest, FEncoder,
+      FDecoder);
+    Keep := Lease;
+    Lease.TimeoutMs := ATimeoutMs;
+    try
+      Lease.AdoptUpgradedStream;
+    except
+      Lease.ReleaseLease;
+      raise;
+    end;
+    // stream 1 is registered, so it is now safe to start the reader: the
+    // preface is written and every inbound stream-1 frame routes to this
+    // lease (never to the shared queue)
+    FConn.Start;
+    // AdoptUpgradedStream registered stream 1, so the response the peer
+    // already produced during the Upgrade (RFC 7540 section 3.2) is routed to
+    // this lease by the connection thread.
+    Deadline := GetTickCount64 + QWord(ATimeoutMs);
+    Ok := False;
+    while True do
+    begin
+      if GetTickCount64 >= Deadline then
+        Slice := 0
+      else
+        Slice := Integer(Deadline - GetTickCount64);
+      Ok := Lease.WaitForResponseHeader(Slice);
+      if Ok then
+        Break;
+      if GetTickCount64 >= Deadline then
+        Break;
+    end;
+    if not Ok then
+    begin
+      // the adopted stream is RESET, never orphaned (mirrors AcquireCancellable)
+      FConn.PostFrame(BuildRstStreamFrame(Lease.StreamId, ecCancel));
+      Lease.ReleaseLease;
+      raise EHttpTimeout.Create('timed out waiting for response headers');
+    end;
+    Result := THttpResponse.Create(Lease, Keep, Self);
+  finally
+    FLock.Release;
+  end;
+end;
+
+{ TSingleReadSocket }
+
+constructor TSingleReadSocket.Create(const AInner: IHttp2Socket);
+var
+  Plain: TObject;
+  H: Integer;
+begin
+  inherited Create;
+  FInner := AInner;
+  FFd := -1;
+  H := -1;
+  // TPlainSocket is the only cleartext transport that exposes an OS handle;
+  // reusing its fd lets a single fpRecv bypass the exact-count loop
+  try
+    if (AInner <> nil) and Supports(AInner, TPlainSocket, Plain) then
+      H := TPlainSocket(Plain).Handle;
+  except
+    H := -1;
+  end;
+  if H >= 0 then
+    FFd := H;
+  FConnectTimeoutMs := cDefaultSocketTimeoutMs;
+  FReadTimeoutMs := cDefaultSocketTimeoutMs;
+  FWriteTimeoutMs := cDefaultSocketTimeoutMs;
+end;
+
+destructor TSingleReadSocket.Destroy;
+begin
+  // FInner is freed by its own reference (no Free here: it may be shared)
+  inherited Destroy;
+end;
+
+function TSingleReadSocket.Read(var ABuffer; ACount: Integer): Integer;
+var
+  N: ssize_t;
+  tv: TTimeVal;
+begin
+  if ACount <= 0 then
+    Exit(0);
+  if FFd < 0 then
+    // no raw handle: fall back to the wrapped transport unchanged
+    Exit(FInner.Read(ABuffer, ACount));
+  tv.tv_sec := 0;
+  if FReadTimeoutMs > 0 then
+  begin
+    tv.tv_sec := FReadTimeoutMs div 1000;
+    tv.tv_usec := (FReadTimeoutMs mod 1000) * 1000;
+  end;
+  fpSetSockOpt(FFd, SOL_SOCKET, SO_RCVTIMEO, @tv, SizeOf(tv));
+  repeat
+    N := fpRecv(FFd, @ABuffer, ACount, 0);
+    if N >= 0 then
+      Exit(N);
+    if (fpGetErrno = ESysEAGAIN) or (fpGetErrno = ESysEWOULDBLOCK) then
+      raise EHttpTimeout.CreateFmt('read timed out after %d ms',
+        [FReadTimeoutMs]);
+    if fpGetErrno = ESysEINTR then
+      Continue;
+    raise EHttpConnectionClosed.CreateFmt('socket read failed (errno %d)',
+      [fpGetErrno]);
+  until False;
+end;
+
+function TSingleReadSocket.Write(const ABuffer; ACount: Integer): Integer;
+begin
+  Result := FInner.Write(ABuffer, ACount);
+end;
+
+procedure TSingleReadSocket.Close;
+begin
+  FInner.Close;
+end;
+
+function TSingleReadSocket.GetConnected: Boolean;
+begin
+  Result := FInner.Connected;
+end;
+
+function TSingleReadSocket.GetConnectTimeoutMs: Integer;
+begin
+  Result := FConnectTimeoutMs;
+end;
+
+procedure TSingleReadSocket.SetConnectTimeoutMs(const AValue: Integer);
+begin
+  FConnectTimeoutMs := AValue;
+  FInner.ConnectTimeoutMs := AValue;
+end;
+
+function TSingleReadSocket.GetReadTimeoutMs: Integer;
+begin
+  Result := FReadTimeoutMs;
+end;
+
+procedure TSingleReadSocket.SetReadTimeoutMs(const AValue: Integer);
+begin
+  FReadTimeoutMs := AValue;
+  FInner.ReadTimeoutMs := AValue;
+end;
+
+function TSingleReadSocket.GetWriteTimeoutMs: Integer;
+begin
+  Result := FWriteTimeoutMs;
+end;
+
+procedure TSingleReadSocket.SetWriteTimeoutMs(const AValue: Integer);
+begin
+  FWriteTimeoutMs := AValue;
+  FInner.WriteTimeoutMs := AValue;
+end;
+
+{ THttp1PooledConnection }
+constructor THttp1PooledConnection.Create(const AH1: THttp1Connection;
+  const AOrigin: string);
+begin
+  inherited Create;
+  FH1 := AH1;
+  FOrigin := AOrigin;
+  FLock := TCriticalSection.Create;
+  FClosing := False;
+  FLastBody := nil;
+end;
+
+destructor THttp1PooledConnection.Destroy;
+begin
+  FH1.Free;               // closes the socket
+  FLock.Free;
+  inherited Destroy;
+end;
+
+function THttp1PooledConnection.ActiveStreams: Integer;
+begin
+  // HTTP/1.1 carries one request at a time: a connection stays busy until the
+  // current response body is drained (doc/design/fallback.md "HTTP/1.1 codec")
+  if (FLastBody <> nil) and (not FLastBody.Eof) then
+    Result := cHttp1StreamLimit
+  else
+    Result := 0;
+end;
+
+function THttp1PooledConnection.Eligible: Boolean;
+begin
+  Result := (not FClosing) and (ActiveStreams = 0);
+end;
+
+function THttp1PooledConnection.Closed: Boolean;
+begin
+  Result := FClosing or (not FH1.Reusable);
+end;
+
+function THttp1PooledConnection.Acquire(const ARequest: TStreamRequest;
+  const ATimeoutMs: Integer; out AAcquired: Boolean): IHttpResponse;
+begin
+  AAcquired := False;
+  Result := nil;
+  FLock.Acquire;
+  try
+    if FClosing then
+      Exit;
+    if not Eligible then
+      Exit;                // one request in flight: the pool tries another
+    try
+      FLastBody := nil;
+      Result := FH1.Send(ARequest);
+      FLastBody := Result.Body;
+      AAcquired := True;
+    except
+      // a failed exchange leaves the HTTP/1.1 stream unusable (a half-read
+      // response would desynchronize the next one): close and let the pool
+      // drop the connection instead of reusing it
+      FClosing := True;
+      FH1.Close;
+      raise;
+    end;
+  finally
+    FLock.Release;
+  end;
+end;
+
+function THttp1PooledConnection.AcquireUpgraded(const ARequest: TStreamRequest;
+  const ATimeoutMs: Integer): IHttpResponse;
+begin
+  // an h2c upgrade only ever runs on a freshly created HTTP/2 connection; a
+  // pooled HTTP/1.1 entry can never adopt stream 1
+  raise EHttpProtocolError.Create(
+    'an HTTP/1.1 pooled connection cannot adopt an h2c upgrade stream',
+    ecProtocolError);
+end;
+
+procedure THttp1PooledConnection.Drain;
+begin
+  FLock.Acquire;
+  try
+    FClosing := True;
+    if ActiveStreams = 0 then
+      FH1.Close;
+  finally
+    FLock.Release;
+  end;
+end;
+
+procedure THttp1PooledConnection.ReleaseIfIdle;
+begin
+  FLock.Acquire;
+  try
+    if FClosing and (ActiveStreams = 0) then
+      FH1.Close;
+  finally
+    FLock.Release;
+  end;
+end;
+
+function THttp1PooledConnection.GetConn: TConnection;
+begin
+  // an HTTP/1.1 connection has no TConnection; nil marks it non-HTTP/2
+  Result := nil;
+end;
+
+function THttp1PooledConnection.GetOrigin: string;
+begin
+  Result := FOrigin;
+end;
+
+function THttp1PooledConnection.GetLock: TCriticalSection;
+begin
+  Result := FLock;
+end;
+
+function THttp1PooledConnection.GetKey: Pointer;
+begin
+  Result := Pointer(FH1);
+end;
+
 { TConnectionPool }
 
 constructor TConnectionPool.Create(const AFactory: IHttp2SocketFactory;
   const AMaxConnections, AMaxStreamsPerConnection, AConnectTimeoutMs,
   AHeaderTimeoutMs, AIdleTimeoutMs: Integer;
-  const AObserver: IHttp2Observer);
+  const AObserver: IHttp2Observer;
+  const AHttp1Fallback: Boolean; const AClearTextPolicy: TClearTextPolicy);
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
@@ -1209,8 +1870,18 @@ begin
   FConnectTimeoutMs := AConnectTimeoutMs;
   FHeaderTimeoutMs := AHeaderTimeoutMs;
   FIdleTimeoutMs := AIdleTimeoutMs;
+  FHttp1Fallback := AHttp1Fallback;
+  FClearTextPolicy := AClearTextPolicy;
   FTotalConnections := 0;
   FClosed := False;
+end;
+
+procedure TConnectionPool.Register(const AOrigin: string;
+  const AConn: IPooledConnection);
+begin
+  ListFor(AOrigin).Add(AConn);
+  Inc(FTotalConnections);
+  MarkUsed(AConn);
 end;
 
 destructor TConnectionPool.Destroy;
@@ -1239,9 +1910,9 @@ begin
     for I := L.Count - 1 downto 0 do
     begin
       C := L[I];
-      if (C.Conn.State = csClosed) and (C.ActiveStreams = 0) then
+      if C.Closed and (C.ActiveStreams = 0) then
       begin
-        FIdleSince.Remove(Pointer(C.Conn));
+        FIdleSince.Remove(C.Key);
         L.Delete(I);
         Dec(FTotalConnections);
       end;
@@ -1251,7 +1922,7 @@ end;
 
 procedure TConnectionPool.MarkUsed(const C: IPooledConnection);
 begin
-  FIdleSince.AddOrSetValue(Pointer(C.Conn), GetTickCount64);
+  FIdleSince.AddOrSetValue(C.Key, GetTickCount64);
 end;
 
 procedure TConnectionPool.ReapIdle;
@@ -1284,12 +1955,12 @@ begin
       C := L[I];
       if C.ActiveStreams > 0 then
         Continue;
-      if not FIdleSince.TryGetValue(Pointer(C.Conn), Since) then
+      if not FIdleSince.TryGetValue(C.Key, Since) then
         Continue;
       if Now - Since < QWord(FIdleTimeoutMs) then
         Continue;
       C.Drain;                       // closes now, since it is idle
-      FIdleSince.Remove(Pointer(C.Conn));
+      FIdleSince.Remove(C.Key);
       L.Delete(I);
       Dec(FTotalConnections);
     end;
@@ -1311,14 +1982,41 @@ begin
   Result := (not FClosed) and (FTotalConnections < FMaxConnections);
 end;
 
-function TConnectionPool.OpenConnection(const AOrigin, AHost: string;
-  const APort: Word): IPooledConnection;
+function TConnectionPool.DialFor(const AHost: string; const APort: Word;
+  const AScheme: string; const ATimeoutMs: Integer;
+  out AProtocol: TNegotiatedProtocol): IHttp2Socket;
 var
-  Sock: IHttp2Socket;
+  CF: ICleartextSocketFactory;
+begin
+  // the default factory (and any factory that opted into the extended
+  // contract) selects TLS vs cleartext and the ALPN codec for us
+  if Supports(FFactory, ICleartextSocketFactory, CF) then
+    Exit(CF.DialProtocol(AHost, APort, AScheme, FHttp1Fallback,
+      FClearTextPolicy, ATimeoutMs, AProtocol));
+
+  // legacy factory (the injected test seam): it only knows TLS + h2, so an
+  // https origin stays strict; a cleartext origin is dialled directly
+  if AScheme = 'http' then
+  begin
+    if FClearTextPolicy = ctUpgrade then
+      AProtocol := npHttp1Cleartext
+    else
+      AProtocol := npHttp2Cleartext;
+    Result := TTlsSocket.DialCleartext(AHost, APort, ATimeoutMs);
+  end
+  else
+  begin
+    AProtocol := npHttp2Tls;
+    Result := FFactory.Dial(AHost, APort, ATimeoutMs);
+  end;
+end;
+
+function TConnectionPool.StartHttp2(const Sock: IHttp2Socket;
+  const AOrigin: string; const AStart: Boolean): IPooledConnection;
+var
   Conn: TConnection;
   Pooled: THttpConnection;
 begin
-  Sock := FFactory.Dial(AHost, APort, FConnectTimeoutMs);
   Conn := TConnection.Create(Sock);
   if FObserver <> nil then
     Conn.Observer := FObserver;
@@ -1327,14 +2025,32 @@ begin
     Conn.PingIntervalMs := FIdleTimeoutMs;
     Conn.PingTimeoutMs := FIdleTimeoutMs;
   end;
-  Conn.Start;
-  if not Conn.WaitForState(csOpen, FConnectTimeoutMs) then
-  begin
-    Conn.Free;
-    raise EHttpConnectionError.Create('HTTP/2 connection did not open');
-  end;
   Pooled := THttpConnection.Create(Conn, AOrigin, FMaxStreamsPerConnection);
+  if AStart then
+  begin
+    Conn.Start;    // DoPreface writes the preface + the initial SETTINGS frame
+    if not Conn.WaitForState(csOpen, FConnectTimeoutMs) then
+    begin
+      Pooled.Free;
+      raise EHttpConnectionError.Create('HTTP/2 connection did not open');
+    end;
+  end;
   Result := Pooled;
+  ListFor(AOrigin).Add(Result);
+  Inc(FTotalConnections);
+  MarkUsed(Result);
+end;
+
+function TConnectionPool.WrapHttp1(const Sock: IHttp2Socket;
+  const AOrigin: string): IPooledConnection;
+var
+  H1: THttp1Connection;
+begin
+  // the HTTP/1.1 codec reads in 16 KiB fills; an exact-count transport would
+  // block on a keep-alive peer, so single-read the underlying socket here
+  H1 := THttp1Connection.Create(TSingleReadSocket.Create(Sock),
+    FHeaderTimeoutMs);
+  Result := THttp1PooledConnection.Create(H1, AOrigin);
   ListFor(AOrigin).Add(Result);
   Inc(FTotalConnections);
   MarkUsed(Result);
@@ -1365,6 +2081,115 @@ begin
   Result := Best;
 end;
 
+function TConnectionPool.TryH2cUpgrade(const Sock: IHttp2Socket;
+  const ARequest: TStreamRequest): Boolean;
+var
+  Raw: TBytes;
+  Ofs, N: Integer;
+  Line, Version, Reason: string;
+  Status, Lines: Integer;
+begin
+  // write the Upgrade request and read the response head byte by byte, so a
+  // 101 leaves the HTTP/2 frames that FOLLOW the head untouched in the
+  // socket.  The Upgrade and Connection headers cannot travel through
+  // TStreamRequest.Headers (the shared map forbids connection-specific
+  // fields), so the wire bytes are built here (doc/design/fallback.md
+  // "h2c upgrade procedure").
+  Raw := BuildH2cUpgradeRequest(ARequest);
+  Ofs := 0;
+  while Ofs < Length(Raw) do
+  begin
+    N := Sock.Write(Raw[Ofs], Length(Raw) - Ofs);
+    if N <= 0 then
+      raise EHttpConnectionClosed.Create('h2c upgrade request write failed');
+    Inc(Ofs, N);
+  end;
+  if not ReadHeadLineBytewise(Sock, Line) then
+    raise EHttpProtocolError.Create('peer closed during the h2c upgrade',
+      ecProtocolError);
+  ParseStatusLine(Line, Version, Status, Reason);
+  Result := Status = 101;
+  if not Result then
+    Exit;
+  // the 101 head continues with Upgrade/Connection fields and the mandatory
+  // empty line; consume them all before the socket becomes an HTTP/2
+  // transport, else the connection thread frames those bytes as HTTP/2
+  Lines := 0;
+  while True do
+  begin
+    if not ReadHeadLineBytewise(Sock, Line) then
+      raise EHttpProtocolError.Create('truncated 101 response head',
+        ecProtocolError);
+    if Line = '' then
+      Break;
+    Inc(Lines);
+    if Lines > 64 then
+      raise EHttpProtocolError.Create('101 response head is too large',
+        ecProtocolError);
+  end;
+end;
+
+function TConnectionPool.OpenForTxn(const AOrigin, AHost: string;
+  const APort: Word; const ARequest: TStreamRequest;
+  const AHeaderTimeoutMs: Integer; const AScheme: string;
+  out AConn: IPooledConnection; out AUpgraded: Boolean): Boolean;
+var
+  Sock: IHttp2Socket;
+  Protocol: TNegotiatedProtocol;
+begin
+  Result := False;
+  AConn := nil;
+  AUpgraded := False;
+  Sock := DialFor(AHost, APort, AScheme, FConnectTimeoutMs, Protocol);
+  try
+    case Protocol of
+      npHttp2Tls, npHttp2Cleartext:
+        // prior knowledge writes no Upgrade; TConnection.DoPreface sends the
+        // preface + SETTINGS itself
+        AConn := StartHttp2(Sock, AOrigin, True);
+      npHttp1Tls:
+        AConn := WrapHttp1(Sock, AOrigin);
+      npHttp1Cleartext:
+        begin
+          // the caller chose ctUpgrade.  A bodyless request is eligible for
+          // the upgrade; a request with a body is NOT, because that would
+          // transmit the body twice (once in the probe, once over HTTP/2).
+          if ARequest.Body.IsSet or (ARequest.BodyWriter <> nil) then
+            AConn := WrapHttp1(Sock, AOrigin)
+          else if TryH2cUpgrade(Sock, ARequest) then
+          begin
+            // 101: the peer already answered the upgrade request and will
+            // send its response on stream 1, so the socket is now an HTTP/2
+            // transport.  Do NOT start the reader yet: the caller must adopt
+            // stream 1 first, else the peer's stream-1 HEADERS could arrive
+            // before a lease owns them and be dropped on the shared queue.
+            AConn := StartHttp2(Sock, AOrigin, False);
+            AUpgraded := True;
+          end
+          else
+          begin
+            // non-101: the peer answered over HTTP/1.1 and the response head
+            // is already partly read, so this socket can no longer be handed
+            // to a fresh HTTP/1.1 codec.  Close it and speak plain HTTP/1.1 on
+            // a NEW connection (dialled through the same factory, so the
+            // codec/policy selection is unchanged), which then gets pooled
+            // (doc/design/fallback.md: "keep the HTTP/1.1 connection").
+            Sock.Close;
+            Sock := DialFor(AHost, APort, AScheme, FConnectTimeoutMs, Protocol);
+            AConn := WrapHttp1(Sock, AOrigin);
+          end;
+        end;
+    end;
+  except
+    // a failure mid-handshake leaves the socket unusable; StartHttp2/WrapHttp1
+    // only own it once they have returned
+    if AConn = nil then
+      Sock.Close;
+    raise;
+  end;
+  Result := AConn <> nil;
+end;
+
 function TConnectionPool.Acquire(const AOrigin, AHost: string;
   const APort: Word; const ARequest: TStreamRequest;
   const AHeaderTimeoutMs: Integer;
@@ -1372,7 +2197,7 @@ function TConnectionPool.Acquire(const AOrigin, AHost: string;
 var
   Deadline: QWord;
   Conn: IPooledConnection;
-  Acquired: Boolean;
+  Acquired, Upgraded: Boolean;
   Sliced: Integer;
 begin
   Deadline := GetTickCount64 + QWord(AHeaderTimeoutMs);
@@ -1380,20 +2205,39 @@ begin
   begin
     if (AToken <> nil) and AToken.IsCancelled then
       raise EHttpStreamError.Create('request cancelled', 0, ecCancel);
+    Upgraded := False;
     FLock.Acquire;
     try
       ReapClosed;
       ReapIdleLocked;
       Conn := PickEligible(AOrigin);
       if (Conn = nil) and CanOpenNew then
-        Conn := OpenConnection(AOrigin, AHost, APort);
+      begin
+        // the one transport-selection point: TLS vs cleartext and the HTTP/2
+        // vs HTTP/1.1 codec (doc/design/fallback.md "Negotiation")
+        OpenForTxn(AOrigin, AHost, APort, ARequest, AHeaderTimeoutMs,
+          ARequest.Scheme, Conn, Upgraded);
+      end;
     finally
       FLock.Release;
     end;
 
+    if Upgraded then
+    begin
+      // h2c upgrade: the 101 switch already happened inside the handshake, so
+      // adopt stream 1 and wait for its response (RFC 7540 section 3.2: the
+      // request is never re-sent).  FLock is released so a slow stream-1
+      // response never blocks other origins.
+      Result := (Conn as THttpConnection).AcquireUpgraded(ARequest,
+        AHeaderTimeoutMs);
+      Exit;
+    end;
+
     if Conn <> nil then
     begin
-      if AToken <> nil then
+      // an HTTP/1.1 pooled connection has no cancellable path (one request in
+      // flight, no RST_STREAM); Acquire either returns at once or raises
+      if (AToken <> nil) and (Conn.Conn <> nil) then
       begin
         Sliced := AHeaderTimeoutMs;
         if Sliced <= 0 then
@@ -1532,7 +2376,7 @@ begin
   FLock := TCriticalSection.Create;
   FPool := TConnectionPool.Create(AFactory, AMaxConnections,
     AMaxStreamsPerConnection, AConnectTimeoutMs, AHeaderTimeoutMs,
-    AIdleTimeoutMs, AObserver);
+    AIdleTimeoutMs, AObserver, AHttp1Fallback, AClearTextPolicy);
   FFollowRedirects := AFollowRedirects;
   FMaxRedirects := AMaxRedirects;
   FHeaderTimeoutMs := AHeaderTimeoutMs;
@@ -1643,10 +2487,9 @@ var
 begin
   ParseHttpUrl(ARequest.Url, Host, Port, Path);
   Origin := OriginOfUrl(ARequest.Url);
-  // cleartext policy (doc/design/fallback.md).  S13 task 13.1 enforces the
-  // default only; the ctPriorKnowledge/ctUpgrade transports land in 13.2/13.3.
-  // S13 task 13.1 enforces the strict default; the ctPriorKnowledge and
-  // ctUpgrade transports land in tasks 13.2 and 13.3.
+  // the cleartext guard (doc/design/fallback.md): the default ctReject raises
+  // before any socket is dialled; ctPriorKnowledge/ctUpgrade proceed and the
+  // pool's DialProtocol applies the same policy again on the wire
   if (SchemeOfUrl(ARequest.Url) = 'http') and (FClearTextPolicy = ctReject) then
     raise EHttpProtocolError.Create(
       'cleartext origin rejected (set WithClearText(ctPriorKnowledge) or ' +

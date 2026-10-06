@@ -127,6 +127,9 @@ type
     FLock: TCriticalSection;
 
     FStreams: TDictionary<LongWord, IConnectionStream>;
+    /// RFC 7540 section 3.2: an h2c upgrade request is served as stream 1 by
+    /// the peer and MUST NOT be re-sent; this guards the one-time adoption
+    FStreamOneReserved: Boolean;
     FStateEvent: PRTLEvent;
     FSocket: IHttp2Socket;
     FOutbound: IBlockingQueue<TFrame>;
@@ -216,6 +219,12 @@ type
     /// register a stream lease for connection-failure fan-out
     procedure RegisterStream(const AStreamId: LongWord;
       const AStream: IConnectionStream);
+    /// RFC 7540 section 3.2: the h2c upgrade request was already received by
+    /// the peer as stream 1, so the response arrives on stream 1 without the
+    /// client emitting any request frame.  Register AStream for stream id 1
+    /// (without sending HEADERS) and return False when stream 1 was already
+    /// adopted.
+    function AdoptStreamOne(const AStream: IConnectionStream): Boolean;
     /// remove a stream lease (idempotent); call exactly once per stream
     procedure UnregisterStream(const AStreamId: LongWord);
     /// number of in-flight stream leases (test seam)
@@ -746,6 +755,7 @@ begin
   FPendingStreamCredit := TDictionary<LongWord, LongWord>.Create;
   FPendingConnCredit := 0;
   FStreams := TDictionary<LongWord, IConnectionStream>.Create;
+  FStreamOneReserved := False;
 end;
 
 destructor TConnection.Destroy;
@@ -942,6 +952,26 @@ begin
     FLock.Release;
   end;
   EmitStreamClose(AStreamId);
+end;
+
+function TConnection.AdoptStreamOne(const AStream: IConnectionStream): Boolean;
+begin
+  FLock.Acquire;
+  try
+    if FStreamOneReserved then
+      Exit(False);
+    FStreamOneReserved := True;
+    FStreams.AddOrSetValue(1, AStream);
+    FFlowControl.OpenStream(1);
+    if FHighestStreamId < 1 then
+      FHighestStreamId := 1;
+  finally
+    FLock.Release;
+  end;
+  // mirror RegisterStream: notify outside the lock so a lease callback never
+  // re-enters FLock
+  EmitStreamOpen(1);
+  Result := True;
 end;
 
 function TConnection.StreamCount: Integer;

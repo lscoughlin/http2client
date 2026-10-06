@@ -203,6 +203,11 @@ type
 
     /// allocate the stream id, register with the connection, emit the request
     procedure Start;
+    /// RFC 7540 section 3.2 (h2c upgrade): the peer already received this
+    /// request as stream 1 during the HTTP/1.1 Upgrade, so adopt stream 1 and
+    /// wait for its response WITHOUT emitting any request frame.  The request
+    /// body (if any) was carried by the HTTP/1.1 message, never by DATA.
+    procedure AdoptUpgradedStream;
     /// emit the request HEADERS block (END_STREAM when there is no body)
     procedure SendHeaders;
     /// emit one DATA frame; AEndStream half-closes the local side
@@ -624,6 +629,29 @@ begin
     ReleaseLease;
     raise;
   end;
+end;
+
+procedure TStreamLease.AdoptUpgradedStream;
+begin
+  if FStarted then
+    raise EHttpProtocolError.Create('stream lease already started',
+      ecProtocolError);
+  FStarted := True;
+  // RFC 7540 section 3.2: "requests that contain a payload body MUST be sent
+  // in their entirety before the client can send HTTP/2 frames", and the
+  // upgrade request becomes stream 1
+  FStreamId := FAllocator.Next;
+  if FStreamId <> 1 then
+    raise EHttpProtocolError.Create('an h2c upgrade must use stream 1',
+      ecProtocolError);
+  if not FConnection.AdoptStreamOne(Self) then
+    raise EHttpProtocolError.Create('stream 1 is already in use',
+      ecProtocolError);
+  FRegistered := True;
+  // the request was already sent as the HTTP/1.1 upgrade request, so nothing
+  // more is emitted: the local side is half-closed (and the response's
+  // END_STREAM drives it to closed via MarkResponseComplete)
+  FLocalState := lsLocalHalfClosed;
 end;
 
 procedure TStreamLease.SendHeaders;
