@@ -6,7 +6,7 @@ aliases:
   - "validation"
 tags:
   - http2client
-  - plan
+  - verification
   - validation
 status: validated
 up: "[[http2client]]"
@@ -15,6 +15,8 @@ depends-on:
   - "11-observability"
 parallel-with: []
 updated: 2026-10-05
+validation-results: "bin/validation-results.md"
+harness-log: "doc/verification/harness-run-full.log"
 ---
 
 # S12 — Validation against external suites
@@ -109,7 +111,7 @@ at `cWindowUpdateBatchSize = 32768`) and is documented in
 
 ```sh
 # the whole sweep (reference verifier + our probe for every id). Needs
-# Docker/Rancher Desktop; ~30 minutes. Writes plan/validation-results.md.
+# Docker/Rancher Desktop; ~30 minutes. Writes bin/validation-results.md.
 tools/validate/harness.sh                 # or: make validate-harness
 
 # one id by hand
@@ -137,7 +139,7 @@ probe; the two are compared.
 
 Acceptance: a results table with counts and the failing id list
 (empty = green) at the pinned harness revision. The generated table lives in
-[[validation-results]] (`plan/validation-results.md`); this file records the
+`bin/validation-results.md`; this file records the
 interpretation and the justification for every non-MATCH row.
 
 Verdicts: **MATCH** = our outcome class equals the reference's; **BETTER** =
@@ -230,8 +232,8 @@ draft-09 suite.
 Command: `make validate-harness` (or `bash tools/validate/harness.sh`), run
 detached because 146 x (~3.1 s reference verifier + ~8 s probe) is ~30 min.
 Positive control `6.5/1`: **pass** (when it does not, every row is scored
-`fail invalid`). Results table: `plan/validation-results.md`; raw log:
-`plan/harness-run-full.log`.
+`fail invalid`). Results table: `bin/validation-results.md`; raw log:
+`doc/verification/harness-run-full.log`.
 
 | Verdict | Count |
 |---|---|
@@ -245,7 +247,7 @@ Positive control `6.5/1`: **pass** (when it does not, every row is scored
 
 **Scoring rule.** The expected outcome class for every id is *declared* by the
 harness's own verifier sources, extracted by `tools/validate/extract_expectations.py`
-into `plan/harness-expectations.tsv` (paren-scoped `verifier.Register(...)`
+into `doc/verification/harness-expectations.tsv` (paren-scoped `verifier.Register(...)`
 scan). The declaration, not the observed reference run, is the authority:
 the image's verifier only matches error **substrings**, so Go can log
 "Verifier passed" while reporting a different error level (e.g. `6.2/4`).

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/validate/interop.sh — plan/validation.md section A (nghttpd interop).
+# tools/validate/interop.sh — doc/verification/validation.md section A (nghttpd interop).
 #
 # Starts nghttpd (TLS + ALPN h2) on a private port with test/certs, then runs
 # the A.1..A.9 cases through the h2probe CLI (test/h2probe.pas) and prints a

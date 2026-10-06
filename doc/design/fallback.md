@@ -223,7 +223,7 @@ Story S13 adds the cleartext and fallback work. The new tasks are:
 | 13.7 | interop cases A.10-A.13 | `make validate-interop` stays green |
 
 The `http2/http2-test` legacy suite is draft-09 plaintext `h2c`. Task 13.2
-gives that suite a code path to exercise. `plan/validation.md` holds the C.6
+gives that suite a code path to exercise. `doc/verification/validation.md` holds the C.6
 skip that this note changes.
 
 ## Validation

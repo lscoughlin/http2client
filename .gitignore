@@ -1,22 +1,58 @@
-# Build artifacts
+# --- Build artifacts (FPC / Lazarus) -----------------------------------------
 *.o
 *.ppu
 *.a
 *.compiled
+*.lrs
 bin/
 lib/
-# Lazarus package build outputs (the generated registration unit is derived
-# from http2client.lpk, which is the authoritative source)
-*.compiled
-*.lrs
 backup/
+
+# Lazarus package build outputs: the generated registration unit is derived
+# from http2client.lpk, which is the authoritative source
 http2client.pas
 http2client.pas.bak
 packagefiles.xml
-.DS_Store
-# Vendored third-party: keep, but ignore build outputs within
+
+# --- Vendored third-party ----------------------------------------------------
+# Keep the checkouts, but never their build outputs. Pinned revisions are
+# recorded in doc/verification/toolchain.md.
 third_party/**/*.o
 third_party/**/*.ppu
-# Pinned upstream checkouts (revisions recorded in plan/toolchain.md)
 third_party/mORMot2/
 third_party/h2-client-test-harness/
+
+# --- Pi harness scratch state -------------------------------------------------
+.pi/
+plan/
+
+# --- Editor / OS noise -------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.lps
+*.bak
+*~
+*.orig
+*.rej
+*.swp
+*.swo
+*.tmp
+.obsidian/
+
+# --- Logs --------------------------------------------------------------------
+*.log
+# Exception: the pinned raw sweep log that doc/verification/validation.md cites
+# as [[harness-log]]. It is provenance for the validation record, so it is
+# tracked on purpose.
+!doc/verification/harness-run-full.log
+
+# --- Python tooling (tools/validate/*.py) ------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- Task runner ---------------------------------------------------------------
+# go-task checksum cache (used by the Taskfile sources/generates/status rules).
+# No trailing slash: go-task has used both a .task directory and a .task file.
+.task

@@ -44,6 +44,13 @@ design depends on it. Details in [[architecture]].
 | [[testing-observability]] | test seams, `fpcunit`, `IHttp2Observer` |
 | [[open-questions]] | single source of truth for unresolved decisions |
 
+## Verification
+
+| Note | Covers |
+| --- | --- |
+| [[validation]] | the S12 validation record: what is gate, what is oracle, the commands, and the results |
+| [[toolchain]] | locked, externally verified tool and library revisions |
+
 ## Quick start
 
 ```pascal

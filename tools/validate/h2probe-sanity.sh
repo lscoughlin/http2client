@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # tools/validate/h2probe-sanity.sh — non-vacuity / classification proof for
-# the S12 probe (plan/validation.md "sanity checks").
+# the S12 probe (doc/verification/validation.md "sanity checks").
 #
 # It proves the probe is not reporting PASS unconditionally, and that the
 # three verifier outcome classes map to distinct exit codes:

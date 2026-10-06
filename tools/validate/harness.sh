@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tools/validate/harness.sh — plan/validation.md section B
+# tools/validate/harness.sh — doc/verification/validation.md section B
 # (nomadlabsinc/h2-client-test-harness, the primary RFC gate).
 #
 # For every id from `docker run --rm h2-test-harness --list` this script:
@@ -9,8 +9,9 @@
 #      network) and running test/h2probe against it,
 # then classifies the id MATCH / BETTER / WORSE / UNKNOWN.
 #
-# It writes the full per-id table to plan/validation-results.md and prints a
-# summary. It is re-runnable and independent of the repo build state.
+# It writes the full per-id table to bin/validation-results.md (a build
+# artifact) and prints a summary. It is re-runnable and independent of the
+# repo build state.
 #
 # Verdict model (approved direction):
 #   PASS = MATCH or BETTER;  FAIL = WORSE;  UNKNOWN counted separately.
@@ -21,11 +22,12 @@
 #            timed out / stayed open (a real client bug).
 #   UNKNOWN: neither side resolves to an outcome class.
 #
-# The outcome class for every id is DECLARED in plan/harness-expectations.tsv,
-# generated from the harness verifier sources. The reference run only tells us
-# whether it demonstrated that declared outcome; where it could not (Go's
-# verifier fails, or the whole oracle was invalid) a declared outcome we DO meet
-# still counts as BETTER rather than being scored against a broken oracle.
+# The outcome class for every id is DECLARED in
+# doc/verification/harness-expectations.tsv, generated from the harness verifier
+# sources. The reference run only tells us whether it demonstrated that declared
+# outcome; where it could not (Go's verifier fails, or the whole oracle was
+# invalid) a declared outcome we DO meet still counts as BETTER rather than
+# being scored against a broken oracle.
 set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -33,7 +35,7 @@ cd "$REPO_ROOT"
 
 BUILD="$(mktemp -d /tmp/h2harness-build.XXXXXX)"
 PROBE="$BUILD/h2probe"
-OUT_MD="$REPO_ROOT/plan/validation-results.md"
+OUT_MD="$REPO_ROOT/bin/validation-results.md"
 RESULTS_TSV="$BUILD/results.tsv"
 
 FPC="${FPC:-fpc}"
@@ -59,7 +61,7 @@ fi
 
 # --- static expectation annotation (from verifier/cases/*.go source) --------
 # --- declared expectations (authority: the verifier's own sources) ----------
-# plan/harness-expectations.tsv is generated from
+# doc/verification/harness-expectations.tsv is generated from
 # third_party/h2-client-test-harness/verifier/cases/*.go by
 # tools/validate/extract_expectations.py. Each row is "<id>\t<expectation>"
 # with expectation in {success, conn-error, stream-error}.
@@ -69,12 +71,12 @@ fi
 # as ExpectConnectionError can still log "Verifier passed" while Go actually
 # reported a *stream* error (e.g. 5.1/1, 6.2/4). Scoring us against that
 # observed wording would import Go's imprecision; the declaration is the rule.
-EXPECTATIONS="$REPO_ROOT/plan/harness-expectations.tsv"
+EXPECTATIONS="$REPO_ROOT/doc/verification/harness-expectations.tsv"
 if [ ! -f "$EXPECTATIONS" ]; then
   echo "ERROR: $EXPECTATIONS missing; regenerate with:" >&2
   echo "  python3 tools/validate/extract_expectations.py \\" >&2
   echo "      third_party/h2-client-test-harness/verifier/cases \\" >&2
-  echo "      > plan/harness-expectations.tsv" >&2
+  echo "      > doc/verification/harness-expectations.tsv" >&2
   exit 1
 fi
 
@@ -104,7 +106,7 @@ compile_probe() {
 classify_ref_log() { # logfile id -> "pass|fail class"
   # The reference run tells us only whether the reference client produced the
   # declared outcome. The EXPECTED class itself comes from the declarations in
-  # plan/harness-expectations.tsv (see declared_intent), NOT from the reference
+  # doc/verification/harness-expectations.tsv (see declared_intent), NOT from the reference
   # log: the image's verifier matches error SUBSTRINGS, so its own wording can
   # disagree with the case author's expectation.
   #
@@ -245,7 +247,7 @@ echo "running ${#IDS[@]} ids (reference + probe each)..." >&2
 # reference image (or the environment) is broken and no row can be trusted.
 BASELINE_ID="${BASELINE_ID:-6.5/1}"
 BASELINE_OK=no
-mkdir -p "$BUILD"
+mkdir -p "$BUILD" "$(dirname "$OUT_MD")"
 base_log="$(run_reference "$BASELINE_ID")"
 printf '%s' "$base_log" > "$BUILD/baseline.log"
 if grep -q 'Verifier passed' "$BUILD/baseline.log"; then

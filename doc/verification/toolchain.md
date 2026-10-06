@@ -4,7 +4,7 @@ aliases:
   - "toolchain"
 tags:
   - http2client
-  - plan
+  - verification
 status: done
 up: "[[http2client]]"
 updated: 2026-10-05

@@ -1,6 +1,6 @@
 # http2client - Free Pascal HTTP/2 client
-# See plan/README.md for the implementation plan and plan/toolchain.md for
-# the locked toolchain facts.
+# See doc/verification/validation.md for the validation record and
+# doc/verification/toolchain.md for the locked toolchain facts.
 #
 #   make          build the library units
 #   make test     build + run the fpcunit suite

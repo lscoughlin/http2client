@@ -25,7 +25,7 @@ falling back to the named function's body when the registration is a bare name.
 Usage:
     python3 tools/validate/extract_expectations.py \
         third_party/h2-client-test-harness/verifier/cases \
-        > plan/harness-expectations.tsv
+        > doc/verification/harness-expectations.tsv
 """
 import re
 import sys

@@ -1,0 +1,38 @@
+http2client
+Copyright 2026 Liam Seamus Coughlin
+
+This product is licensed under the Apache License, Version 2.0.
+See the LICENSE file for the full text.
+
+Third-party components
+----------------------
+
+This product builds against, links with, or runs the components below.
+They are separate works and they keep their own licenses.
+They are not covered by the Apache License, Version 2.0.
+
+1. mORMot2 (third_party/mORMot2, synopse/mORMot2)
+   Copyright (C) Arnaud Bouchez.
+   License: a choice of MPL 1.1, GPL 2.0, or LGPL 2.1 with the FPC modified
+   LGPL linking exception.
+   This project uses the mORMot2 OpenSSL and ALPN units at build time and at
+   run time. The mORMot2 checkout is a pinned external dependency. It is not
+   part of the http2client source distribution.
+
+2. h2-client-test-harness (third_party/h2-client-test-harness,
+   nomadlabsinc/h2-client-test-harness)
+   License: the upstream repository states no license.
+   This project uses the harness only as a test tool. It runs the harness in a
+   local container image. No harness code enters the http2client library or
+   its binaries.
+
+3. OpenSSL (loaded at run time from the system or from Homebrew)
+   License: the Apache License, Version 2.0.
+   This project loads OpenSSL through mORMot2. No OpenSSL code is included.
+
+4. nghttp2 (the `nghttpd` and `nghttp` programs)
+   License: the MIT License.
+   This project uses these programs as external test tools only.
+
+Test-only files under test/certs/ are self-signed certificates that the test
+scripts generate. They carry no rights and they are not for production use.

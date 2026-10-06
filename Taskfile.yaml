@@ -1,0 +1,149 @@
+# http2client — Taskfile entry points.
+#
+# Mirrors the Makefile targets and adds the complete S12 validation ladder.
+# The scripts under tools/validate/ are the normative runner implementations;
+# this file only composes them in the right order.
+#
+#   task              list tasks
+#   task setup        bootstrap external deps (third_party clones, nghttp2, harness image)
+#   task test         build the library units + run the fpcunit suite
+#   task validate     run the FULL suite (unit + sanity + interop + harness)
+#   task validate:fast  everything except the ~30 min harness sweep
+#
+# On a fresh clone run `task setup` first (or just `task validate`, which pulls
+# in the harness image automatically). See doc/verification/toolchain.md for the pinned
+# revisions these tasks track.
+#
+# Environment overrides (same names as the Makefile): FPC, FPC_UNITS, MORMOT,
+# OPENSSL_LIBPATH, INTEROP_PORT, INTEROP_PLAIN_PORT, INTEROP_H2C_PORT,
+# INTEROP_H1_PORT, HARNESS_IDS, BASELINE_ID, PROBE_TIMEOUT_MS.
+version: '3'
+
+vars:
+  FPC:
+    sh: echo "${FPC:-fpc}"
+  FPC_UNITS:
+    sh: echo "${FPC_UNITS:-/usr/local/lib/fpc/3.2.4/units/aarch64-darwin}"
+  MORMOT: 'third_party/mORMot2/src'
+  MORMOT_REPO: 'third_party/mORMot2'
+  MORMOT_REV: '2ccea1a0e5d7be85bd3cf68e1fd70e9e603d09cc'
+  HARNESS_REPO: 'third_party/h2-client-test-harness'
+  HARNESS_REV: '0bc075cc21e5a247dfd222e005d1e7e5679d2bff'
+  HARNESS_IMAGE: 'h2-test-harness'
+  DOCKER:
+    sh: command -v docker || echo "$HOME/.rd/bin/docker"
+  OPENSSL_LIBPATH:
+    sh: echo "${OPENSSL_LIBPATH:-/opt/homebrew/opt/openssl@3/lib}"
+  FPCFLAGS: '-O2 -vw -Mdelphi -Fu./src -Fu{{.FPC_UNITS}}/fcl-fpcunit -Fu{{.MORMOT}}/core -Fu{{.MORMOT}}/lib -Fu{{.MORMOT}}/net -Fu{{.MORMOT}}/crypt'
+  BIN: bin
+
+env:
+  OPENSSL_LIBPATH: '{{.OPENSSL_LIBPATH}}'
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  setup:
+    desc: Bootstrap external dependencies (third_party clones, nghttp2, harness image)
+    cmds:
+      - task: setup:deps
+      - task: setup:tools
+      - task: setup:harness
+
+  setup:deps:
+    desc: Clone the revision-pinned third_party checkouts (mORMot2, h2-client-test-harness)
+    cmds:
+      - |
+        set -e
+        clone_pinned() { # url dir rev
+          if [ ! -d "$2/.git" ]; then
+            echo "cloning $1 -> $2"
+            git clone "$1" "$2"
+          fi
+          if [ "$(git -C "$2" rev-parse HEAD)" != "$3" ]; then
+            echo "pinning $2 at $3"
+            git -C "$2" fetch --all --tags 2>/dev/null || true
+            git -C "$2" checkout "$3"
+          else
+            echo "$2 already at $3"
+          fi
+        }
+        clone_pinned https://github.com/synopse/mORMot2.git {{.MORMOT_REPO}} {{.MORMOT_REV}}
+        clone_pinned https://github.com/nomadlabsinc/h2-client-test-harness.git {{.HARNESS_REPO}} {{.HARNESS_REV}}
+
+  setup:tools:
+    desc: Install nghttp2 (nghttpd/nghttp interop server + oracle)
+    status:
+      - 'command -v nghttpd'
+    cmds:
+      - brew install nghttp2
+
+  setup:harness:
+    desc: Build the local h2-test-harness Docker image (not published to a registry)
+    status:
+      - '{{.DOCKER}} image inspect {{.HARNESS_IMAGE}} >/dev/null 2>&1'
+    cmds:
+      - '{{.DOCKER}} build -t {{.HARNESS_IMAGE}} {{.HARNESS_REPO}}'
+
+  build:
+    desc: Compile the library units into bin/ (all 13 Http2 units)
+    cmds:
+      - mkdir -p {{.BIN}}
+      - '{{.FPC}} {{.FPCFLAGS}} -Cn -FE{{.BIN}} src/Http2.pas'
+    sources:
+      - src/*.pas
+    generates:
+      - '{{.BIN}}/Http2.ppu'
+
+  test:
+    desc: Build the library units and run the fpcunit suite
+    cmds:
+      - mkdir -p {{.BIN}}
+      - '{{.FPC}} {{.FPCFLAGS}} -Cn -FE{{.BIN}} src/Http2.pas'
+      - '{{.FPC}} {{.FPCFLAGS}} -Fu./test -FE{{.BIN}} test/Http2.RunTests.pas'
+      - '{{.BIN}}/Http2.RunTests --all --format=plain --sparse'
+
+  validate:interop:
+    desc: 'S12 gate A — nghttpd TLS+ALPN interop (A.1–A.13)'
+    cmds:
+      - bash tools/validate/interop.sh
+
+  validate:sanity:
+    desc: 'S12 non-vacuity checks — h2probe classification proof'
+    cmds:
+      - bash tools/validate/h2probe-sanity.sh
+
+  validate:harness:
+    desc: 'S12 gate B — 146-id h2-client-test-harness sweep (~30 min, Docker)'
+    deps:
+      - setup:deps
+      - setup:harness
+    cmds:
+      - bash tools/validate/harness.sh
+
+  validate:fast:
+    desc: Unit suite + sanity + interop (skips the ~30 min harness sweep)
+    cmds:
+      - task: setup:deps
+      - task: setup:tools
+      - task: test
+      - task: validate:sanity
+      - task: validate:interop
+
+  validate:
+    desc: Full validation suite — setup, unit, sanity, interop, harness
+    cmds:
+      - task: setup
+      - task: test
+      - task: validate:sanity
+      - task: validate:interop
+      - task: validate:harness
+
+  clean:
+    desc: Remove build outputs
+    cmds:
+      - rm -rf {{.BIN}} src/*.o src/*.ppu test/*.o test/*.ppu
