@@ -22,12 +22,52 @@ uses
   Http2.Errors;
 
 const
-  /// the single ALPN protocol this client offers (RFC 7540 section 3.3)
+  /// the single ALPN protocol this client offers in strict mode (RFC 7540
+  /// section 3.3)
   cHttp2AlpnProtocol = 'h2';
+  /// HTTP/1.1's ALPN name, offered only when the caller enables fallback
+  cHttp11AlpnProtocol = 'http/1.1';
+  /// the ALPN offer in strict mode (fallback off): "h2" only
+  cHttp2AlpnOffer: array[0..0] of string = (cHttp2AlpnProtocol);
+  /// the ALPN offer when HTTP/1.1 fallback is on (doc/design/fallback.md
+  /// "Negotiation", step 2)
+  cHttp2Http1AlpnOffer: array[0..1] of string =
+    (cHttp2AlpnProtocol, cHttp11AlpnProtocol);
   /// default connect/read/write deadline when none is set explicitly
   cDefaultSocketTimeoutMs = 30000;
 
 type
+  /// how the client treats a cleartext ("http") origin (doc/design/
+  /// fallback.md "Factory surface").  ctReject is the default: a cleartext
+  /// request raises instead of silently sending bytes in the clear.
+  // Declared here, not in Http2.Messages.pas: the transport layer acts on the
+  // policy, and Http2.Messages already uses this unit for IHttp2Socket, so a
+  // declaration there would be a circular unit reference.  Http2.Messages
+  // re-exports these as aliases for callers that only use that unit.
+  TClearTextPolicy = (ctReject, ctPriorKnowledge, ctUpgrade);
+
+  /// the transport selected for one origin (doc/design/fallback.md)
+  TNegotiatedProtocol = (npHttp2Tls, npHttp2Cleartext, npHttp1Tls,
+    npHttp1Cleartext);
+
+  IHttp2Socket = interface;   // forward: declared in full just below
+
+  /// implemented by a socket factory that also understands cleartext and the
+  /// HTTP/1.1 fallback.  The base IHttp2SocketFactory (declared in
+  /// Http2.Client) predates S13 and only knows "dial TLS, speak h2"; the
+  /// client checks for this extended contract with Supports() so an injected
+  /// test factory keeps working unchanged.
+  ICleartextSocketFactory = interface
+    ['{C13A0001-0000-4000-8000-000000000001}']
+    /// dial AHost:APort for AScheme and return the socket plus the protocol
+    /// the transport is committed to.  For TLS the protocol follows the ALPN
+    /// result; for cleartext it follows APolicy.
+    function DialProtocol(const AHost: string; const APort: Word;
+      const AScheme: string; const AHttp1Fallback: Boolean;
+      const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
+      out AProtocol: TNegotiatedProtocol): IHttp2Socket;
+  end;
+
   /// a blocking, connected byte stream carrying HTTP/2 frames
   // - Read returns the number of bytes read and returns 0 only at end of
   //   stream; it never assumes one transport read yields the whole request
@@ -61,6 +101,16 @@ function AlpnSelectedName(const AData: PByte; const ALen: Cardinal): string;
 // here rather than silently continue on HTTP/1.1
 procedure RequireH2Alpn(const AData: PByte; const ALen: Cardinal);
 
+/// encode the ALPN offer for the caller's fallback policy: "h2" when fallback
+// is off (the strict default), "h2" then "http/1.1" when it is on
+// (doc/design/fallback.md "Negotiation")
+function AlpnOfferFor(const AHttp1Fallback: Boolean): TBytes;
+
+/// normalise a selected ALPN name to one of "h2", "http/1.1" or "" (nothing
+// selected, or a protocol this client does not know) so the caller can choose
+// a codec (doc/design/fallback.md "Negotiation")
+function AlpnNegotiatedName(const AName: string): string;
+
 /// map the insecure toggle to the OpenSSL verify mode (NONE when insecure)
 function SslVerifyModeFor(const AInsecure: Boolean): Integer;
 
@@ -74,6 +124,24 @@ function SocketWriteFully(AFd, ACount, ATimeoutMs: Integer;
   const ABuffer): Integer;
 
 type
+  /// the production transport selector (plan S13): picks TLS or cleartext and
+  /// reports the wire protocol it committed to.  Https offers "h2", or
+  /// "h2"+"http/1.1" when fallback is on; an empty ALPN result with fallback
+  /// on means HTTP/1.1 (RFC 7301).  A cleartext origin honours the policy
+  /// (doc/design/fallback.md "Negotiation").
+  TProtocolSocketFactory = class(TInterfacedObject, ICleartextSocketFactory)
+  private
+    FCACertFile: string;
+    FInsecure: Boolean;
+  public
+    constructor Create(const ACACertFile: string = '';
+      const AInsecure: Boolean = False);
+    function DialProtocol(const AHost: string; const APort: Word;
+      const AScheme: string; const AHttp1Fallback: Boolean;
+      const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
+      out AProtocol: TNegotiatedProtocol): IHttp2Socket;
+  end;
+
   /// a plain (cleartext) TCP socket over fcl-net's TInetSocket
   TPlainSocket = class(TInterfacedObject, IHttp2Socket)
   private
@@ -114,6 +182,8 @@ type
     FSsl: PSSL;
     FHandshaked: Boolean;
     FSelectedProtocol: string;
+    FAlpnOffer: TBytes;
+    FRequireH2: Boolean;
     FConnectTimeoutMs: Integer;
     FReadTimeoutMs: Integer;
     FWriteTimeoutMs: Integer;
@@ -151,6 +221,22 @@ type
       const AInsecure: Boolean = False;
       const AConnectTimeoutMs: Integer = cDefaultSocketTimeoutMs;
       const ACACertFile: string = ''): IHttp2Socket;
+    /// dial and TLS-wrap while offering the caller's ALPN list (in wire form,
+    /// e.g. AlpnOfferFor(True)); the negotiated name is in SelectedProtocol
+    // - fallback is the caller's decision, so the strict ALPN check is skipped
+    //   here and the protocol name is reported for the caller to map
+    class function DialWithAlpn(const AHost: string; const APort: Word;
+      const AAlpnOffer: TBytes; const AInsecure: Boolean = False;
+      const AConnectTimeoutMs: Integer = cDefaultSocketTimeoutMs;
+      const ACACertFile: string = ''): IHttp2Socket;
+    /// dial a CLEARTEXT TCP socket for h2c prior knowledge
+    // (doc/design/fallback.md "h2c prior knowledge"); the caller writes the
+    // connection preface.  No TLS, no ALPN, so SelectedProtocol is not used.
+    class function DialCleartext(const AHost: string; const APort: Word;
+      const AConnectTimeoutMs: Integer = cDefaultSocketTimeoutMs): IHttp2Socket;
+    /// override the ALPN offer this socket will send in Establish; ignored by
+    /// the Dial overloads, which set it for you
+    procedure SetAlpnOffer(const AOffer: TBytes);
     property Insecure: Boolean read FInsecure;
     /// PEM bundle used to verify the peer; '' = the system trust store
     property CACertFile: string read FCACertFile;
@@ -172,9 +258,6 @@ type
   end;
 
 implementation
-
-const
-  cTlsAlpnOffer: array[0..0] of string = (cHttp2AlpnProtocol);
 
 function AlpnProtocolList(const AProtocols: array of string): TBytes;
 var
@@ -229,6 +312,22 @@ begin
     raise EHttpProtocolError.CreateFmt(
       'peer did not negotiate ALPN "%s" (selected "%s")',
       [cHttp2AlpnProtocol, Selected]);
+end;
+
+function AlpnOfferFor(const AHttp1Fallback: Boolean): TBytes;
+begin
+  if AHttp1Fallback then
+    Result := AlpnProtocolList(cHttp2Http1AlpnOffer)
+  else
+    Result := AlpnProtocolList(cHttp2AlpnOffer);
+end;
+
+function AlpnNegotiatedName(const AName: string): string;
+begin
+  if (AName = cHttp2AlpnProtocol) or (AName = cHttp11AlpnProtocol) then
+    Result := AName
+  else
+    Result := '';
 end;
 
 function SslVerifyModeFor(const AInsecure: Boolean): Integer;
@@ -418,9 +517,16 @@ begin
   FHost := AHost;
   FInsecure := AInsecure;
   FCACertFile := ACACertFile;
+  FAlpnOffer := AlpnOfferFor(False); // strict default: offer "h2" alone
+  FRequireH2 := True;
   FConnectTimeoutMs := cDefaultSocketTimeoutMs;
   FReadTimeoutMs := cDefaultSocketTimeoutMs;
   FWriteTimeoutMs := cDefaultSocketTimeoutMs;
+end;
+
+procedure TTlsSocket.SetAlpnOffer(const AOffer: TBytes);
+begin
+  FAlpnOffer := AOffer;
 end;
 
 destructor TTlsSocket.Destroy;
@@ -466,11 +572,10 @@ begin
 end;
 
 function TTlsSocket.ApplyAlpnProtos(const ACtx: PSSL_CTX): Integer;
-var
-  Wire: TBytes;
 begin
-  Wire := AlpnProtocolList(cTlsAlpnOffer);
-  Result := SSL_CTX_set_alpn_protos(ACtx, @Wire[0], Length(Wire));
+  if Length(FAlpnOffer) = 0 then
+    Exit(0);
+  Result := SSL_CTX_set_alpn_protos(ACtx, @FAlpnOffer[0], Length(FAlpnOffer));
 end;
 
 procedure TTlsSocket.ApplyVerifyMode(const ACtx: PSSL_CTX;
@@ -597,8 +702,12 @@ begin
         raise EHttpConnectionError.CreateFmt(
           'TLS handshake failed (SSL_get_error=%d)', [LastSslError(FSsl, r)]);
     Alpn := SelectedAlpnBytes(FSsl);
-    RequireH2Alpn(PByte(Alpn), Length(Alpn));
-    FSelectedProtocol := AlpnSelectedName(PByte(Alpn), Length(Alpn));
+    // strict mode still fails when the peer does not select "h2" (interop
+    // A.9); a fallback dial skips the check and reports the name instead
+    if FRequireH2 then
+      RequireH2Alpn(PByte(Alpn), Length(Alpn));
+    FSelectedProtocol := AlpnNegotiatedName(
+      AlpnSelectedName(PByte(Alpn), Length(Alpn)));
     FHandshaked := True;
   except
     DestroySslHandle;
@@ -624,6 +733,42 @@ begin
     Sock.Free;
     raise;
   end;
+  Result := Sock;
+end;
+
+class function TTlsSocket.DialWithAlpn(const AHost: string; const APort: Word;
+  const AAlpnOffer: TBytes; const AInsecure: Boolean;
+  const AConnectTimeoutMs: Integer;
+  const ACACertFile: string): IHttp2Socket;
+var
+  Transport: TPlainSocket;
+  Sock: TTlsSocket;
+begin
+  Transport := TPlainSocket.Create(AHost, APort, AConnectTimeoutMs);
+  Sock := TTlsSocket.Create(Transport, AHost, AInsecure, ACACertFile);
+  Sock.ConnectTimeoutMs := AConnectTimeoutMs;
+  Sock.ReadTimeoutMs := AConnectTimeoutMs;
+  // the caller supplies the offer and applies its own ALPN policy afterwards
+  Sock.FAlpnOffer := AAlpnOffer;
+  Sock.FRequireH2 := False;
+  try
+    Sock.Establish;
+  except
+    Sock.Free;
+    raise;
+  end;
+  Result := Sock;
+end;
+
+class function TTlsSocket.DialCleartext(const AHost: string; const APort: Word;
+  const AConnectTimeoutMs: Integer): IHttp2Socket;
+var
+  Sock: TPlainSocket;
+begin
+  Sock := TPlainSocket.Create(AHost, APort, AConnectTimeoutMs);
+  Sock.SetConnectTimeoutMs(AConnectTimeoutMs);
+  Sock.SetReadTimeoutMs(AConnectTimeoutMs);
+  Sock.SetWriteTimeoutMs(AConnectTimeoutMs);
   Result := Sock;
 end;
 
@@ -740,6 +885,72 @@ begin
   FWriteTimeoutMs := AValue;
   if FTransport <> nil then
     FTransport.WriteTimeoutMs := AValue;
+end;
+
+{ TProtocolSocketFactory }
+
+constructor TProtocolSocketFactory.Create(const ACACertFile: string;
+  const AInsecure: Boolean);
+begin
+  inherited Create;
+  FCACertFile := ACACertFile;
+  FInsecure := AInsecure;
+end;
+
+function TProtocolSocketFactory.DialProtocol(const AHost: string;
+  const APort: Word; const AScheme: string; const AHttp1Fallback: Boolean;
+  const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
+  out AProtocol: TNegotiatedProtocol): IHttp2Socket;
+var
+  Sock: IHttp2Socket;
+  Name: string;
+begin
+  AProtocol := npHttp2Tls;
+  if AScheme = 'http' then
+  begin
+    // cleartext: the policy decides (doc/design/fallback.md "http origins")
+    case APolicy of
+      ctReject:
+        raise EHttpProtocolError.Create(
+          'cleartext origin rejected (set WithClearText to enable it)',
+          ecProtocolError);
+      ctUpgrade:
+        // task 13.3 layers the HTTP/1.1 Upgrade dance on the cleartext socket;
+        // until then the caller drives HTTP/1.1 directly on this transport
+        begin
+          AProtocol := npHttp1Cleartext;
+          Result := TTlsSocket.DialCleartext(AHost, APort, ATimeoutMs);
+        end;
+    else
+      // ctPriorKnowledge: speak HTTP/2 at once, the caller writes the preface
+      begin
+        AProtocol := npHttp2Cleartext;
+        Result := TTlsSocket.DialCleartext(AHost, APort, ATimeoutMs);
+      end;
+    end;
+    Exit;
+  end;
+
+  // https: the ALPN offer follows the fallback flag, then the result maps to a
+  // codec.  DialWithAlpn skips the strict check so we can map the name here.
+  Sock := TTlsSocket.DialWithAlpn(AHost, APort, AlpnOfferFor(AHttp1Fallback),
+    FInsecure, ATimeoutMs, FCACertFile);
+  Name := TTlsSocket(Sock).SelectedProtocol;
+  if Name = cHttp11AlpnProtocol then
+    AProtocol := npHttp1Tls
+  else if Name = cHttp2AlpnProtocol then
+    AProtocol := npHttp2Tls
+  else if AHttp1Fallback then
+    // RFC 7301: no ALPN result means the peer speaks HTTP/1.1
+    AProtocol := npHttp1Tls
+  else
+  begin
+    Sock.Close;
+    raise EHttpProtocolError.CreateFmt(
+      'peer did not negotiate ALPN "%s" (selected "%s")',
+      [cHttp2AlpnProtocol, Name]);
+  end;
+  Result := Sock;
 end;
 
 end.

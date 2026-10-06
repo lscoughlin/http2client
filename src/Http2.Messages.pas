@@ -37,34 +37,17 @@ type
     function Read(const AResponse: IHttpResponse): T;
   end;
 
-  /// how the client treats a cleartext ("http") origin (doc/design/
-  /// fallback.md "Factory surface").  ctReject is the default: a cleartext
-  /// request raises instead of silently sending bytes in the clear.  Defined
-  /// here (not in Http2.Client) so the transport layer can act on it without
-  /// depending on the client unit.
-  TClearTextPolicy = (ctReject, ctPriorKnowledge, ctUpgrade);
-
-  /// the transport selected for one origin (doc/design/fallback.md).  The
-  /// client asks a socket factory for this first; the factory reports which
-  /// wire protocol it can deliver for the scheme and the caller's policy.
-  TNegotiatedProtocol = (npHttp2Tls, npHttp2Cleartext, npHttp1Tls,
-    npHttp1Cleartext);
-
-  /// implemented by a socket factory that also understands cleartext and the
-  /// HTTP/1.1 fallback.  The base IHttp2SocketFactory (declared in
-  /// Http2.Client) predates S13 and only knows "dial TLS, speak h2"; the
-  /// client checks for this extended contract with Supports() so an injected
-  /// test factory keeps working unchanged.
-  ICleartextSocketFactory = interface
-    ['{C13A0001-0000-4000-8000-000000000001}']
-    /// dial AHost:APort for AScheme and return the socket plus the protocol
-    /// the transport is committed to.  For TLS the protocol follows the ALPN
-    /// result; for cleartext it follows APolicy and the peer's upgrade reply.
-    function DialProtocol(const AHost: string; const APort: Word;
-      const AScheme: string; const AHttp1Fallback: Boolean;
-      const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
-      out AProtocol: TNegotiatedProtocol): IHttp2Socket;
-  end;
+  // TClearTextPolicy, TNegotiatedProtocol and ICleartextSocketFactory are
+  // declared in Http2.Tls.pas (they belong with the transport that acts on
+  // them; placing them here would make Http2.Tls need this unit while this
+  // unit needs Http2.Tls for IHttp2Socket -- a circular reference).  They are
+  // re-exported as aliases so callers that already use Http2.Messages keep
+  // compiling.  Note the enum LITERALS (ctReject, npHttp2Tls, ...) are only
+  // visible to a unit that also names Http2.Tls in its uses clause; both
+  // existing consumers already do.
+  TClearTextPolicy = Http2.Tls.TClearTextPolicy;
+  TNegotiatedProtocol = Http2.Tls.TNegotiatedProtocol;
+  ICleartextSocketFactory = Http2.Tls.ICleartextSocketFactory;
 
 implementation
 
