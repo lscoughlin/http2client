@@ -18,7 +18,7 @@ interface
 uses
   SysUtils, Classes, SyncObjs, Generics.Collections, fpcunit, testregistry,
   Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack,
-  Http2.Tls, Http2.Connection, Http2.Stream, Http2.Client, Http2.Observer;
+  Http2.Tls, Http2.Connection, Http2.Stream, Http2.Messages, Http2.Client, Http2.Observer;
 
 type
   /// a scripted in-memory HTTP/2 server: parses every frame the client writes

@@ -21,7 +21,7 @@ interface
 uses
   SysUtils, Classes, SyncObjs, Generics.Collections, fpcunit, testregistry,
   Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack,
-  Http2.Tls, Http2.Connection, Http2.Stream, Http2.Client;
+  Http2.Tls, Http2.Connection, Http2.Stream, Http2.Messages, Http2.Client;
 
 type
   /// one scripted server response
@@ -90,6 +90,11 @@ type
     function RequestAt(const AIndex: Integer): TReqRecord;
     function WrittenFrames: TArray<TFrame>;
     function WaitForRequests(const ACount, ATimeoutMs: Integer): Boolean;
+    /// bounded wait until a written frame of AType appears.  A posted frame is
+    /// flushed by the connection thread asynchronously, so a caller that
+    /// observes a request failing (e.g. a cancel) may still race the wire.
+    function WaitForWrittenFrame(const AType: TFrameType;
+      const ATimeoutMs: Integer): Boolean;
     // IHttp2Socket
     function Read(var ABuffer; ACount: Integer): Integer;
     function Write(const ABuffer; ACount: Integer): Integer;
@@ -481,6 +486,25 @@ begin
     Sleep(2);
   end;
   Result := True;
+end;
+
+function TFakeFrameSocket.WaitForWrittenFrame(const AType: TFrameType;
+  const ATimeoutMs: Integer): Boolean;
+var
+  Deadline: QWord;
+  Frames: TArray<TFrame>;
+  I: Integer;
+begin
+  Deadline := GetTickCount64 + QWord(ATimeoutMs);
+  repeat
+    Frames := WrittenFrames;
+    for I := 0 to High(Frames) do
+      if Frames[I].Header.FrameType = AType then
+        Exit(True);
+    if GetTickCount64 >= Deadline then
+      Exit(False);
+    Sleep(2);
+  until False;
 end;
 
 function TFakeFrameSocket.Read(var ABuffer; ACount: Integer): Integer;

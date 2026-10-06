@@ -18,7 +18,7 @@ program h2probe;
 
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
-  SysUtils, Classes, TypInfo, Http2.Errors, Http2.Client, Http2.Stream,
+  SysUtils, Classes, TypInfo, Http2.Errors, Http2.Messages, Http2.Client, Http2.Stream,
   Http2.ProbeOutcome, Http2.Frames, Http2.Observer;
 
 const

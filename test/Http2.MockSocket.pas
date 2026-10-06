@@ -34,7 +34,7 @@ interface
 uses
   SysUtils, Classes, SyncObjs, Generics.Collections, fpcunit, testregistry,
   Http2.Errors, Http2.Frames, Http2.Hpack, Http2.Tls, Http2.Observer,
-  Http2.Connection, Http2.Stream, Http2.Client;
+  Http2.Connection, Http2.Stream, Http2.Messages, Http2.Client;
 
 type
   /// how the mock answers a Read when no canned bytes are available:

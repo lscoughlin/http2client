@@ -9,7 +9,7 @@ program testclient;
 
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
-  SysUtils, Http2.Errors, Http2.Client, Http2.Stream;
+  SysUtils, Http2.Errors, Http2.Messages, Http2.Client, Http2.Stream;
 
 function ArgValue(const AIndex: Integer; const ADefault: string): string;
 begin

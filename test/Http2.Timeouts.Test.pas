@@ -19,7 +19,7 @@ interface
 uses
   SysUtils, Classes, SyncObjs, fpcunit, testregistry,
   Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack,
-  Http2.Tls, Http2.Connection, Http2.Stream, Http2.Client,
+  Http2.Tls, Http2.Connection, Http2.Stream, Http2.Messages, Http2.Client,
   Http2.Redirects.Test;
 
 type
@@ -241,8 +241,10 @@ begin
       Pos('EHttpStreamError', Worker.Error) > 0);
     AssertEquals('cancel error code is CANCEL', Ord(ecCancel),
       Ord(Worker.ErrorCode));
+    // cancel returns after the reset is *queued*; wait for the connection
+    // thread to flush it, otherwise this races the wire (flaky at 1/6)
     AssertTrue('the stream was reset with RST_STREAM',
-      HasRstStream(Sock.WrittenFrames));
+      Sock.WaitForWrittenFrame(ftRstStream, 2000));
   finally
     Worker.Free;
   end;

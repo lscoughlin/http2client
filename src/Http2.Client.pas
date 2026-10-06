@@ -21,7 +21,7 @@ interface
 uses
   SysUtils, Classes, SyncObjs, Generics.Collections, TypInfo,
   Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack,
-  Http2.Tls, Http2.Connection, Http2.Stream, Http2.Observer;
+  Http2.Tls, Http2.Connection, Http2.Stream, Http2.Observer, Http2.Messages;
 
 const
   /// documented factory defaults (doc/design/client-api.md "HttpClientFactory")
@@ -40,7 +40,6 @@ const
   cCancelPollSliceMs              = 20;
 
 type
-  THttpConnection = class;
   THttpResponse = class;
 
   /// dials the transport for one origin. Injected so pool tests need no real
@@ -82,22 +81,10 @@ type
       const ATimeoutMs: Integer): IHttp2Socket;
   end;
 
-  /// an HTTP/2 response (doc/design/messages.md IHttpResponse). Pseudo-headers
+  /// an HTTP/2 response. Pseudo-headers
   /// are surfaced through StatusCode, not through Headers.
-  IHttpResponse = interface
-    ['{8B1C2D3E-4F50-4A61-9C72-0123456789AB}']
-    function GetStatusCode: LongInt;
-    function GetHeaders: IHttpHeaders;
-    function GetBody: IHttpBodyStream;
-    property StatusCode: LongInt read GetStatusCode;
-    property Headers: IHttpHeaders read GetHeaders;
-    property Body: IHttpBodyStream read GetBody;
-  end;
-
-  /// bridges a response body into a value of T (doc/design/messages.md)
-  IResponseReader<T> = interface
-    function Read(const AResponse: IHttpResponse): T;
-  end;
+  // IHttpResponse moved to Http2.Messages.pas so a second codec (the HTTP/1.1
+  // fallback) can implement it without depending on this unit (plan S13).
 
   /// a request built by the public fluent API (doc/design/messages.md
   /// "HttpRequest"). Pseudo-header mapping happens in ToStreamRequest.
