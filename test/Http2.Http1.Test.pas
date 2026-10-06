@@ -80,6 +80,9 @@ type
     procedure TestBadStatusLineRaises;
     procedure TestBadChunkSizeRaises;
     procedure TestHeaderBlockLimitRaises;
+    procedure TestBeginResponseReadsOnlyTheStatusLine;
+    procedure TestDetachRefusesBufferedBytes;
+    procedure TestDetachTransfersSocketOwnership;
   end;
 
 implementation
@@ -654,6 +657,75 @@ begin
   finally
     Conn.Free;
   end;
+end;
+
+procedure THttp1Test.TestBeginResponseReadsOnlyTheStatusLine;
+var
+  Sock: TSocketScript;
+  Conn: THttp1Connection;
+  Resp: IHttpResponse;
+begin
+  // an h2c upgrade: after "101" the bytes that follow are HTTP/2 frames that
+  // must stay in the socket.  BeginResponse must not read past the status
+  // line, so idle 101 followed by a SETTINGS frame keeps PendingBytes at 0.
+  Sock := TSocketScript.Create;
+  Sock.Feed('HTTP/1.1 101 Switching Protocols'#13#10);
+  Sock.Feed('X: y'#13#10#13#10);
+  Conn := THttp1Connection.Create(Sock);
+  try
+    AssertTrue('status line read', Conn.BeginResponse(NewGetRequest('/')));
+    AssertEquals('status', 101, Conn.StatusCode);
+    AssertEquals('no read-ahead past the status line', 0, Conn.PendingBytes);
+    Resp := Conn.FinishResponse;
+    AssertEquals('finish keeps status', 101, Resp.StatusCode);
+    AssertEquals('finish parsed the field', 'y',
+      Resp.Headers.GetFirst('x'));
+  finally
+    Conn.Free;
+  end;
+end;
+
+procedure THttp1Test.TestDetachRefusesBufferedBytes;
+var
+  Sock: TSocketScript;
+  Conn: THttp1Connection;
+  Raised: Boolean;
+begin
+  // a normal Send reads the head with read-ahead, so a buffered byte can be
+  // left over.  Detach must refuse rather than silently discard it.
+  Sock := TSocketScript.Create;
+  Sock.Feed('HTTP/1.1 200 OK'#13#10'Content-Length: 5'#13#10#13#10'hello');
+  Conn := THttp1Connection.Create(Sock);
+  try
+    Conn.Send(NewGetRequest('/x'));
+    Raised := False;
+    try
+      Conn.Detach;
+    except
+      on E: EHttpError do
+        Raised := True;
+    end;
+    AssertTrue('detach with buffered bytes raises', Raised);
+  finally
+    Conn.Free;
+  end;
+end;
+
+procedure THttp1Test.TestDetachTransfersSocketOwnership;
+var
+  Sock: TSocketScript;
+  Conn: THttp1Connection;
+  Detached: IHttp2Socket;
+begin
+  // after a status-only BeginResponse, Detach must hand the socket back and
+  // must NOT close it when the connection is freed
+  Sock := TSocketScript.Create;
+  Sock.Feed('HTTP/1.1 101 Switching Protocols'#13#10#13#10);
+  Conn := THttp1Connection.Create(Sock);
+  Conn.BeginResponse(NewGetRequest('/'));
+  Detached := Conn.Detach;
+  Conn.Free;                       // must not close the detached socket
+  AssertTrue('socket survives Detach', Detached.GetConnected);
 end;
 
 initialization

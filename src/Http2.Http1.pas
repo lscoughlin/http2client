@@ -62,6 +62,10 @@ type
     /// read one CRLF- or LF-terminated line, stripping the terminator.  False
     /// only when the stream ends before any byte of the line arrives.
     function ReadLine(out ALine: string): Boolean;
+    /// read one CRLF- or LF-terminated line WITHOUT reading past it.  Used at
+    /// the HTTP/1.1 -> HTTP/2 upgrade boundary, where a buffered read would
+    /// swallow the first HTTP/2 bytes that follow the status line.
+    function ReadLineNoReadAhead(out ALine: string): Boolean;
     /// true when no buffered byte remains (may still pull more later)
     function Buffered: Integer;
   end;
@@ -129,7 +133,17 @@ type
     FLastBody: IHttpBodyStream;
     FLastTrailers: IHttpHeaders;
     FRequestCount: Integer;
+    // response head, split so an h2c upgrade can inspect the status line
+    // before the socket switches protocol
+    FBeginDone: Boolean;
+    FStatusCode: LongInt;
+    FReason: string;
+    FVersion: string;
+    FFields: TArray<THttp1HeaderField>;
+    FHeaders: IHttpHeaders;
+    FSendRequest: TStreamRequest;
     procedure WriteAll(const ABytes: TBytes);
+    function GetReaderBuffered: Integer;
   public
     constructor Create(const ASocket: IHttp2Socket;
       const ATimeoutMs: Integer = cDefaultSocketTimeoutMs);
@@ -137,6 +151,22 @@ type
     /// send ARequest and parse one response.  Raises EHttpProtocolError when
     /// the previous response body was not drained first.
     function Send(const ARequest: TStreamRequest): IHttpResponse;
+    /// write ARequest, then read ONLY the response status line, byte by byte,
+    /// without reading past it.  After True the socket sits exactly at the
+    /// start of the header fields; inspect StatusCode to decide whether the
+    /// peer accepted an Upgrade.  Used by the h2c upgrade path.
+    function BeginResponse(const ARequest: TStreamRequest): Boolean;
+    /// parse the header fields and body framing that follow the status line
+    /// already read by BeginResponse, and return the response
+    function FinishResponse: IHttpResponse;
+    /// hand the raw socket back to the caller without closing it, so it can
+    /// be reused for another protocol.  PendingBytes must be 0 first.
+    function Detach: IHttp2Socket;
+    /// the status line read by BeginResponse
+    property StatusCode: LongInt read FStatusCode;
+    property Reason: string read FReason;
+    /// bytes already buffered from the socket (>0 only after a read-ahead)
+    property PendingBytes: Integer read GetReaderBuffered;
     /// true when the last response permits reusing this socket (HTTP/1.1
     /// default keep-alive and no "Connection: close"; read-to-close framing
     /// always forbids reuse)
@@ -314,6 +344,53 @@ begin
       Break;
     Inc(Result, N);
   end;
+end;
+
+function TBufferedReader.ReadLineNoReadAhead(out ALine: string): Boolean;
+var
+  One: array[0..0] of Byte;
+  Bytes: TBytes;
+  N: Integer;
+begin
+  // This variant never reads past the terminating LF: it pulls one byte at a
+  // time straight from the socket.  It is used at the h2c upgrade boundary,
+  // where the bytes after the status line are HTTP/2 frames that must stay
+  // in the socket for the HTTP/2 connection to read.
+  ALine := '';
+  SetLength(Bytes, 0);
+  while True do
+  begin
+    if FPos < FEnd then
+    begin
+      SetLength(Bytes, Length(Bytes) + 1);
+      Bytes[High(Bytes)] := FBuf[FPos];
+      Inc(FPos);
+    end
+    else
+    begin
+      N := FSocket.Read(One[0], 1);
+      if N <= 0 then
+        Break;
+      SetLength(Bytes, Length(Bytes) + 1);
+      Bytes[High(Bytes)] := One[0];
+    end;
+    if Bytes[High(Bytes)] = 10 then
+      Break;
+    if Length(Bytes) > cHttp1MaxHeaderBytes then
+      raise EHttpProtocolError.Create(
+        'HTTP/1.1 header line exceeds the ' +
+        IntToStr(cHttp1MaxHeaderBytes) + '-byte limit', ecProtocolError);
+  end;
+  if Length(Bytes) = 0 then
+    Exit(False);
+  if Bytes[High(Bytes)] = 10 then
+    SetLength(Bytes, Length(Bytes) - 1);
+  if (Length(Bytes) > 0) and (Bytes[High(Bytes)] = 13) then
+    SetLength(Bytes, Length(Bytes) - 1);
+  SetLength(ALine, Length(Bytes));
+  if Length(Bytes) > 0 then
+    Move(Bytes[0], ALine[1], Length(Bytes));
+  Result := True;
 end;
 
 function TBufferedReader.ReadLine(out ALine: string): Boolean;
@@ -855,21 +932,9 @@ begin
   end;
 end;
 
-function THttp1Connection.Send(const ARequest: TStreamRequest): IHttpResponse;
+function THttp1Connection.BeginResponse(const ARequest: TStreamRequest): Boolean;
 var
-  Head: TArray<string>;
   Line: string;
-  Total, I: Integer;
-  Version, Reason: string;
-  StatusCode: Integer;
-  Fields: TArray<THttp1HeaderField>;
-  Headers: IHttpHeaders;
-  Framing: TBodyFraming;
-  ContentLength: Int64;
-  CL, TE, Connection: string;
-  Bodyless: Boolean;
-  Body: THttp1BodyStream;
-  Trailers: IHttpHeaders;
 begin
   // one request in flight at a time: the previous body must be drained
   if (FLastBody <> nil) and (not FLastBody.Eof) then
@@ -882,8 +947,38 @@ begin
 
   WriteAll(BuildHttp1Request(ARequest));
   Inc(FRequestCount);
+  FSendRequest := ARequest;
+  FBeginDone := False;
 
-  // read the response head: status line + header fields, bounded
+  // Read ONLY the status line, with no read-ahead: an h2c upgrade must leave
+  // the bytes after the 101 in the socket for the HTTP/2 connection.
+  if not FReader.ReadLineNoReadAhead(Line) then
+    Exit(False);
+  ParseStatusLine(Line, FVersion, FStatusCode, FReason);
+  FBeginDone := True;
+  Result := True;
+end;
+
+function THttp1Connection.FinishResponse: IHttpResponse;
+var
+  Head: TArray<string>;
+  Line: string;
+  Total, I: Integer;
+  Fields: TArray<THttp1HeaderField>;
+  Headers: IHttpHeaders;
+  Framing: TBodyFraming;
+  ContentLength: Int64;
+  CL, TE, Connection: string;
+  Bodyless: Boolean;
+  Body: THttp1BodyStream;
+  Trailers: IHttpHeaders;
+begin
+  if not FBeginDone then
+    raise EHttpProtocolError.Create(
+      'FinishResponse called before BeginResponse', ecInternalError);
+  FBeginDone := False;   // consume: one status line per response
+
+  // read the remaining header field lines, bounded
   Total := 0;
   SetLength(Head, 0);
   while True do
@@ -901,24 +996,18 @@ begin
     SetLength(Head, Length(Head) + 1);
     Head[High(Head)] := Line;
   end;
-  if Length(Head) = 0 then
-    raise EHttpProtocolError.Create('empty HTTP/1.1 response head',
-      ecProtocolError);
 
-  ParseStatusLine(Head[0], Version, StatusCode, Reason);
-  // drop the status line in place; the rest are header field lines
-  for I := 1 to High(Head) do
-    Head[I - 1] := Head[I];
-  SetLength(Head, Length(Head) - 1);
   SetLength(Fields, 0);
   if Length(Head) > 0 then
     Fields := ParseHeaders(Head);
+  FFields := Fields;
   Headers := FieldsToHttpHeaders(Fields);
+  FHeaders := Headers;
 
   // bodyless responses: HEAD, 204 and 304 never carry a body even when a
   // content-length is present (RFC 9110 section 6.4.1)
-  Bodyless := SameText(ARequest.Method, 'HEAD') or (StatusCode = 204) or
-    (StatusCode = 304);
+  Bodyless := SameText(FSendRequest.Method, 'HEAD') or (FStatusCode = 204) or
+    (FStatusCode = 304);
 
   CL := HeaderFieldValue(Fields, HeaderContentLength);
   TE := HeaderFieldValue(Fields, 'transfer-encoding');
@@ -947,10 +1036,34 @@ begin
   // framing always forbids reuse (the body ends only at EOF)
   FReusable := (Pos('close', LowerCase(Connection)) = 0) and
     (Framing <> bfUntilClose) and
-    ((Version = 'HTTP/1.1') or
+    ((FVersion = 'HTTP/1.1') or
      (Pos('keep-alive', LowerCase(Connection)) > 0));
 
-  Result := THttp1Response.Create(Version, StatusCode, Reason, Headers, Body);
+  Result := THttp1Response.Create(FVersion, FStatusCode, FReason, Headers,
+    Body);
+end;
+
+function THttp1Connection.Send(const ARequest: TStreamRequest): IHttpResponse;
+begin
+  if not BeginResponse(ARequest) then
+    raise EHttpProtocolError.Create('unexpected EOF in response head',
+      ecStreamClosed);
+  Result := FinishResponse;
+end;
+
+function THttp1Connection.GetReaderBuffered: Integer;
+begin
+  Result := FReader.Buffered;
+end;
+
+function THttp1Connection.Detach: IHttp2Socket;
+begin
+  if FReader.Buffered <> 0 then
+    raise EHttpProtocolError.Create(
+      'cannot detach: bytes were read past the status line', ecInternalError);
+  Result := FSocket;
+  FSocket := nil;        // ownership transfers; Close must not touch it
+  FReusable := False;
 end;
 
 function THttp1Connection.Reusable: Boolean;
