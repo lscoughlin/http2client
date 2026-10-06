@@ -38,8 +38,15 @@ const
   cMaxTransparentRetries          = 2;
   /// a cancellable wait polls its token in slices of this many milliseconds
   cCancelPollSliceMs              = 20;
+  /// default for the HTTP/1.1 ALPN fallback (doc/design/fallback.md)
+  cDefaultHttp1Fallback           = False;
 
 type
+  /// how the client treats a cleartext ("http") origin (doc/design/
+  /// fallback.md "Factory surface").  ctReject is the default: a cleartext
+  /// request raises instead of silently sending bytes in the clear.
+  TClearTextPolicy = (ctReject, ctPriorKnowledge, ctUpgrade);
+
   THttpResponse = class;
 
   /// dials the transport for one origin. Injected so pool tests need no real
@@ -163,6 +170,8 @@ type
     FCACertFile: string;
     FInsecure: Boolean;
     FObserver: IHttp2Observer;
+    FHttp1Fallback: Boolean;
+    FClearTextPolicy: TClearTextPolicy;
   public
     class function Create: THttpClientFactory; static;
     function WithMaxConnections(const AMax: Integer): THttpClientFactory;
@@ -183,6 +192,14 @@ type
     /// harnesses whose cert has no SAN (e.g. the h2 conformance harness,
     /// which self-signs with CN=localhost only).
     function WithInsecureTls(const AInsecure: Boolean = True): THttpClientFactory;
+    /// offer "http/1.1" as an ALPN alternative and accept an HTTP/1.1
+    /// response when the peer does not select "h2" (doc/design/fallback.md).
+    /// Off by default: strict mode keeps failing loudly (interop A.9).
+    function WithHttp1Fallback(const AEnable: Boolean = True): THttpClientFactory;
+    /// select the cleartext policy for "http" origins.  The default ctReject
+    /// raises EHttpProtocolError; ctPriorKnowledge speaks HTTP/2 at once;
+    /// ctUpgrade tries the HTTP/1.1 Upgrade dance first (doc/design/fallback.md).
+    function WithClearText(const APolicy: TClearTextPolicy): THttpClientFactory;
     /// observability seam: every connection opened by Build reports its
     /// connection/stream/frame events to AObserver (doc/design/
     /// testing-observability.md). Nil disables observation.
@@ -201,6 +218,8 @@ type
     property CACertFile: string read FCACertFile;
     property InsecureTls: Boolean read FInsecure;
     property Observer: IHttp2Observer read FObserver;
+    property Http1Fallback: Boolean read FHttp1Fallback;
+    property ClearTextPolicy: TClearTextPolicy read FClearTextPolicy;
   end;
 
   /// one pooled connection, exposed as an interface so an outstanding response
@@ -357,13 +376,17 @@ type
     FMaxRedirects: Integer;
     FClosed: Boolean;
     FLock: TCriticalSection;
+    FHttp1Fallback: Boolean;
+    FClearTextPolicy: TClearTextPolicy;
     function SendOnce(const ARequest: THttpRequest): IHttpResponse;
   public
     constructor Create(const AFactory: IHttp2SocketFactory;
       const AMaxConnections, AMaxStreamsPerConnection: Integer;
       const AFollowRedirects: Boolean; const AMaxRedirects,
       AConnectTimeoutMs, AHeaderTimeoutMs, AIdleTimeoutMs: Integer;
-      const AObserver: IHttp2Observer = nil);
+      const AObserver: IHttp2Observer = nil;
+      const AHttp1Fallback: Boolean = False;
+      const AClearTextPolicy: TClearTextPolicy = ctReject);
     destructor Destroy; override;
     function Send(const ARequest: THttpRequest): IHttpResponse;
     procedure Close;
@@ -829,6 +852,8 @@ begin
   Result.FCACertFile := '';
   Result.FInsecure := False;
   Result.FObserver := nil;
+  Result.FHttp1Fallback := cDefaultHttp1Fallback;
+  Result.FClearTextPolicy := ctReject;   // strict by default
   Result.FSocketFactory := TDefaultSocketFactory.Create;
 end;
 
@@ -924,11 +949,26 @@ begin
   Result.FObserver := AObserver;
 end;
 
+function THttpClientFactory.WithHttp1Fallback(
+  const AEnable: Boolean): THttpClientFactory;
+begin
+  Result := Self;
+  Result.FHttp1Fallback := AEnable;
+end;
+
+function THttpClientFactory.WithClearText(
+  const APolicy: TClearTextPolicy): THttpClientFactory;
+begin
+  Result := Self;
+  Result.FClearTextPolicy := APolicy;
+end;
+
 function THttpClientFactory.Build: IHttpClient;
 begin
   Result := THttpClient.Create(FSocketFactory, FMaxConnections,
     FMaxStreamsPerConnection, FFollowRedirects, FMaxRedirects,
-    FConnectTimeoutMs, FHeaderTimeoutMs, FIdleTimeoutMs, FObserver);
+    FConnectTimeoutMs, FHeaderTimeoutMs, FIdleTimeoutMs, FObserver,
+    FHttp1Fallback, FClearTextPolicy);
 end;
 
 { TGuardedBody }
@@ -1488,7 +1528,8 @@ constructor THttpClient.Create(const AFactory: IHttp2SocketFactory;
   const AMaxConnections, AMaxStreamsPerConnection: Integer;
   const AFollowRedirects: Boolean; const AMaxRedirects, AConnectTimeoutMs,
   AHeaderTimeoutMs, AIdleTimeoutMs: Integer;
-  const AObserver: IHttp2Observer);
+  const AObserver: IHttp2Observer;
+  const AHttp1Fallback: Boolean; const AClearTextPolicy: TClearTextPolicy);
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
@@ -1499,6 +1540,8 @@ begin
   FMaxRedirects := AMaxRedirects;
   FHeaderTimeoutMs := AHeaderTimeoutMs;
   FClosed := False;
+  FHttp1Fallback := AHttp1Fallback;
+  FClearTextPolicy := AClearTextPolicy;
 end;
 
 destructor THttpClient.Destroy;
@@ -1603,6 +1646,14 @@ var
 begin
   ParseHttpUrl(ARequest.Url, Host, Port, Path);
   Origin := OriginOfUrl(ARequest.Url);
+  // cleartext policy (doc/design/fallback.md).  S13 task 13.1 enforces the
+  // default only; the ctPriorKnowledge/ctUpgrade transports land in 13.2/13.3.
+  // S13 task 13.1 enforces the strict default; the ctPriorKnowledge and
+  // ctUpgrade transports land in tasks 13.2 and 13.3.
+  if (SchemeOfUrl(ARequest.Url) = 'http') and (FClearTextPolicy = ctReject) then
+    raise EHttpProtocolError.Create(
+      'cleartext origin rejected (set WithClearText(ctPriorKnowledge) or ' +
+      'WithClearText(ctUpgrade) to enable it)', ecProtocolError);
   R := ARequest.ToStreamRequest;
   Timeout := FHeaderTimeoutMs;
   if ARequest.HeaderTimeoutMs > 0 then
