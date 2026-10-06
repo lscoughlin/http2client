@@ -13,8 +13,9 @@ related:
   - "[[messages]]"
   - "[[protocol]]"
   - "[[transport]]"
+  - "[[fallback]]"
   - "[[errors-redirects]]"
-updated: 2026-10-05
+updated: 2026-10-06
 ---
 
 # Open Questions
@@ -29,7 +30,8 @@ rather than restating an item.
    `:authority`/`:scheme` become behind a proxy? — see [[client-api]] and
    [[transport]].
 3. HTTP/1.1 fallback: fail on non-`h2` ALPN, or implement a fallback
-   codec? — see [[transport]].
+   codec? — **resolved 2026-10-06:** implement the fallback, off by default;
+   `WithHttp1Fallback` turns it on. See [[fallback]].
 4. Transparent retry: idempotent-only, or opt-in per request? — see
    [[transport]].
 5. `ftPriority` support: send it, or ignore received priority? — see

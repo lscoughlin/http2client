@@ -12,6 +12,7 @@ related:
   - "[[protocol]]"
   - "[[architecture]]"
   - "[[fpc-runtime]]"
+  - "[[fallback]]"
   - "[[open-questions]]"
 updated: 2026-10-05
 ---
@@ -140,11 +141,13 @@ failure only for idempotent methods, or explicit opt-in. See
 
 ## TLS and ALPN
 
-- TLS is required; `https://` only. Cleartext `h2c` (prior knowledge or
-  upgrade) is out of scope.
-- ALPN must offer `h2`. If the server does not select `h2`, fail — do not
-  silently fall back to HTTP/1.1 (a fallback needs a separate codec; decide
-  whether that is in scope). `NPN` is not required.
+- The default is TLS only. The client uses `https` origins with ALPN `h2`.
+- ALPN must offer `h2`. If the server does not select `h2`, the client
+  raises `EHttpProtocolError` by default. It does not fall back to HTTP/1.1
+  without the caller's consent. `NPN` is not required.
+- **In scope since 2026-10-06:** cleartext `h2c` (prior knowledge and
+  upgrade) and HTTP/1.1 fallback. Both are available when the caller enables
+  them. The default stays strict. See [[fallback]].
 - Certificate validation/trust configuration is a factory concern (hostname
   verification on by default).
 - Proxy: with `WithProxy`, negotiate TLS/`h2` over a `CONNECT` tunnel to the

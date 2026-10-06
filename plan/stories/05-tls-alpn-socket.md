@@ -32,6 +32,12 @@ the highest-risk story: FPC 3.2.4's bundled SSL units have no ALPN (see
 Spec: [`../../doc/design/transport.md`](../../doc/design/transport.md) §TLS
 and ALPN, and §Memory model (`TInterfacedObject`, ARC).
 
+**Scope change (2026-10-06):** cleartext `h2c` and HTTP/1.1 fallback are now
+in scope. They are off by default and land in story S13; see
+[`../../doc/design/fallback.md`](../../doc/design/fallback.md) and
+[`13-cleartext-fallback.md`](13-cleartext-fallback.md). S05 keeps the TLS
+and ALPN work.
+
 ## Tasks
 
 | ID | Description | Files touched | Deliverable | Acceptance | Depends on |

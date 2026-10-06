@@ -64,6 +64,10 @@ cert**. `INTEROP_HTDOCS` (default `/tmp/nghttpd-root`) holds `index.html`
 | A.7 | Large response | flow-control `WINDOW_UPDATE` emitted, no stall |
 | A.8 | Server GOAWAY | in-flight streams above id retried/handled per policy |
 | A.9 | TLS ALPN | `SSL_get0_alpn_selected == h2`; an http/1.1-only server raises |
+| A.10 | h2c prior knowledge (S13) | a GET against `nghttpd --no-tls` returns `200` |
+| A.11 | h2c upgrade (S13) | a GET returns `101` then uses HTTP/2 |
+| A.12 | HTTP/1.1 fallback (S13) | a GET against an HTTP/1.1 server returns `200` |
+| A.13 | strict mode (S13) | a cleartext request raises `EHttpProtocolError` |
 
 Acceptance command: `make validate-interop` (wraps the above) exits 0.
 
@@ -148,7 +152,7 @@ not the bytes.
 
 | ID | Legacy raw run (stretch) | Condition |
 |---|---|---|
-| C.6 | `grunt mochaTest:client` with `HTTP2_BROWSER=test/testclient` | **Not run.** The suite speaks draft-09 plaintext `h2c`, and the shipped client is TLS-only: there is no `h2c`/prior-knowledge upgrade path in `src/` (`grep` finds only the TLS preface `cClientPreface` in `src/Http2.Connection.pas`). Running it therefore cannot exercise our code, and a green result would not be evidence of RFC 7540 conformance. Recorded as a documented skip. |
+| C.6 | `grunt mochaTest:client` with `HTTP2_BROWSER=test/testclient` | **Ported, not raw-run.** The suite speaks draft-09 plaintext `h2c`, and the shipped client is TLS-only. Story S13 adds an h2c path (`ctPriorKnowledge` / `ctUpgrade`) that can exercise this suite; see [[fallback]]. Until S13 lands, the raw run cannot exercise our code (`grep` finds only the TLS preface `cClientPreface` in `src/Http2.Connection.pas`). Recorded as a documented skip. |
 
 ## D. h2spec (optional appendix)
 

@@ -39,6 +39,7 @@ design depends on it. Details in [[architecture]].
 | [[messages]] | `IHttpResponse`, `THttpRequest`, `IHttpHeaders`, header constants, streaming |
 | [[protocol]] | frame layer, HPACK, flow control |
 | [[transport]] | threading and queues, connection lifecycle, TLS/ALPN |
+| [[fallback]] | cleartext h2c (prior knowledge and upgrade) and HTTP/1.1 fallback |
 | [[errors-redirects]] | exception hierarchy, timeouts, cancellation, redirects |
 | [[testing-observability]] | test seams, `fpcunit`, `IHttp2Observer` |
 | [[open-questions]] | single source of truth for unresolved decisions |

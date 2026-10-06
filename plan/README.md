@@ -46,6 +46,7 @@ flowchart TD
     S10["10 redirects-timeouts"]
     S11["11 observability"]
     S12["12 validation (validation.md)"]
+    S13["13 cleartext-fallback"]
 
     S00 --> S01
     S01 --> S02
@@ -65,6 +66,10 @@ flowchart TD
     S09 --> S11
     S10 --> S12
     S11 --> S12
+    S05 --> S13
+    S09 --> S13
+    S13 --> S12
+    S12 --> S13
 ```
 
 Critical path: `S00 → S01 → S03 → S08 → S09 → S10 → S12`
@@ -110,6 +115,7 @@ Cross-lane dependencies the lane sketch compresses: `S02/S03/S04/S05/S07 → S08
 | 3 Transport | S06, S07 | One connection thread owns a socket, drives preface/SETTINGS/PING/GOAWAY; queue tests green. |
 | 4 Session/API | S08, S09 | `Send` completes a real GET/POST over a live connection; pool caps enforced; factory API compiles per `testclient`. |
 | 5 Semantics | S10, S11 | Redirects, timeouts/cancellation, observer and mock-socket seams tested. |
+| 5b Fallback | S13 | Cleartext h2c and HTTP/1.1 fallback, off by default. |
 | 6 Validation | S12 | `nghttpd` interop green; h2-test-harness suite run and reported; `http2/http2-test` intents ported. |
 
 ## Agent-team ownership
@@ -133,6 +139,7 @@ concurrently — parallel tracks own disjoint units.
 | S10 | api | `src/Http2.Client.pas` (redirects/timeouts) | S09 |
 | S11 | api | `src/Http2.Observer.pas`, `test/` seams | S01, S09 |
 | S12 | validation | `test/validation/`, `plan/validation.md` | all |
+| S13 | cleartext | `src/Http2.Http1.pas`, `src/Http2.Client.pas` (fallback) | S05, S09 |
 
 ## Unit ownership map (one writer per file)
 
@@ -146,7 +153,8 @@ concurrently — parallel tracks own disjoint units.
 | `Http2.Tls` | S05 |
 | `Http2.Connection` | S06 (create), S07 (lifecycle) |
 | `Http2.Stream` | S08 |
-| `Http2.Client` | S09 (create), S10 (extend) |
+| `Http2.Client` | S09 (create), S10 (extend), S13 (fallback) |
+| `Http2.Http1` | S13 |
 | `Http2.Observer` | S11 |
 
 ## Global "done when"
@@ -179,3 +187,4 @@ concurrently — parallel tracks own disjoint units.
 | [`stories/10-redirects-timeouts.md`](stories/10-redirects-timeouts.md) | Redirects, timeouts, cancellation |
 | [`stories/11-observability.md`](stories/11-observability.md) | Observability and test seams |
 | [`validation.md`](validation.md) | External validation (S12) |
+| [`stories/13-cleartext-fallback.md`](stories/13-cleartext-fallback.md) | Cleartext h2c and HTTP/1.1 fallback (S13) |

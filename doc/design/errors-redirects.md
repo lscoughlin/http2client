@@ -11,8 +11,9 @@ up: "[[http2client]]"
 related:
   - "[[messages]]"
   - "[[transport]]"
+  - "[[fallback]]"
   - "[[open-questions]]"
-updated: 2026-10-05
+updated: 2026-10-06
 ---
 
 # Errors, Timeouts & Redirects

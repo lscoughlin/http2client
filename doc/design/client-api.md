@@ -40,6 +40,8 @@ type
     FIdleTimeoutMs: Integer;
     FProxyHost: string;
     FProxyPort: Word;
+    FHttp1Fallback: Boolean;
+    FClearTextPolicy: TClearTextPolicy;
   public
     class function Create: THttpClientFactory; static;
     function WithMaxConnections(const AMax: Integer): THttpClientFactory;
@@ -47,6 +49,8 @@ type
     function WithFollowRedirects(const AFollow: Boolean): THttpClientFactory;
     function WithMaxRedirects(const AMax: Integer): THttpClientFactory;
     function WithProxy(const AHost: string; const APort: Word): THttpClientFactory;
+    function WithHttp1Fallback(const AEnable: Boolean): THttpClientFactory;
+    function WithClearText(const APolicy: TClearTextPolicy): THttpClientFactory;
     function Build: IHttpClient;
   end;
 ```
@@ -66,6 +70,8 @@ Defaults:
 | `ConnectTimeoutMs` | `10000` | TCP + TLS handshake deadline |
 | `HeaderTimeoutMs` | `30000` | response-header deadline once headers are expected |
 | `IdleTimeoutMs` | `60000` | idle connection reap time |
+| `Http1Fallback` | `False` | allow HTTP/1.1 when the peer does not offer `h2`; see [[fallback]] |
+| `ClearTextPolicy` | `ctReject` | reject `http` origins; see [[fallback]] |
 
 Whether `WithProxy` should implement a real `CONNECT` tunnel (versus
 forwarding) is unresolved — see [[open-questions]].
