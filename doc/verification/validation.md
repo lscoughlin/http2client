@@ -10,14 +10,14 @@ tags:
   - validation
 status: validated
 up: "[[http2client]]"
-depends-on:
-  - "10-redirects-timeouts"
-  - "11-observability"
-parallel-with: []
 updated: 2026-10-05
 validation-results: "bin/validation-results.md"
 harness-log: "doc/verification/harness-run-full.log"
 ---
+
+> Story lineage: S12 closes the plan and was built on S10 and S11, whose
+> story notes are kept outside this repository with the rest of `plan/`.
+> This record is self-contained, so those notes are not required to read it.
 
 # S12 — Validation against external suites
 
@@ -220,7 +220,7 @@ when A and B are green.
 | `h2-client-test-harness` image | `h2-test-harness`, digest `sha256:745149517ede…` |
 | `third_party/h2-client-test-harness` | git `0bc075c` |
 | Container runtime | Rancher Desktop `docker` (`~/.rd/bin/docker`) |
-| Unit suite | 247 tests, 0 errors, 0 failures |
+| Unit suite | 292 tests, 0 errors, 0 failures |
 
 Skips, each with its reason: **A.8** (no nghttpd GOAWAY trigger; covered by
 unit tests), **C.6** (draft-09 plaintext `h2c`; client is TLS-only), **D**
@@ -299,10 +299,37 @@ and reports the violation; no malformed input is silently accepted. The gate
 therefore holds: **no WORSE**, and every divergence is a deliberate,
 RFC-grounded level choice rather than an unhandled case.
 
+## Sanity checks (non-vacuity)
+
+Before trusting A or B, prove the probe can fail. `tools/validate/h2probe-sanity.sh`
+(also `task validate:sanity`, seconds) runs five conditions and asserts a
+distinct exit code for each outcome class:
+
+| # | Condition | Expected |
+|---|---|---|
+| 1 | an unreachable port | exit 2 (connection error) |
+| 2 | the harness RST_STREAM case `5.1/2` | exit 3 (stream error) |
+| 3 | bad command-line usage | exit 1 |
+| 4 | an `http/1.1`-only ALPN peer | exit 2, ALPN message |
+| 5 | a live `nghttpd` GET (positive control) | exit 0 |
+
+Checks 2 and 5 are SKIPs when the harness image or `nghttpd` is absent. Each
+checked server is waited for explicitly (`wait_port`, `wait_harness_ready`). A
+server that never binds is reported as an **infrastructure** failure and
+counted apart from a probe failure, because an unready server says nothing
+about the client. Check 2 retries the container up to three times before it
+gives up, matching the readiness policy of `tools/validate/harness.sh`.
+
+Recorded result (2026-10-06): `PASS=5 FAIL=0`, stable over five consecutive
+runs. Negative control: with a container that never logs `listening on`, the
+script reports `PASS=4 FAIL=1`, names the cause as infrastructure, and exits 1.
+
 ## Done when
 
 - A exits 0 on a real TLS ALPN connection.
 - B has a complete, justified results set for all 146 ids.
+- The sanity checks pass, and a server that fails to start is reported as an
+  infrastructure failure rather than as a probe failure.
 - C intents exist as unit tests; any raw-suite skip is documented.
 - E comparison notes exist for at least one request.
 - No claim of conformance rests on the draft-09 suite.

@@ -130,6 +130,10 @@ It checks five conditions:
 5. A live `nghttpd` GET gives exit code 0. This check is a SKIP when
    `nghttpd` is absent.
 
+The script waits for each server to open its port. If a server does not
+start, the script reports an infrastructure failure. It does not report a
+probe failure. A probe failure always means that the probe is wrong.
+
 ### Interop gate
 
 The interop script starts `nghttpd` with the test certificates. Then it runs
