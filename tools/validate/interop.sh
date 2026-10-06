@@ -14,10 +14,19 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 PORT="${INTEROP_PORT:-18443}"
-PLAIN_PORT="${INTEROP_PLAIN_PORT:-18080}"
+PLAIN_PORT="${INTEROP_PLAIN_PORT:-18480}"
+# S13: cleartext h2c / HTTP-1.1 servers (Apache httpd:2.4 in docker).  Keep
+# these well above the 18080-18082 range: that range collides with common
+# dev proxies (e.g. an unrelated `auth_proxy.py`), and a foreign 127.0.0.1
+# listener would shadow Lima's `*:<port>` tunnel and silently answer the
+# upgrade probe.
+H2C_PORT="${INTEROP_H2C_PORT:-18481}"
+H1_PORT="${INTEROP_H1_PORT:-18482}"
 HTDOCS="$(mktemp -d /tmp/h2interop.XXXXXX)"
 BUILD="$(mktemp -d /tmp/h2interop-build.XXXXXX)"
 PROBE="$BUILD/h2probe"
+DOCKER="${DOCKER:-$(command -v docker || echo "$HOME/.rd/bin/docker")}"
+DOCKER_OK=no
 
 FPC="${FPC:-fpc}"
 FPC_UNITS="${FPC_UNITS:-/usr/local/lib/fpc/3.2.4/units/aarch64-darwin}"
@@ -33,6 +42,9 @@ cleanup() {
   [ -n "${NGHTTPD_PID:-}" ] && kill "$NGHTTPD_PID" 2>/dev/null
   [ -n "${NGHTTPD_PLAIN_PID:-}" ] && kill "$NGHTTPD_PLAIN_PID" 2>/dev/null
   [ -n "${SSERVER_PID:-}" ] && kill "$SSERVER_PID" 2>/dev/null
+  if [ "$DOCKER_OK" = yes ]; then
+    "$DOCKER" rm -f http2client-h2c http2client-h1 >/dev/null 2>&1
+  fi
   rm -rf "$BUILD" "$HTDOCS" 2>/dev/null
 }
 trap cleanup EXIT
@@ -75,6 +87,17 @@ wait_port() { # host port
   return 1
 }
 
+# a foreign process already answering on the port would shadow the container
+# (Lima publishes a `*:<port>` tunnel, a 127.0.0.1 listener wins over it) and
+# the probe would silently read the wrong server back
+require_free_port() { # port case-id
+  if nc -z 127.0.0.1 "$1" 2>/dev/null; then
+    echo "ERROR: port $1 ($2) is already in use; set INTEROP_$3_PORT to a free port" >&2
+    return 1
+  fi
+  return 0
+}
+
 echo "== http2client interop validation (nghttpd) =="
 echo "repo:    $REPO_ROOT"
 echo "nghttpd: $($NGHTTPD --version 2>&1 | head -1)"
@@ -88,13 +111,70 @@ fi
 
 compile_probe
 
-# seed a document root
+# --- S13: Apache httpd:2.4 servers for the cleartext cases ----------------
+# h2c upgrade needs mod_http2 ("Protocols h2c http/1.1" + "H2Upgrade on");
+# nghttpd is HTTP/2-only and cannot answer an HTTP/1.1 Upgrade request.
+#
+# The config and docroot are copied in with `docker cp` rather than
+# bind-mounted: Rancher Desktop intermittently deletes a bind-mount source
+# directory that lives inside the repo checkout, which used to leave the
+# container serving a 404 with an empty docroot.
+start_apache() { # name port protocols h2upgrade
+  local name="$1" port="$2" protocols="$3" h2upgrade="$4"
+  local conf="$BUILD/httpd-$name.conf"
+  cat > "$conf" <<EOF
+ServerRoot "/usr/local/apache2"
+Listen $port
+LoadModule mpm_event_module modules/mod_mpm_event.so
+LoadModule authz_core_module modules/mod_authz_core.so
+LoadModule dir_module modules/mod_dir.so
+LoadModule mime_module modules/mod_mime.so
+LoadModule log_config_module modules/mod_log_config.so
+LoadModule unixd_module modules/mod_unixd.so
+LoadModule http2_module modules/mod_http2.so
+ServerName localhost
+Protocols $protocols
+$h2upgrade
+DocumentRoot "/htdocs"
+<Directory "/htdocs">
+  Require all granted
+</Directory>
+ErrorLog /dev/stderr
+EOF
+  "$DOCKER" rm -f "$name" >/dev/null 2>&1
+  "$DOCKER" create --name "$name" --network host httpd:2.4 >/dev/null 2>&1 || return 1
+  "$DOCKER" cp "$conf" "$name:/usr/local/apache2/conf/httpd.conf" >/dev/null 2>&1 || return 1
+  "$DOCKER" cp "$HTDOCS/." "$name:/htdocs/" >/dev/null 2>&1 || return 1
+  "$DOCKER" start "$name" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+if [ -n "$DOCKER" ] && "$DOCKER" info >/dev/null 2>&1; then
+  DOCKER_OK=yes
+fi
+
+# seed a document root (must exist before start_apache copies it in)
 printf 'hello-http2\n' > "$HTDOCS/index.html"
 printf '0123456789'     > "$HTDOCS/small.txt"
 head -c 30000 /dev/urandom > "$HTDOCS/m30.bin"
 # 100k exceeds the default connection flow-control window; used by A.7
 head -c 100000 /dev/urandom > "$HTDOCS/m100.bin"
 
+if [ "$DOCKER_OK" = yes ]; then
+  if require_free_port "$H2C_PORT" A.11 H2C && \
+     require_free_port "$H1_PORT" A.12 H1; then
+    if start_apache http2client-h2c "$H2C_PORT" "h2c http/1.1" "H2Upgrade on" && \
+       start_apache http2client-h1  "$H1_PORT"  "http/1.1"     ""; then
+      wait_port 127.0.0.1 "$H2C_PORT" || true
+      wait_port 127.0.0.1 "$H1_PORT"  || true
+    else
+      echo "WARNING: failed to start the Apache cleartext servers" >&2
+      DOCKER_OK=no
+    fi
+  else
+    DOCKER_OK=no
+  fi
+fi
 # --- A gate server: TLS + ALPN h2 -----------------------------------------
 "$NGHTTPD" -d "$HTDOCS" --echo-upload "$PORT" \
   test/certs/localhost.key test/certs/localhost.crt \
@@ -203,6 +283,50 @@ else
     "openssl not available" SKIP
 fi
 
+# --- S13 A.10: h2c prior knowledge against nghttpd --no-tls ----------------
+run_probe "http://127.0.0.1:$PLAIN_PORT/small.txt" --clear-text=prior-knowledge
+if [ "$PROBE_RC" = 0 ] && echo "$PROBE_OUT" | grep -q "status=200 bytes=10"; then
+  record A.10 "h2c prior knowledge -> 200" "200,10" "$PROBE_OUT" PASS
+else
+  record A.10 "h2c prior knowledge -> 200" "200,10" "$PROBE_OUT" FAIL
+fi
+
+# --- S13 A.11: h2c upgrade (Upgrade: h2c -> 101 -> HTTP/2) ----------------
+if [ "$DOCKER_OK" = yes ]; then
+  run_probe "http://127.0.0.1:$H2C_PORT/small.txt" --clear-text=upgrade
+  if [ "$PROBE_RC" = 0 ] && echo "$PROBE_OUT" | grep -q "status=200 bytes=10"; then
+    record A.11 "h2c upgrade -> 101 then HTTP/2" "200,10" "$PROBE_OUT" PASS
+  else
+    record A.11 "h2c upgrade -> 101 then HTTP/2" "200,10" "$PROBE_OUT" FAIL
+  fi
+else
+  record A.11 "h2c upgrade -> 101 then HTTP/2" "200,10" \
+    "docker unavailable" SKIP
+fi
+
+# --- S13 A.12: HTTP/1.1 fallback (upgrade offered, peer stays HTTP/1.1) ---
+if [ "$DOCKER_OK" = yes ]; then
+  run_probe "http://127.0.0.1:$H1_PORT/small.txt" --clear-text=upgrade
+  if [ "$PROBE_RC" = 0 ] && echo "$PROBE_OUT" | grep -q "status=200 bytes=10"; then
+    record A.12 "HTTP/1.1 fallback -> 200" "200,10" "$PROBE_OUT" PASS
+  else
+    record A.12 "HTTP/1.1 fallback -> 200" "200,10" "$PROBE_OUT" FAIL
+  fi
+else
+  record A.12 "HTTP/1.1 fallback -> 200" "200,10" \
+    "docker unavailable" SKIP
+fi
+
+# --- S13 A.13: strict mode rejects cleartext -------------------------------
+run_probe "http://127.0.0.1:$PLAIN_PORT/small.txt"
+if [ "$PROBE_RC" = 2 ] && echo "$PROBE_OUT" | grep -q "code=PROTOCOL_ERROR"; then
+  record A.13 "strict mode rejects cleartext" "conn-error PROTOCOL_ERROR" \
+    "$PROBE_OUT" PASS
+else
+  record A.13 "strict mode rejects cleartext" "conn-error PROTOCOL_ERROR" \
+    "$PROBE_OUT" FAIL
+fi
+
 # also prove the TLS+ALPN gate actually negotiated h2 (server log evidence)
 if grep -q "h2" "$BUILD/nghttpd.log" 2>/dev/null; then :; fi
 
@@ -216,7 +340,7 @@ for r in "${rows[@]}"; do
 done
 
 echo
-echo "interop: PASS=$PASS FAIL=$FAIL SKIP=$SKIP (mandatory cases: A.1-A.5,A.7,A.9)"
+echo "interop: PASS=$PASS FAIL=$FAIL SKIP=$SKIP (mandatory cases: A.1-A.5,A.7,A.9,A.10,A.11,A.12,A.13)"
 if [ "$FAIL" -eq 0 ]; then
   echo "RESULT: interop gate GREEN"
   exit 0
