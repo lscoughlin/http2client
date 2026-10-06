@@ -104,8 +104,8 @@ IDE as a design-time package.
 
 | Fact | Value |
 |---|---|
-| Package name / type | `http2client`, `RunAndDesignTime`, `Version 0.1.0` |
-| Units | all 11 in `src/`, `Http2.pas` (umbrella) first |
+| Package name / type | `http2client`, `RunAndDesignTime`, `Version 0.13.0` |
+| Units | all 13 in `src/`, `Http2.pas` (umbrella) first |
 | `OtherUnitFiles` | `src` + the four vendored mormot dirs (`core`, `lib`, `net`, `crypt`) |
 | `RequiredPkgs` | `FCL` **only** — deliberately **not** the IDE `mormot2` package (see below) |
 | Unit output | `lib/$(TargetCPU)-$(TargetOS)` (gitignored) |
@@ -150,7 +150,7 @@ lazbuild --opt=-Fu/tmp/lpkintf \
          --opt=-Fu$L/packager/registration http2client.lpk
 ```
 
-Verified: `79371 lines compiled`, all 11 units produced `.ppu`/`.o` in
+Verified: `83049 lines compiled`, all 13 units produced `.ppu`/`.o` in
 `lib/aarch64-darwin/`. A stock Lazarus matched to its FPC would not need the
 `--opt` workaround.
 
