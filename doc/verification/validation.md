@@ -15,9 +15,9 @@ validation-results: "bin/validation-results.md"
 harness-log: "doc/verification/harness-run-full.log"
 ---
 
-> Story lineage: S12 closes the plan and was built on S10 and S11, whose
-> story notes are kept outside this repository with the rest of `plan/`.
-> This record is self-contained, so those notes are not required to read it.
+> Story lineage: S12 closes the plan and was built on S10 and S11. The notes
+> for those earlier stories are not part of this repository. This record is
+> self-contained, so they are not required to read it.
 
 # S12 — Validation against external suites
 
