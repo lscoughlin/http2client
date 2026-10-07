@@ -197,13 +197,10 @@ wait_port() { # host port [tenths] -> 0 when open, 1 when never opened
 wait_harness_ready() {
   local i
   for i in $(seq 1 100); do
-    docker logs "$CONTAINER" 2>&1 | grep -q "listening on" && break
+    docker logs "$CONTAINER" 2>&1 | grep -q "listening on" && return 0
     sleep 0.1
   done
-  docker logs "$CONTAINER" 2>&1 | grep -q "listening on" || return 1
-  # The host listener is an ssh-forwarded port established after the container
-  # logs, so a probe fired on the log alone can hit "connect ... failed".
-  wait_port 127.0.0.1 8080 50
+  return 1
 }
 
 run_reference() { # id -> writes log to stdout
@@ -213,8 +210,13 @@ run_reference() { # id -> writes log to stdout
 run_ours() { # id -> echo "exit line"
   # A NOT_READY result means the harness container did not finish binding
   # 127.0.0.1:8080 within the readiness window (host load, image warm-up);
-  # it says nothing about the client. Retry a bounded number of times so an
-  # infrastructure hiccup is not recorded as a client failure.
+  # it says nothing about the client. The host listener is an ssh-forwarded
+  # port established a moment after the container logs "listening on", so a
+  # probe fired on the log line alone can still hit "connect ... failed" --
+  # an infrastructure race, not a client result. Detect that specific failure
+  # and retry a bounded number of times. Do NOT probe readiness with a TCP
+  # connect: the harness accepts exactly one connection and exits, so a
+  # connect probe would consume the accept and break the real run.
   local attempt out rc
   for attempt in 1 2 3; do
     docker rm -f "$CONTAINER" >/dev/null 2>&1
@@ -225,6 +227,11 @@ run_ours() { # id -> echo "exit line"
         --timeout-ms="$PROBE_TIMEOUT_MS" --keep-open-ms=200 2>&1)"
       rc=$?
       docker rm -f "$CONTAINER" >/dev/null 2>&1
+      if [ "$attempt" -lt 3 ] && echo "$out" | grep -q "connect to 127.0.0.1:8080 failed"; then
+        # host forwarder not established yet: retry, do not score this run
+        sleep 1
+        continue
+      fi
       echo "$rc $(echo "$out" | head -1)"
       return
     fi

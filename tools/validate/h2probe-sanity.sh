@@ -37,7 +37,6 @@ cleanup() {
   [ -n "${SSERVER_PID:-}" ] && kill "$SSERVER_PID" 2>/dev/null
   [ -n "${RSTSERVER_PID:-}" ] && kill "$RSTSERVER_PID" 2>/dev/null
   [ -n "${NGHTTPD_PID:-}" ] && kill "$NGHTTPD_PID" 2>/dev/null
-  [ -n "${CONTAINER:-}" ] && docker rm -f "$CONTAINER" >/dev/null 2>&1
   rm -rf "$BUILD" 2>/dev/null
 }
 trap cleanup EXIT
@@ -92,22 +91,6 @@ wait_log_line() { # file pattern [tenths]
     sleep 0.1
   done
   return 1
-}
-
-# The harness logs a line once it is bound. Waiting on the LOG alone is not
-# enough: under Rancher Desktop the host listener is an ssh-forwarded port
-# established a moment after the container logs, so a probe fired on the log
-# alone intermittently hits "connect to 127.0.0.1:8080 failed". Wait for BOTH
-# the log line and the host port. The container exits after serving one
-# connection, so readiness must be re-established per attempt.
-wait_harness_ready() {
-  local i
-  for i in $(seq 1 100); do
-    docker logs "$CONTAINER" 2>&1 | grep -q "listening on" && break
-    sleep 0.1
-  done
-  docker logs "$CONTAINER" 2>&1 | grep -q "listening on" || return 1
-  wait_port 127.0.0.1 8080 50
 }
 
 "$FPC" -O2 -Mdelphi -Fu./src -Fu"$BUILD" \
