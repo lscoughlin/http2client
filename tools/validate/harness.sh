@@ -177,13 +177,33 @@ verdict_for() { # ref_state ref_class our id -> verdict
   if [ "$rstate" = pass ]; then echo "WORSE"; else echo "UNKNOWN"; fi
 }
 
-wait_harness_ready() {
-  local i
-  for i in $(seq 1 100); do
-    docker logs "$CONTAINER" 2>&1 | grep -q "listening on" && return 0
+port_open() { # host port
+  if command -v nc >/dev/null 2>&1; then
+    nc -z "$1" "$2" 2>/dev/null
+  else
+    (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null
+  fi
+}
+
+wait_port() { # host port [tenths] -> 0 when open, 1 when never opened
+  local host="$1" port="$2" tries="${3:-100}" i
+  for i in $(seq 1 "$tries"); do
+    port_open "$host" "$port" && return 0
     sleep 0.1
   done
   return 1
+}
+
+wait_harness_ready() {
+  local i
+  for i in $(seq 1 100); do
+    docker logs "$CONTAINER" 2>&1 | grep -q "listening on" && break
+    sleep 0.1
+  done
+  docker logs "$CONTAINER" 2>&1 | grep -q "listening on" || return 1
+  # The host listener is an ssh-forwarded port established after the container
+  # logs, so a probe fired on the log alone can hit "connect ... failed".
+  wait_port 127.0.0.1 8080 50
 }
 
 run_reference() { # id -> writes log to stdout

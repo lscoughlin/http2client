@@ -5,15 +5,21 @@
 # It proves the probe is not reporting PASS unconditionally, and that the
 # three verifier outcome classes map to distinct exit codes:
 #   check 1: an unreachable port              -> exit 2 (connection error)
-#   check 2: the harness RST_STREAM case 5.1/2 -> exit 3 (stream error)
+#   check 2: a reset after a 200 response     -> exit 3 (stream error)
 #   check 3: bad usage                        -> exit 1
 #   check 4: an http/1.1-only ALPN peer       -> exit 2 with an ALPN message
 #   check 5: a live nghttpd GET               -> exit 0 (positive control)
 #
-# Check 2 uses the real h2-test-harness (case 5.1/2 sends RST_STREAM on an idle
-# stream); our client surfaces it as EHttpStreamError, which is verifier class
-# ExpectStreamError. This also cross-checks the runner: if the probe had
-# reported exit 0 for 5.1/2, the runner would be vacuous.
+# Check 2 uses a local fabricated peer (tools/validate/fake_rst_server.py),
+# not the h2-test-harness. The harness's case 5.1/2 sends RST_STREAM on a
+# stream it considers idle (it never reads our HEADERS) and then closes the
+# socket at once, so the reset races the EOF: the probe legitimately reports
+# either a stream error (exit 3) or a connection error (exit 2), and the
+# harness's own reference verifier expects the connection error. That case
+# therefore cannot serve as a deterministic stream-error oracle. The
+# fabricated peer answers the request with a 200 response and only then sends
+# RST_STREAM, holding the socket open, so exit 3 is unambiguous. This still
+# cross-checks the runner: a vacuous probe that reported exit 0 would fail.
 set -u
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -29,6 +35,7 @@ export PATH="/Users/liamcoughlin/.rd/bin:$PATH"
 PASS=0; FAIL=0
 cleanup() {
   [ -n "${SSERVER_PID:-}" ] && kill "$SSERVER_PID" 2>/dev/null
+  [ -n "${RSTSERVER_PID:-}" ] && kill "$RSTSERVER_PID" 2>/dev/null
   [ -n "${NGHTTPD_PID:-}" ] && kill "$NGHTTPD_PID" 2>/dev/null
   [ -n "${CONTAINER:-}" ] && docker rm -f "$CONTAINER" >/dev/null 2>&1
   rm -rf "$BUILD" 2>/dev/null
@@ -74,16 +81,33 @@ wait_port() { # host port [tenths]  -> 0 when open, 1 when never opened
   return 1
 }
 
-# The harness logs a line once it is bound. Waiting on the LOG (not the port)
-# is what the sweep uses, and the container exits after serving one connection,
-# so readiness must be re-established per attempt.
-wait_harness_ready() {
-  local i
-  for i in $(seq 1 100); do
-    docker logs "$CONTAINER" 2>&1 | grep -q "listening on" && return 0
+# Wait for a line to appear in a file. Use this (NOT port_open/wait_port) to
+# gate a server that accepts a SINGLE connection: a TCP-connect readiness probe
+# is itself a connection and would consume that one accept, so the real probe
+# afterwards would hit a consumed/half-open socket.
+wait_log_line() { # file pattern [tenths]
+  local file="$1" pattern="$2" tries="${3:-100}" i
+  for i in $(seq 1 "$tries"); do
+    grep -q "$pattern" "$file" 2>/dev/null && return 0
     sleep 0.1
   done
   return 1
+}
+
+# The harness logs a line once it is bound. Waiting on the LOG alone is not
+# enough: under Rancher Desktop the host listener is an ssh-forwarded port
+# established a moment after the container logs, so a probe fired on the log
+# alone intermittently hits "connect to 127.0.0.1:8080 failed". Wait for BOTH
+# the log line and the host port. The container exits after serving one
+# connection, so readiness must be re-established per attempt.
+wait_harness_ready() {
+  local i
+  for i in $(seq 1 100); do
+    docker logs "$CONTAINER" 2>&1 | grep -q "listening on" && break
+    sleep 0.1
+  done
+  docker logs "$CONTAINER" 2>&1 | grep -q "listening on" || return 1
+  wait_port 127.0.0.1 8080 50
 }
 
 "$FPC" -O2 -Mdelphi -Fu./src -Fu"$BUILD" \
@@ -98,40 +122,31 @@ echo "== h2probe sanity checks =="
 out="$("$PROBE" --url=https://127.0.0.1:1/ --insecure --timeout-ms=1500 2>&1)"; rc=$?
 check "unreachable port -> conn-error" 2 "$rc" "$out"
 
-# 2. real harness RST_STREAM case 5.1/2 -> stream error -> exit 3
-# The harness needs up to ~10 s to bind (image warm-up, host load), so a
-# bounded retry keeps an infrastructure hiccup out of the probe's score. If it
-# never binds, that is an infrastructure failure, reported as such.
-if command -v docker >/dev/null 2>&1 && docker image inspect h2-test-harness >/dev/null 2>&1; then
-  CONTAINER="h2sanity-$$"
-  rc=""; out=""
-  for attempt in 1 2 3; do
-    docker rm -f "$CONTAINER" >/dev/null 2>&1
-    docker run -d --name "$CONTAINER" --network host h2-test-harness \
-      --harness-only --test=5.1/2 >/dev/null 2>&1
-    if wait_harness_ready; then
-      out="$("$PROBE" --url=https://127.0.0.1:8080/ --insecure --timeout-ms=3000 \
-        --keep-open-ms=200 2>&1)"; rc=$?
-      docker rm -f "$CONTAINER" >/dev/null 2>&1; CONTAINER=""
-      break
-    fi
-  done
-  if [ -z "$rc" ]; then
-    docker rm -f "$CONTAINER" >/dev/null 2>&1; CONTAINER=""
-    infra_fail "harness 5.1/2 RST_STREAM -> stream-error" \
-      "harness never logged 'listening on' (3 attempts); no score for the probe"
-  else
-    check "harness 5.1/2 RST_STREAM -> stream-error" 3 "$rc" "$out"
-  fi
+# 2. reset after a 200 response -> stream error -> exit 3
+# A local fabricated peer sends HEADERS(200) then RST_STREAM(CANCEL) and holds
+# the socket open, so the classification is deterministic (see the header
+# note). No container and no host-port race are involved.
+RST_PORT=18445
+python3 tools/validate/fake_rst_server.py \
+  "$RST_PORT" test/certs/localhost.crt test/certs/localhost.key 2.0 \
+  >"$BUILD/rstserver.log" 2>&1 &
+RSTSERVER_PID=$!
+if wait_log_line "$BUILD/rstserver.log" "listening on"; then
+  out="$("$PROBE" --url=https://127.0.0.1:$RST_PORT/ --insecure \
+    --timeout-ms=3000 --keep-open-ms=200 2>&1)"; rc=$?
+  check "reset after response -> stream-error" 3 "$rc" "$out"
 else
-  echo "SKIP  harness 5.1/2 stream-error (image not built)"
+  infra_fail "reset after response -> stream-error" \
+    "fabricated rst server never opened port $RST_PORT; see $BUILD/rstserver.log"
 fi
+kill "$RSTSERVER_PID" 2>/dev/null; RSTSERVER_PID=""
 
 # 3. bad usage -> exit 1
 out="$("$PROBE" --nonsense 2>&1)"; rc=$?
 check "bad usage -> usage error" 1 "$rc" "$out"
 
 # 4. http/1.1-only (or no-ALPN) peer -> connection error (ALPN) -> exit 2
+# Ports 18446/18447 are chosen to avoid the fabricated rst server's 18445.
 openssl s_server -quiet -accept 18446 \
   -cert test/certs/localhost.crt -key test/certs/localhost.key -alpn http/1.1 -www \
   >"$BUILD/sserver.log" 2>&1 &

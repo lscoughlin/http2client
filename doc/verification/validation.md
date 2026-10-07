@@ -308,21 +308,40 @@ distinct exit code for each outcome class:
 | # | Condition | Expected |
 |---|---|---|
 | 1 | an unreachable port | exit 2 (connection error) |
-| 2 | the harness RST_STREAM case `5.1/2` | exit 3 (stream error) |
+| 2 | a reset that follows a 200 response (`tools/validate/fake_rst_server.py`) | exit 3 (stream error) |
 | 3 | bad command-line usage | exit 1 |
 | 4 | an `http/1.1`-only ALPN peer | exit 2, ALPN message |
 | 5 | a live `nghttpd` GET (positive control) | exit 0 |
 
-Checks 2 and 5 are SKIPs when the harness image or `nghttpd` is absent. Each
-checked server is waited for explicitly (`wait_port`, `wait_harness_ready`). A
-server that never binds is reported as an **infrastructure** failure and
-counted apart from a probe failure, because an unready server says nothing
-about the client. Check 2 retries the container up to three times before it
-gives up, matching the readiness policy of `tools/validate/harness.sh`.
+Checks 1-4 use local peers; only check 5 is SKIPped when `nghttpd` is absent.
+Each checked server is waited for explicitly (`wait_port`, `wait_log_line`,
+`wait_harness_ready`). A server that never binds is reported as an
+**infrastructure** failure and counted apart from a probe failure, because an
+unready server says nothing about the client.
 
-Recorded result (2026-10-06): `PASS=5 FAIL=0`, stable over five consecutive
-runs. Negative control: with a container that never logs `listening on`, the
-script reports `PASS=4 FAIL=1`, names the cause as infrastructure, and exits 1.
+Check 2 deliberately does **not** use the h2-test-harness case `5.1/2`. That
+case sends RST_STREAM on a stream the *server* still considers idle (it never
+reads our HEADERS) and then closes the socket at once, so the reset races the
+EOF: our probe can legitimately report either a stream error (exit 3) or a
+connection error (exit 2), and the harness's own reference verifier expects the
+connection error (`verifier/cases/http2/5_1_stream_states.go`). It is an
+accepted divergence (see the `5.1/2` row above), not a deterministic
+stream-error oracle, and using it here made the check flaky (roughly 1 run in
+3). The fabricated peer instead sends a valid 200 response HEADERS *then*
+RST_STREAM and holds the socket open, so exit 3 is unambiguous. Non-vacuity
+against that peer is verified by mutation: remove the RST_STREAM write and the
+check fails (`exit=2`, header timeout) as it must.
+
+Readiness of a Docker-backed harness, when one is used, waits on **both** the
+container's `listening on` log line and the host port. Under Rancher Desktop
+the host listener is an ssh-forwarded port established a moment after the
+container logs, so a probe fired on the log alone intermittently hits
+`connect to 127.0.0.1:8080 failed`.
+
+Recorded result (2026-10-07): `PASS=5 FAIL=0`, stable over twenty consecutive
+runs; the mutation above flips check 2 to `FAIL exit=2`. Negative control: with
+a server that never opens its port, the script reports `PASS=4 FAIL=1`, names
+the cause as infrastructure, and exits 1.
 
 ## Done when
 
