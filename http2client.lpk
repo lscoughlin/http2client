@@ -6,7 +6,7 @@
     <Type Value="RunAndDesignTime"/>
     <Author Value="lscoughlin"/>
     <Description Value="HTTP/2 client library for Free Pascal 3.2.4+ (ALPN via mORMot2/OpenSSL)"/>
-    <Version Major="0" Minor="13" Release="0" Build="0"/>
+    <Version Major="0" Minor="14" Release="0" Build="0"/>
     <License Value="Apache-2.0"/>
     <CompilerOptions>
       <Version Value="11"/>

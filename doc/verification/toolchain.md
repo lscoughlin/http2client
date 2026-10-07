@@ -104,7 +104,7 @@ IDE as a design-time package.
 
 | Fact | Value |
 |---|---|
-| Package name / type | `http2client`, `RunAndDesignTime`, `Version 0.13.0` |
+| Package name / type | `http2client`, `RunAndDesignTime`, `Version 0.14.0` |
 | Units | all 13 in `src/`, `Http2.pas` (umbrella) first |
 | `OtherUnitFiles` | `src` + the four vendored mormot dirs (`core`, `lib`, `net`, `crypt`) |
 | `RequiredPkgs` | `FCL` **only** — deliberately **not** the IDE `mormot2` package (see below) |
