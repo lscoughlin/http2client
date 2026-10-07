@@ -573,6 +573,16 @@ type
 
   /// reads a whole response body and decodes it to T. Under {$mode delphi} a
   /// class-level generic compiles (doc/design/messages.md "Syntax note").
+  ///
+  /// The decoded result depends on the type kind of T:
+  /// - `string` / `AnsiString` / `UTF8String`: the raw body bytes as text
+  ///   (UTF8String is an AnsiString on FPC 3.2.4, so it lands here too).
+  /// - a dynamic array of bytes: the raw body bytes.
+  /// - any other type: the raw body bytes are memcpy'd into T, so the body
+  ///   must be at least SizeOf(T) bytes (a short body raises EHttpProtocolError).
+  ///
+  /// Structured formats (JSON, XML) live in Http2.Readers.pas so the 13-unit
+  /// core library keeps no fpjson/fcl-xml dependency.
   TResponseReader<T> = class(TInterfacedObject, IResponseReader<T>)
   public
     function Read(const AResponse: IHttpResponse): T; overload;
@@ -582,6 +592,16 @@ type
 
   /// pointer used by TResponseReader<T> to store a dynamic-array result
   PBytesValue = ^TBytes;
+
+/// attach AText as the request body and set `content-type: text/plain` when the
+/// request carries no content-type yet. The text bytes are copied verbatim (on
+/// FPC 3.2.4 an AnsiString/string is UTF-8 on this platform).
+function WithTextBody(const ARequest: THttpRequest;
+  const AText: string): THttpRequest;
+
+/// read a whole response body as text (the body bytes copied verbatim; UTF-8
+/// when the peer sends UTF-8, which is the HTTP/2 default for text)
+function ReadText(const AResponse: IHttpResponse): string;
 
 /// split a URL into host, port and path+query; default port is 443 (TLS)
 procedure ParseHttpUrl(const AUrl: string; out AHost: string; out APort: Word;
@@ -827,6 +847,31 @@ begin
     Move(Buf[0], Result[Total], N);
     Inc(Total, N);
   end;
+end;
+
+function WithTextBody(const ARequest: THttpRequest;
+  const AText: string): THttpRequest;
+var
+  B: TBytes;
+begin
+  SetLength(B, Length(AText));
+  if Length(B) > 0 then
+    Move(AText[1], B[0], Length(B));
+  Result := ARequest.WithBody(THttpBody.FromBytes(B));
+  if (Result.Headers = nil) or (not Result.Headers.Contains(HeaderContentType)) then
+    Result := Result.WithHeader(HeaderContentType, 'text/plain');
+end;
+
+function ReadText(const AResponse: IHttpResponse): string;
+var
+  Raw: TBytes;
+begin
+  if AResponse = nil then
+    raise EHttpProtocolError.Create('response is nil', ecInternalError);
+  Raw := ReadAllBodyBytes(AResponse.Body);
+  SetLength(Result, Length(Raw));
+  if Length(Raw) > 0 then
+    Move(Raw[0], Result[1], Length(Raw));
 end;
 
 function Base64UrlEncode(const AData: TBytes): string;
@@ -2598,6 +2643,9 @@ begin
   case PI^.Kind of
     tkAString:
       begin
+        // string, AnsiString and UTF8String all report tkAString on FPC
+        // 3.2.4, so this branch is the text reader for every string type.
+        // The bytes are copied verbatim; no code-page conversion is applied.
         SetLength(S, Length(Raw));
         if Length(Raw) > 0 then
           Move(Raw[0], S[1], Length(Raw));

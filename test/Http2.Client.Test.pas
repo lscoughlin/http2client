@@ -170,7 +170,12 @@ type
     // 09.3
     procedure TestResponseReaderDecodesBytes;
     procedure TestResponseReaderDecodesString;
+    procedure TestResponseReaderDecodesUTF8String;
     procedure TestResponseReaderDecodesRecord;
+    // base-library text helpers
+    procedure TestWithTextBodySetsBodyAndContentType;
+    procedure TestWithTextBodyKeepsExplicitContentType;
+    procedure TestReadTextReturnsBody;
     // 09.5
     procedure TestPoolNeverExceedsMaxConnections;
     procedure TestMaxConnectionsPerHostAndTotalAreIndependent;
@@ -809,6 +814,50 @@ begin
   TResponseReader<TSmallDto>.Read(Resp, V);
   AssertEquals('first field', LongWord($11223344), V.A);
   AssertEquals('second field', LongWord($55667788), V.B);
+end;
+
+procedure TClientTest.TestResponseReaderDecodesUTF8String;
+var
+  Resp: IHttpResponse;
+  V: UTF8String;
+begin
+  // UTF8String is an AnsiString on FPC 3.2.4; the base reader copies the body
+  // bytes verbatim into it (no code-page conversion)
+  Resp := TFakeResponse.Create(200, TFakeBody.Create(BytesOf('h'#195#169'llo')));
+  TResponseReader<UTF8String>.Read(Resp, V);
+  AssertEquals('utf8 byte count', 6, Length(V));
+  AssertEquals('utf8 text', 'h'#195#169'llo', string(V));
+end;
+
+procedure TClientTest.TestWithTextBodySetsBodyAndContentType;
+var
+  Req: THttpRequest;
+begin
+  Req := WithTextBody(
+    THttpRequest.Create(hmPost, 'https://api.example/echo'), 'hello');
+  AssertTrue('body is set', Req.Body.IsSet);
+  AssertEquals('body bytes', 'hello', StrOf(Req.Body.Data));
+  AssertEquals('content-type defaulted', 'text/plain',
+    Req.Headers.GetFirst('content-type'));
+end;
+
+procedure TClientTest.TestWithTextBodyKeepsExplicitContentType;
+var
+  Req: THttpRequest;
+begin
+  Req := WithTextBody(
+    THttpRequest.Create(hmPost, 'https://api.example/echo')
+      .WithHeader('content-type', 'text/csv'), 'a,b');
+  AssertEquals('explicit content-type preserved', 'text/csv',
+    Req.Headers.GetFirst('content-type'));
+end;
+
+procedure TClientTest.TestReadTextReturnsBody;
+var
+  Resp: IHttpResponse;
+begin
+  Resp := TFakeResponse.Create(200, TFakeBody.Create(BytesOf('plain text')));
+  AssertEquals('body as text', 'plain text', ReadText(Resp));
 end;
 
 procedure TClientTest.TestPoolNeverExceedsMaxConnections;

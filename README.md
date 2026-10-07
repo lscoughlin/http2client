@@ -69,11 +69,16 @@ start with `task validate`.
 task build
 ```
 
-The `build` task compiles all 13 library units into `bin/`. The output is the
+The `build` task compiles all 14 library units into `bin/`. The output is the
 `.ppu` and `.o` files for each unit. The task does not create a linked binary,
 because the library has no program of its own. To use the units in your own
 program, add `-Fu` for the `src` and `bin` directories. See the `FPCFLAGS`
 value in `Taskfile.yaml`.
+
+Thirteen units make up the core library. The fourteenth, `Http2.Readers.pas`,
+is optional: it adds JSON and XML helpers and is the only unit that depends on
+`fcl-json` or `fcl-xml`. Name it in your `uses` clause only when you need it.
+See [Examples](#examples).
 
 ## Test
 
@@ -82,7 +87,7 @@ task test
 ```
 
 The `test` task compiles the library and the unit suite. Then it runs the
-suite. The suite has 292 tests.
+suite. The suite has 315 tests.
 
 The suite uses `fpcunit` and a mock socket. It needs no network and no server.
 
@@ -223,11 +228,77 @@ Client := THttpClientFactory.Create
 For a test against a private certificate, use `WithCACertFile`.
 For a self-signed certificate, use `WithInsecureTls`.
 
+### Text, JSON, and XML helpers
+
+`WithTextBody` and `ReadText` live in `Http2.Client`:
+
+```pascal
+uses Http2.Client;
+
+Response := Client.Send(
+  WithTextBody(THttpRequest.Create(hmPost, Url), 'hello'));
+WriteLn(ReadText(Response));
+```
+
+JSON and XML live in the optional `Http2.Readers` unit. The read helpers
+parse the whole body and return an object **you own** (free it):
+
+```pascal
+uses fpjson, Http2.Client, Http2.Readers;
+
+Sent := TJSONObject.Create;
+Sent.Add('name', 'widget');
+Response := Client.Send(WithJsonBody(THttpRequest.Create(hmPost, Url), Sent));
+
+Got := ReadJsonObject(Response);   // TJSONObject, caller-owned
+try
+  WriteLn(Got.AsJSON);
+finally
+  Got.Free;
+end;
+```
+
+The same shape works for XML: `WithXmlBody` / `ReadXmlDocument`.
+`ReadJsonData` and the `TJsonReader<T>` class decode any `TJSONData`
+descendant (arrays, numbers, strings). A body that does not parse raises
+`EHttpProtocolError`, so a malformed response never leaks `EJSONParser` or
+`EXMLReadError`. The XML reader also accepts documents that declare
+`encoding="us-ascii"`, which `fcl-xml` rejects on its own.
+
+## Examples
+
+The `examples/` directory has five small programs. Build them all with:
+
+```sh
+make examples      # or: task examples
+```
+
+They compile into `bin/` and are not run by the build. Run one with the
+OpenSSL path set (`OPENSSL_LIBPATH` is required at runtime):
+
+```sh
+export OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib
+bin/basic_get      https://nghttp2.org/
+bin/post_text      https://nghttp2.org/httpbin/post
+bin/json_request   https://nghttp2.org/httpbin/post
+bin/xml_request    https://nghttp2.org/httpbin/xml
+bin/threaded_get   https://nghttp2.org/ 8 25
+```
+
+| Program | Shows |
+|---|---|
+| `basic_get.pas` | The factory, one GET, status/headers, `ReadText`. |
+| `post_text.pas` | `WithTextBody` streaming a plain text request body. |
+| `json_request.pas` | `WithJsonBody` + `ReadJsonObject` (`TJSONObject`). |
+| `xml_request.pas` | `WithXmlBody` + `ReadXmlDocument` (`TXMLDocument`). |
+| `threaded_get.pas` | Many threads sharing one client and its pool. |
+
 ## Project layout
 
 | Path | Content |
 |---|---|
 | `src/` | The library units. |
+| `examples/` | Five small, runnable programs. See [Examples](#examples). |
 | `test/` | The unit suite, the mock socket, and the `h2probe` CLI. |
 | `tools/validate/` | The interop, sanity, and harness scripts. |
 | `bin/` | The build output. |

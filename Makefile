@@ -4,6 +4,7 @@
 #
 #   make          build the library units
 #   make test     build + run the fpcunit suite
+#   make examples compile the example programs into bin/
 #   make clean    remove build outputs
 
 FPC        ?= fpc
@@ -18,9 +19,10 @@ export OPENSSL_LIBPATH
 FPCFLAGS   += -Fu$(MORMOT)/core -Fu$(MORMOT)/lib -Fu$(MORMOT)/net -Fu$(MORMOT)/crypt
 SRC        = $(wildcard src/*.pas)
 TESTSRC    = $(wildcard test/*.pas)
+EXAMPLESRC = $(wildcard examples/*.pas)
 BIN        = bin
 
-.PHONY: all test clean validate-interop validate-harness validate
+.PHONY: all test examples clean validate-interop validate-harness validate
 
 all: $(BIN)/libhttp2.a
 
@@ -34,8 +36,12 @@ test: all | $(BIN)
 	$(FPC) $(FPCFLAGS) -Fu./test -FE$(BIN) test/Http2.RunTests.pas
 	$(BIN)/Http2.RunTests --all --format=plain --sparse
 
+# Compile the example programs (smoke build; they are not executed here).
+examples: all | $(BIN)
+	for f in $(EXAMPLESRC); do $(FPC) $(FPCFLAGS) -FE$(BIN) $$f || exit 1; done
+
 clean:
-	rm -rf $(BIN) src/*.o src/*.ppu test/*.o test/*.ppu
+	rm -rf $(BIN) src/*.o src/*.ppu test/*.o test/*.ppu examples/*.o examples/*.ppu
 
 # S12 gates. validate-interop is the mandatory nghttpd TLS+ALPN gate;
 # validate-harness runs the 146-id h2-client-test-harness sweep (needs

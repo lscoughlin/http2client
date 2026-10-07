@@ -90,7 +90,7 @@ tasks:
       - '{{.DOCKER}} build -t {{.HARNESS_IMAGE}} {{.HARNESS_REPO}}'
 
   build:
-    desc: Compile the library units into bin/ (all 13 Http2 units)
+    desc: Compile the library units into bin/ (all 14 Http2 units)
     cmds:
       - mkdir -p {{.BIN}}
       - '{{.FPC}} {{.FPCFLAGS}} -Cn -FE{{.BIN}} src/Http2.pas'
@@ -98,6 +98,21 @@ tasks:
       - src/*.pas
     generates:
       - '{{.BIN}}/Http2.ppu'
+
+  examples:
+    desc: Compile the example programs into bin/ (smoke build, not run)
+    cmds:
+      - mkdir -p {{.BIN}}
+      - '{{.FPC}} {{.FPCFLAGS}} -FE{{.BIN}} examples/basic_get.pas'
+      - '{{.FPC}} {{.FPCFLAGS}} -FE{{.BIN}} examples/post_text.pas'
+      - '{{.FPC}} {{.FPCFLAGS}} -FE{{.BIN}} examples/json_request.pas'
+      - '{{.FPC}} {{.FPCFLAGS}} -FE{{.BIN}} examples/xml_request.pas'
+      - '{{.FPC}} {{.FPCFLAGS}} -FE{{.BIN}} examples/threaded_get.pas'
+    sources:
+      - src/*.pas
+      - examples/*.pas
+    generates:
+      - '{{.BIN}}/basic_get'
 
   test:
     desc: Build the library units and run the fpcunit suite
@@ -146,4 +161,4 @@ tasks:
   clean:
     desc: Remove build outputs
     cmds:
-      - rm -rf {{.BIN}} src/*.o src/*.ppu test/*.o test/*.ppu
+      - rm -rf {{.BIN}} src/*.o src/*.ppu test/*.o test/*.ppu examples/*.o examples/*.ppu

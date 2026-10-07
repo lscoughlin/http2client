@@ -222,3 +222,62 @@ Do not include connection-specific headers (`connection`, `keep-alive`,
 - Buffered vs. streamed is an explicit choice of reader: a buffering
   `IResponseReader<T>` reads to EOF then decodes; an incremental one decodes
   per chunk.
+
+## Text, JSON, and XML helpers
+
+Three convenience layers sit on top of the streaming API. They exist so the
+common "send a small body / read the whole body" case does not need a
+hand-rolled loop.
+
+**Base library (`Http2.Client`).**
+
+- `WithTextBody(ARequest, AText): THttpRequest` copies `AText` into the
+  request body **byte for byte** and sets `content-type: text/plain` when no
+  content-type is already present. It never overwrites an explicit
+  content-type.
+- `ReadText(AResponse): string` drains the response body to EOF and copies
+  the bytes **verbatim** — no charset sniffing, no transcoding. It is the
+  string counterpart of reading the raw `TBytes`.
+- `TResponseReader<T>` (see above) keeps its raw-passthrough semantics: a
+  `tkAString` type (which includes `UTF8String` on FPC 3.2.4) is decoded as
+  an `AnsiString` without conversion, a `tkDynArray` is read as `TBytes`, and
+  anything else is `memcpy`'d as `SizeOf(T)`. A reader that wants
+  interpretation must do it itself.
+
+**Optional readers (`Http2.Readers`).**
+
+This unit is *outside* the 13-unit core. It is the only unit with an
+`fcl-json`/`fcl-xml` dependency, so it is linked only when a caller names it
+in their `uses` clause.
+
+| Helper | Returns | Notes |
+|---|---|---|
+| `TJsonObjectReader` / `ReadJsonObject` | `TJSONObject` | rejects a non-object body |
+| `TJsonReader<T: TJSONData>` / `ReadJsonData` | `T` | any `TJSONData` descendant |
+| `TXmlDocumentReader` / `ReadXmlDocument` | `TXMLDocument` | accepts `us-ascii` declarations |
+
+- Every `Read` helper consumes the whole body to EOF.
+- The returned object is **caller-owned**; the helper never caches or frees
+  it.
+- A body that does not parse raises `EHttpProtocolError`
+  (`ecProtocolError`); the underlying `EJSONParser` / `EXMLReadError` is
+  caught and re-raised, never leaked.
+- The class forms expose a `Parse(const AText: string)` static function and a
+  `Read(const AResponse)` instance method, so the same reader works on a
+  string payload in a test or on a live response.
+- `TXmlDocumentReader` rewrites an `encoding="us-ascii"` (or `"ascii"`)
+  declaration to `utf-8` before parsing. `fcl-xml` rejects `us-ascii`, and
+  US-ASCII is a strict subset of UTF-8, so the rewrite is byte-safe. No other
+  declared encoding is touched, so `iso-8859-1` high bytes survive unchanged.
+
+**Send helpers (`Http2.Readers`).** These are pure request builders and never
+touch the network:
+
+- `WithJsonBody(ARequest, AData: TJSONData)` serializes `AData` (via
+  `AsJSON`) and defaults `content-type: application/json`.
+- `WithJsonText(ARequest, AJson)` attaches the string verbatim and applies
+  the same content-type default.
+- `WithXmlBody(ARequest, ADoc: TXMLDocument)` serializes the document and
+  defaults `content-type: application/xml`.
+
+Each respects an explicitly set content-type.

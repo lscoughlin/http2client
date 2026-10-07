@@ -105,7 +105,7 @@ IDE as a design-time package.
 | Fact | Value |
 |---|---|
 | Package name / type | `http2client`, `RunAndDesignTime`, `Version 0.14.0` |
-| Units | all 13 in `src/`, `Http2.pas` (umbrella) first |
+| Units | all 14 in `src/`, `Http2.pas` (umbrella) first; `Http2.Readers.pas` is the optional JSON/XML unit |
 | `OtherUnitFiles` | `src` + the four vendored mormot dirs (`core`, `lib`, `net`, `crypt`) |
 | `RequiredPkgs` | `FCL` **only** — deliberately **not** the IDE `mormot2` package (see below) |
 | Unit output | `lib/$(TargetCPU)-$(TargetOS)` (gitignored) |
@@ -152,7 +152,8 @@ lazbuild --opt=-Fu/tmp/lpkintf \
 
 Verified: `83049 lines compiled`, all 13 units produced `.ppu`/`.o` in
 `lib/aarch64-darwin/`. A stock Lazarus matched to its FPC would not need the
-`--opt` workaround.
+`--opt` workaround. (`Http2.Readers.pas` was added after that build; the count
+is now 14.)
 
 ## Prerequisites for a fresh clone (expanded)
 
