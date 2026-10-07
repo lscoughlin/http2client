@@ -173,6 +173,9 @@ type
     procedure TestResponseReaderDecodesRecord;
     // 09.5
     procedure TestPoolNeverExceedsMaxConnections;
+    procedure TestMaxConnectionsPerHostAndTotalAreIndependent;
+    procedure TestPoolNeverExceedsMaxConnectionsPerHost;
+    procedure TestPoolNeverExceedsMaxTotalConnections;
     procedure TestConcurrentSendAcrossOneConnection;
     // 09.6
     procedure TestLeastLoadedSelection;
@@ -701,7 +704,9 @@ var
   F: THttpClientFactory;
 begin
   F := THttpClientFactory.Create;
-  AssertEquals('MaxConnections default', 4, F.MaxConnections);
+  AssertEquals('MaxConnectionsPerHost default', 4, F.MaxConnectionsPerHost);
+  AssertEquals('MaxTotalConnections default', 32, F.MaxTotalConnections);
+  AssertEquals('MaxConnections alias', 4, F.MaxConnections);
   AssertEquals('MaxStreamsPerConnection default', 100,
     F.MaxStreamsPerConnection);
   AssertTrue('FollowRedirects default', F.FollowRedirects);
@@ -720,9 +725,15 @@ begin
   Base := THttpClientFactory.Create;
   Forked := Base.WithMaxConnections(8).WithFollowRedirects(False);
   AssertEquals('fork changed MaxConnections', 8, Forked.MaxConnections);
+  AssertEquals('fork changed MaxConnectionsPerHost', 8,
+    Forked.MaxConnectionsPerHost);
+  AssertEquals('fork changed MaxTotalConnections', 8,
+    Forked.MaxTotalConnections);
   AssertFalse('fork changed FollowRedirects', Forked.FollowRedirects);
   // the original is untouched
   AssertEquals('base MaxConnections unchanged', 4, Base.MaxConnections);
+  AssertEquals('base MaxTotalConnections unchanged', 32,
+    Base.MaxTotalConnections);
   AssertTrue('base FollowRedirects unchanged', Base.FollowRedirects);
   // chaining twice from one base yields independent records
   AssertEquals('base MaxStreams unchanged', 100, Base.MaxStreamsPerConnection);
@@ -849,6 +860,136 @@ begin
   AssertEquals('two streams fit the two slots', 2, Succeeded);
   AssertEquals('the rest wait and time out at the slot deadline', 4, TimedOut);
   AssertEquals('the waits time out with EHttpTimeout', 4, Timeouts);
+  for I := 0 to High(Workers) do
+    Workers[I].Free;
+  Client.Close;
+end;
+
+procedure TClientTest.TestMaxConnectionsPerHostAndTotalAreIndependent;
+var
+  Base, PerHost, Total, Legacy: THttpClientFactory;
+begin
+  Base := THttpClientFactory.Create;
+  // the two caps are set independently, so a high-concurrency caller can keep
+  // a large total while tightly bounding each authority
+  PerHost := Base.WithMaxConnectionsPerHost(1)
+    .WithMaxTotalConnections(64)
+    .WithMaxStreamsPerConnection(20);
+  AssertEquals('per-host cap set', 1, PerHost.MaxConnectionsPerHost);
+  AssertEquals('total cap set', 64, PerHost.MaxTotalConnections);
+  AssertEquals('stream cap set', 20, PerHost.MaxStreamsPerConnection);
+  // MaxConnectionsPerHost leaves the total alone
+  AssertEquals('the base total is unchanged', 32, Base.MaxTotalConnections);
+
+  Total := Base.WithMaxTotalConnections(8);
+  AssertEquals('total cap set', 8, Total.MaxTotalConnections);
+  AssertEquals('per-host cap untouched', 4, Total.MaxConnectionsPerHost);
+
+  // the legacy single setter pins both, which is right for a single authority
+  Legacy := Base.WithMaxConnections(6);
+  AssertEquals('WithMaxConnections sets the per-host cap', 6,
+    Legacy.MaxConnectionsPerHost);
+  AssertEquals('WithMaxConnections also sets the total', 6,
+    Legacy.MaxTotalConnections);
+end;
+
+procedure TClientTest.TestPoolNeverExceedsMaxConnectionsPerHost;
+var
+  Factory: TFakeSocketFactory;
+  Client: IHttpClient;
+  Pool: TConnectionPool;
+  Workers: array[0..3] of TSendWorker;
+  I, Succeeded, TimedOut, Timeouts: Integer;
+begin
+  Factory := TFakeSocketFactory.Create;
+  // hold every lease open (HEADERS only) so a slot occupied stays occupied
+  Factory.SetResponse('200', nil, False);
+  // one connection per host, but room for all four pool-wide: if the per-host
+  // cap were ignored, each host would open its second connection and the
+  // per-origin counts below would read 2
+  Client := THttpClientFactory.Create
+    .WithSocketFactory(Factory)
+    .WithMaxConnectionsPerHost(1)
+    .WithMaxTotalConnections(4)
+    .WithMaxStreamsPerConnection(1)
+    .WithHeaderTimeout(600)
+    .Build;
+  Pool := (Client as THttpClient).Pool;
+  Workers[0] := TSendWorker.Create(Client, 'https://a.example/x');
+  Workers[1] := TSendWorker.Create(Client, 'https://a.example/x');
+  Workers[2] := TSendWorker.Create(Client, 'https://b.example/x');
+  Workers[3] := TSendWorker.Create(Client, 'https://b.example/x');
+  for I := 0 to High(Workers) do
+    Workers[I].Start;
+  Succeeded := 0;
+  TimedOut := 0;
+  Timeouts := 0;
+  for I := 0 to High(Workers) do
+    AssertTrue('worker finished', Workers[I].WaitDone(5000));
+  for I := 0 to High(Workers) do
+  begin
+    if (not Workers[I].Raised) and (Workers[I].Status = 200) then
+      Inc(Succeeded)
+    else
+    begin
+      if Pos('timed out', Workers[I].Error) > 0 then
+        Inc(Timeouts);
+      Inc(TimedOut);
+    end;
+  end;
+  // one connection per host (2 total), each capped at a single stream
+  AssertEquals('one connection dialled per host', 2, Factory.Dials);
+  AssertEquals('the pool holds per-host + total connections', 2,
+    Pool.ConnectionCount);
+  AssertEquals('a.example opened exactly one connection', 1,
+    Pool.ConnectionCountForOrigin('a.example'));
+  AssertEquals('b.example opened exactly one connection', 1,
+    Pool.ConnectionCountForOrigin('b.example'));
+  AssertEquals('one stream fits each host slot', 2, Succeeded);
+  AssertEquals('the extra request per host waits and times out', 2, TimedOut);
+  AssertEquals('the waits time out with EHttpTimeout', 2, Timeouts);
+  for I := 0 to High(Workers) do
+    Workers[I].Free;
+  Client.Close;
+end;
+
+procedure TClientTest.TestPoolNeverExceedsMaxTotalConnections;
+var
+  Factory: TFakeSocketFactory;
+  Client: IHttpClient;
+  Pool: TConnectionPool;
+  Workers: array[0..1] of TSendWorker;
+  I, Succeeded, TimedOut: Integer;
+begin
+  Factory := TFakeSocketFactory.Create;
+  Factory.SetResponse('200', nil, False);
+  // a generous per-host cap but a total of one: the global resource budget
+  // must bind below the per-host cap
+  Client := THttpClientFactory.Create
+    .WithSocketFactory(Factory)
+    .WithMaxConnectionsPerHost(4)
+    .WithMaxTotalConnections(1)
+    .WithMaxStreamsPerConnection(1)
+    .WithHeaderTimeout(600)
+    .Build;
+  Pool := (Client as THttpClient).Pool;
+  Workers[0] := TSendWorker.Create(Client, 'https://a.example/x');
+  Workers[1] := TSendWorker.Create(Client, 'https://b.example/x');
+  for I := 0 to High(Workers) do
+    Workers[I].Start;
+  Succeeded := 0;
+  TimedOut := 0;
+  for I := 0 to High(Workers) do
+    AssertTrue('worker finished', Workers[I].WaitDone(5000));
+  for I := 0 to High(Workers) do
+    if (not Workers[I].Raised) and (Workers[I].Status = 200) then
+      Inc(Succeeded)
+    else
+      Inc(TimedOut);
+  AssertEquals('only one connection may exist pool-wide', 1, Factory.Dials);
+  AssertEquals('the pool reports its one connection', 1, Pool.ConnectionCount);
+  AssertEquals('one stream proceeds', 1, Succeeded);
+  AssertEquals('the second host waits and times out', 1, TimedOut);
   for I := 0 to High(Workers) do
     Workers[I].Free;
   Client.Close;

@@ -189,7 +189,8 @@ var
   Response: IHttpResponse;
 begin
   Client := THttpClientFactory.Create
-    .WithMaxConnections(8)
+    .WithMaxConnectionsPerHost(2)
+    .WithMaxTotalConnections(8)
     .WithMaxStreamsPerConnection(50)
     .WithFollowRedirects(False)
     .Build;

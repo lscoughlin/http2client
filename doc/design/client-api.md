@@ -12,7 +12,7 @@ related:
   - "[[architecture]]"
   - "[[messages]]"
   - "[[open-questions]]"
-updated: 2026-10-05
+updated: 2026-10-07
 ---
 
 # Client API
@@ -24,14 +24,16 @@ updated: 2026-10-05
 > `.WithFollowRedirects(follow=true)`, `.WithProxy(host,port)`, `.Build()`,
 > with the note that "when 4 leases go out it creates a new connection".
 > That last clause is wrong under the resolved model — see
-> [[architecture]]. It is recorded here because the per-connection caps in
-> this section are the replacement.
+> [[architecture]]. The connection cap was later split into a per-authority
+> cap and a pool-wide cap, because a high-concurrency client needs to bound
+> each host tightly while still allowing many hosts.
 
 ```pascal
 type
   THttpClientFactory = record
   private
-    FMaxConnections: Integer;
+    FMaxConnectionsPerHost: Integer;
+    FMaxTotalConnections: Integer;
     FMaxStreamsPerConnection: Integer;
     FFollowRedirects: Boolean;
     FMaxRedirects: Integer;
@@ -45,6 +47,8 @@ type
   public
     class function Create: THttpClientFactory; static;
     function WithMaxConnections(const AMax: Integer): THttpClientFactory;
+    function WithMaxConnectionsPerHost(const AMax: Integer): THttpClientFactory;
+    function WithMaxTotalConnections(const AMax: Integer): THttpClientFactory;
     function WithMaxStreamsPerConnection(const AMax: Integer): THttpClientFactory;
     function WithFollowRedirects(const AFollow: Boolean): THttpClientFactory;
     function WithMaxRedirects(const AMax: Integer): THttpClientFactory;
@@ -63,7 +67,8 @@ Defaults:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `MaxConnections` | `4` | concurrent TCP connections in the pool, all hosts combined |
+| `MaxConnectionsPerHost` | `4` | concurrent TCP connections to one authority (`host:port`) |
+| `MaxTotalConnections` | `32` | concurrent TCP connections across every authority combined |
 | `MaxStreamsPerConnection` | `100` | concurrent streams per connection offered to the peer |
 | `FollowRedirects` | `True` | automatic redirect handling (see [[errors-redirects]]) |
 | `MaxRedirects` | `10` | redirect chain limit before `EHttpTooManyRedirects` |
@@ -72,6 +77,27 @@ Defaults:
 | `IdleTimeoutMs` | `60000` | idle connection reap time |
 | `Http1Fallback` | `False` | allow HTTP/1.1 when the peer does not offer `h2`; see [[fallback]] |
 | `ClearTextPolicy` | `ctReject` | reject `http` origins; see [[fallback]] |
+
+Two connection caps apply, because a pool has two different budgets: a
+**per-authority** one (how many TCP connections may serve one `host:port`, a
+parallelism/reuse decision) and a **pool-wide** one (how many file descriptors
+and TLS states the client may hold in total, a resource decision).
+`MaxStreamsPerConnection` is the per-connection request cap and is applied on
+top of the peer's `SETTINGS_MAX_CONCURRENT_STREAMS` (whichever is smaller).
+
+RFC 9113 section 9.1 says a client *SHOULD NOT* open more than one HTTP/2
+connection to a given host and port, so `MaxConnectionsPerHost = 1` is the
+most conformant choice and is what a single-authority client wants. The
+default of `4` keeps headroom for a small number of connections to share the
+load; raise it only with a measurement. High-concurrency workloads that would
+rather open a few connections than expose very wide multiplexing should lower
+`MaxStreamsPerConnection` (say to `20`–`50`) and set
+`MaxConnectionsPerHost` in the `1`–`4` range, e.g. `WithMaxConnectionsPerHost(2)`
+with `WithMaxTotalConnections(128)`.
+
+`WithMaxConnections(max)` is retained as a compatibility shim: it sets **both**
+caps to `max`, which is the historic meaning for a single-authority pool.
+Prefer `WithMaxConnectionsPerHost` / `WithMaxTotalConnections`.
 
 `WithProxy(host, port)` routes every dial through an HTTP `CONNECT` tunnel
 to `host:port`; the tunnel is established on the plain socket, so TLS and
@@ -86,7 +112,8 @@ var
   Client: IHttpClient;
 begin
   Client := THttpClientFactory.Create
-    .WithMaxConnections(8)
+    .WithMaxConnectionsPerHost(2)
+    .WithMaxTotalConnections(8)
     .WithMaxStreamsPerConnection(50)
     .WithFollowRedirects(False)
     .Build;
@@ -125,8 +152,9 @@ releases them.
    eligible** connection — one that is open (or opening) and whose active
    stream count is below both `MaxStreamsPerConnection` and the peer's
    advertised `SETTINGS_MAX_CONCURRENT_STREAMS`.
-3. If none is eligible and the global connection count is below
-   `MaxConnections`, **open a new connection** for `Origin` and use it.
+3. If none is eligible and the origin count is below
+   `MaxConnectionsPerHost` and the pool count is below `MaxTotalConnections`,
+   **open a new connection** for `Origin` and use it.
 4. Otherwise **wait** for a slot to free (bounded by the configured
    timeouts, else `EHttpTimeout`).
 5. Allocate the next odd stream id on the chosen connection, build a

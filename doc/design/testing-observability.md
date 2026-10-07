@@ -27,5 +27,6 @@ updated: 2026-10-05
   receives connection open/close, stream open/close, frames in/out, window
   updates, retries, and discarded frames.
 - **Concurrency tests:** many threads calling `Send` against a slow
-  streaming server to prove `MaxConnections`/stream-cap accounting and that
-  backpressure throttles instead of buffering.
+  streaming server to prove per-host and pool-wide connection caps plus
+  stream-cap accounting, and that backpressure throttles instead of
+  buffering.

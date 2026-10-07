@@ -22,9 +22,9 @@ interfaces. Language claims are verified against FPC 3.2.4 — see
 ## Design model (resolved)
 
 A **lease is one HTTP/2 stream, not one TCP connection**. A single
-connection multiplexes many concurrent streams. `MaxConnections` caps
-concurrent **TCP connections** in the pool (all hosts combined);
-`MaxStreamsPerConnection` (and the peer's
+connection multiplexes many concurrent streams. `MaxConnectionsPerHost` caps
+concurrent **TCP connections to one authority** and `MaxTotalConnections` caps
+them **across all authorities**; `MaxStreamsPerConnection` (and the peer's
 `SETTINGS_MAX_CONCURRENT_STREAMS`) caps **concurrent requests**. This
 resolves the contradiction in the original sketch and the rest of the
 design depends on it. Details in [[architecture]].
@@ -63,7 +63,8 @@ var
   Response: IHttpResponse;
 begin
   Client := THttpClientFactory.Create
-    .WithMaxConnections(8)
+    .WithMaxConnectionsPerHost(2)
+    .WithMaxTotalConnections(8)
     .WithMaxStreamsPerConnection(50)
     .WithFollowRedirects(False)
     .Build;

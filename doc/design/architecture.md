@@ -27,15 +27,17 @@ depends on it:
 
 - **A lease is one HTTP/2 stream, not one TCP connection.** A single
   connection multiplexes many concurrent leases/streams.
-- **`MaxConnections` caps concurrent TCP connections in the pool**, across
-  all hosts combined — it is not a cap on in-flight requests.
+- **Two connection caps bound TCP connections**: `MaxConnectionsPerHost`
+  caps concurrent connections to one `host:port`, and `MaxTotalConnections`
+  caps them across all hosts combined. Neither is a cap on in-flight
+  requests.
 - **Concurrency of requests is bounded separately** by
   `MaxStreamsPerConnection` (and by the peer's advertised
   `SETTINGS_MAX_CONCURRENT_STREAMS`).
 - When a new lease is requested, the client reuses the least-loaded open
   connection for that `host:port` if it has a free stream slot; otherwise it
-  opens a new connection (until `MaxConnections`); otherwise the lease
-  waits.
+  opens a new connection (until `MaxConnectionsPerHost` /`MaxTotalConnections`);
+  otherwise the lease waits.
 
 ```
 THttpClient
@@ -46,7 +48,8 @@ THttpClient
  │       └─ Stream 5 <- Lease C  (GET /c)
  │     Conn2
  │       └─ Stream 1 <- Lease D
- └─ caps: MaxConnections (TCP), MaxStreamsPerConnection (streams)
+ └─ caps: MaxConnectionsPerHost (TCP per host), MaxTotalConnections (TCP pool),
+          MaxStreamsPerConnection (streams)
 ```
 
 ## Component diagram
@@ -57,7 +60,7 @@ THttpClientFactory (record, immutable)
         ▼
 IHttpClient ───────── owns ──────────► TConnectionPool
    │  Send(const ARequest: THttpRequest): IHttpResponse   TDictionary<string, TConnectionList>
-   │  lease acquisition                                   (bounded by FMaxConnections)
+   │  lease acquisition                                   (bounded by FMaxTotalConnections)
    ▼                                                           │
 TStreamLease (one stream) ─ attached to ─► IConnection ───────┘
    FStreamId                                     │ owns
@@ -73,7 +76,8 @@ Layering, top down:
 2. **`IHttpClient` / `THttpClient`** — public entry point, thread-safe,
    owns the pool, hands out leases. `Send` may be called concurrently.
 3. **`TConnectionPool`** — `TDictionary<string, TConnectionList>` guarded by
-   a `TCriticalSection`. Enforces the global `MaxConnections` budget.
+   a `TCriticalSection`. Enforces the per-host `MaxConnectionsPerHost` budget
+   and the global `MaxTotalConnections` budget.
 4. **`IConnection` / `TConnection`** — owns one socket, one background
    thread, and all connection-scoped HTTP/2 state (HPACK, settings, windows,
    stream-id counter). See [[transport]].

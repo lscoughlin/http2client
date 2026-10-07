@@ -124,8 +124,8 @@ this scope:
 
 HTTP/1.1 has no multiplexing. One connection carries one request at a time.
 For HTTP/1.1 origins the client sets the effective stream limit to 1. The
-pool opens more connections when it needs more concurrency. The
-`MaxConnections` cap still applies.
+pool opens more connections when it needs more concurrency, bounded by
+`MaxConnectionsPerHost` and `MaxTotalConnections` (doc/design/client-api.md).
 
 The codec reuses the public surface. `IHttpClient.Send` and
 `IHttpResponse` do not change. Redirects, timeouts, cancellation, and the

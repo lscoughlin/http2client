@@ -27,7 +27,16 @@ uses
 
 const
   /// documented factory defaults (doc/design/client-api.md "HttpClientFactory")
-  cDefaultMaxConnections          = 4;
+  ///
+  /// Two connection caps apply (doc/design/architecture.md "resolved model"):
+  /// MaxConnectionsPerHost is the reuse/parallelism budget for one authority
+  /// (RFC 9113 section 9.1 says a client SHOULD NOT open more than one, but a
+  /// small cap lets a small number of connections carry the load);
+  /// MaxTotalConnections bounds the file descriptors and TLS memory across
+  /// every origin.  MaxStreamsPerConnection is the per-connection request cap
+  /// and is applied on top of the peer's SETTINGS_MAX_CONCURRENT_STREAMS.
+  cDefaultMaxConnectionsPerHost   = 4;
+  cDefaultMaxTotalConnections     = 32;
   cDefaultMaxStreamsPerConnection = 100;
   cDefaultFollowRedirects         = True;
   cDefaultMaxRedirects            = 10;
@@ -46,7 +55,8 @@ const
   cDefaultHttp1Fallback           = False;
   /// an HTTP/1.1 connection carries one request at a time (doc/design/
   /// fallback.md "HTTP/1.1 codec"): the effective stream limit is 1, so the
-  /// pool opens more connections for concurrency, still capped by MaxConnections
+  /// pool opens more connections for concurrency, bounded per host by
+  /// MaxConnectionsPerHost and pool-wide by MaxTotalConnections
   cHttp1StreamLimit               = 1;
 
 type
@@ -177,7 +187,8 @@ type
   /// factory can be reused and forked without shared mutable state.
   THttpClientFactory = record
   private
-    FMaxConnections: Integer;
+    FMaxConnectionsPerHost: Integer;
+    FMaxTotalConnections: Integer;
     FMaxStreamsPerConnection: Integer;
     FFollowRedirects: Boolean;
     FMaxRedirects: Integer;
@@ -194,7 +205,14 @@ type
     FClearTextPolicy: TClearTextPolicy;
   public
     class function Create: THttpClientFactory; static;
+    /// compatibility shim: sets BOTH the per-host and the total cap to AMax,
+    /// so a single-authority pool keeps its historic meaning. Prefer the two
+    /// explicit setters below.
     function WithMaxConnections(const AMax: Integer): THttpClientFactory;
+    /// cap concurrent TCP connections to one authority (`host:port`)
+    function WithMaxConnectionsPerHost(const AMax: Integer): THttpClientFactory;
+    /// cap concurrent TCP connections across every authority combined
+    function WithMaxTotalConnections(const AMax: Integer): THttpClientFactory;
     function WithMaxStreamsPerConnection(const AMax: Integer): THttpClientFactory;
     function WithFollowRedirects(const AFollow: Boolean): THttpClientFactory;
     function WithMaxRedirects(const AMax: Integer): THttpClientFactory;
@@ -226,7 +244,10 @@ type
     function WithObserver(const AObserver: IHttp2Observer): THttpClientFactory;
     function Build: IHttpClient;
 
-    property MaxConnections: Integer read FMaxConnections;
+    /// compatibility alias for MaxConnectionsPerHost
+    property MaxConnections: Integer read FMaxConnectionsPerHost;
+    property MaxConnectionsPerHost: Integer read FMaxConnectionsPerHost;
+    property MaxTotalConnections: Integer read FMaxTotalConnections;
     property MaxStreamsPerConnection: Integer read FMaxStreamsPerConnection;
     property FollowRedirects: Boolean read FFollowRedirects;
     property MaxRedirects: Integer read FMaxRedirects;
@@ -427,13 +448,15 @@ type
 
   /// the connection pool (doc/design/client-api.md "Lease acquisition"):
   /// a TDictionary<string,TList<IPooledConnection>> guarded by a critical
-  /// section, with a global MaxConnections cap and per-origin reuse.
+  /// section, with a per-origin connection cap (MaxConnectionsPerHost), a
+  /// pool-wide cap (MaxTotalConnections) and per-origin reuse.
   TConnectionPool = class
   private
     FLock: TCriticalSection;
     FByOrigin: TDictionary<string, TList<IPooledConnection>>;
     FFactory: IHttp2SocketFactory;
-    FMaxConnections: Integer;
+    FMaxConnectionsPerHost: Integer;
+    FMaxTotalConnections: Integer;
     FMaxStreamsPerConnection: Integer;
     FConnectTimeoutMs: Integer;
     FHeaderTimeoutMs: Integer;
@@ -485,11 +508,14 @@ type
     procedure MarkUsed(const C: IPooledConnection);
     function ListFor(const AOrigin: string): TList<IPooledConnection>;
     function PickEligible(const AOrigin: string): IPooledConnection;
-    function CanOpenNew: Boolean;
+    /// can a new connection be opened for AOrigin? False when the origin is
+    /// already at MaxConnectionsPerHost, or the pool is at MaxTotalConnections.
+    function CanOpenNew(const AOrigin: string): Boolean;
     procedure Register(const AOrigin: string;
       const AConn: IPooledConnection);
   public
-    constructor Create(const AFactory: IHttp2SocketFactory; const AMaxConnections,
+    constructor Create(const AFactory: IHttp2SocketFactory;
+      const AMaxConnectionsPerHost, AMaxTotalConnections,
       AMaxStreamsPerConnection, AConnectTimeoutMs, AHeaderTimeoutMs,
       AIdleTimeoutMs: Integer; const AObserver: IHttp2Observer = nil;
       const AHttp1Fallback: Boolean = False;
@@ -503,7 +529,7 @@ type
       const ARequest: TStreamRequest; const AHeaderTimeoutMs: Integer;
       const AToken: ICancellationToken = nil): IHttpResponse;
     /// close and remove connections idle for longer than IdleTimeoutMs, so
-    /// the pool stays within MaxConnections (plan S10 task 10.7).
+    /// the pool stays within MaxTotalConnections (plan S10 task 10.7).
     procedure ReapIdle;
     procedure Close;
     // test seams
@@ -531,7 +557,8 @@ type
     function SendOnce(const ARequest: THttpRequest): IHttpResponse;
   public
     constructor Create(const AFactory: IHttp2SocketFactory;
-      const AMaxConnections, AMaxStreamsPerConnection: Integer;
+      const AMaxConnectionsPerHost, AMaxTotalConnections,
+      AMaxStreamsPerConnection: Integer;
       const AFollowRedirects: Boolean; const AMaxRedirects,
       AConnectTimeoutMs, AHeaderTimeoutMs, AIdleTimeoutMs: Integer;
       const AObserver: IHttp2Observer = nil;
@@ -1206,7 +1233,8 @@ end;
 
 class function THttpClientFactory.Create: THttpClientFactory;
 begin
-  Result.FMaxConnections := cDefaultMaxConnections;
+  Result.FMaxConnectionsPerHost := cDefaultMaxConnectionsPerHost;
+  Result.FMaxTotalConnections := cDefaultMaxTotalConnections;
   Result.FMaxStreamsPerConnection := cDefaultMaxStreamsPerConnection;
   Result.FFollowRedirects := cDefaultFollowRedirects;
   Result.FMaxRedirects := cDefaultMaxRedirects;
@@ -1227,7 +1255,22 @@ function THttpClientFactory.WithMaxConnections(
   const AMax: Integer): THttpClientFactory;
 begin
   Result := Self;
-  Result.FMaxConnections := AMax;
+  Result.FMaxConnectionsPerHost := AMax;
+  Result.FMaxTotalConnections := AMax;
+end;
+
+function THttpClientFactory.WithMaxConnectionsPerHost(
+  const AMax: Integer): THttpClientFactory;
+begin
+  Result := Self;
+  Result.FMaxConnectionsPerHost := AMax;
+end;
+
+function THttpClientFactory.WithMaxTotalConnections(
+  const AMax: Integer): THttpClientFactory;
+begin
+  Result := Self;
+  Result.FMaxTotalConnections := AMax;
 end;
 
 function THttpClientFactory.WithMaxStreamsPerConnection(
@@ -1339,10 +1382,10 @@ end;
 
 function THttpClientFactory.Build: IHttpClient;
 begin
-  Result := THttpClient.Create(FSocketFactory, FMaxConnections,
-    FMaxStreamsPerConnection, FFollowRedirects, FMaxRedirects,
-    FConnectTimeoutMs, FHeaderTimeoutMs, FIdleTimeoutMs, FObserver,
-    FHttp1Fallback, FClearTextPolicy);
+  Result := THttpClient.Create(FSocketFactory, FMaxConnectionsPerHost,
+    FMaxTotalConnections, FMaxStreamsPerConnection, FFollowRedirects,
+    FMaxRedirects, FConnectTimeoutMs, FHeaderTimeoutMs, FIdleTimeoutMs,
+    FObserver, FHttp1Fallback, FClearTextPolicy);
 end;
 
 { TGuardedBody }
@@ -1869,9 +1912,9 @@ end;
 { TConnectionPool }
 
 constructor TConnectionPool.Create(const AFactory: IHttp2SocketFactory;
-  const AMaxConnections, AMaxStreamsPerConnection, AConnectTimeoutMs,
-  AHeaderTimeoutMs, AIdleTimeoutMs: Integer;
-  const AObserver: IHttp2Observer;
+  const AMaxConnectionsPerHost, AMaxTotalConnections,
+  AMaxStreamsPerConnection, AConnectTimeoutMs, AHeaderTimeoutMs,
+  AIdleTimeoutMs: Integer; const AObserver: IHttp2Observer;
   const AHttp1Fallback: Boolean; const AClearTextPolicy: TClearTextPolicy);
 begin
   inherited Create;
@@ -1880,7 +1923,8 @@ begin
   FIdleSince := TDictionary<Pointer, QWord>.Create;
   FFactory := AFactory;
   FObserver := AObserver;
-  FMaxConnections := AMaxConnections;
+  FMaxConnectionsPerHost := AMaxConnectionsPerHost;
+  FMaxTotalConnections := AMaxTotalConnections;
   FMaxStreamsPerConnection := AMaxStreamsPerConnection;
   FConnectTimeoutMs := AConnectTimeoutMs;
   FHeaderTimeoutMs := AHeaderTimeoutMs;
@@ -1992,9 +2036,11 @@ begin
   end;
 end;
 
-function TConnectionPool.CanOpenNew: Boolean;
+function TConnectionPool.CanOpenNew(const AOrigin: string): Boolean;
 begin
-  Result := (not FClosed) and (FTotalConnections < FMaxConnections);
+  Result := (not FClosed) and
+            (ListFor(AOrigin).Count < FMaxConnectionsPerHost) and
+            (FTotalConnections < FMaxTotalConnections);
 end;
 
 function TConnectionPool.DialFor(const AHost: string; const APort: Word;
@@ -2226,7 +2272,7 @@ begin
       ReapClosed;
       ReapIdleLocked;
       Conn := PickEligible(AOrigin);
-      if (Conn = nil) and CanOpenNew then
+      if (Conn = nil) and CanOpenNew(AOrigin) then
       begin
         // the one transport-selection point: TLS vs cleartext and the HTTP/2
         // vs HTTP/1.1 codec (doc/design/fallback.md "Negotiation")
@@ -2281,7 +2327,8 @@ begin
         raise EHttpConnectionClosed.Create('client is closed');
       if GetTickCount64 >= Deadline then
         raise EHttpTimeout.Create(
-          'timed out waiting for a connection slot (MaxConnections reached)');
+          'timed out waiting for a connection slot ' +
+          '(MaxConnectionsPerHost or MaxTotalConnections reached)');
       Sleep(2);
     end;
   end;
@@ -2381,7 +2428,8 @@ end;
 { THttpClient }
 
 constructor THttpClient.Create(const AFactory: IHttp2SocketFactory;
-  const AMaxConnections, AMaxStreamsPerConnection: Integer;
+  const AMaxConnectionsPerHost, AMaxTotalConnections,
+  AMaxStreamsPerConnection: Integer;
   const AFollowRedirects: Boolean; const AMaxRedirects, AConnectTimeoutMs,
   AHeaderTimeoutMs, AIdleTimeoutMs: Integer;
   const AObserver: IHttp2Observer;
@@ -2389,9 +2437,10 @@ constructor THttpClient.Create(const AFactory: IHttp2SocketFactory;
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
-  FPool := TConnectionPool.Create(AFactory, AMaxConnections,
-    AMaxStreamsPerConnection, AConnectTimeoutMs, AHeaderTimeoutMs,
-    AIdleTimeoutMs, AObserver, AHttp1Fallback, AClearTextPolicy);
+  FPool := TConnectionPool.Create(AFactory, AMaxConnectionsPerHost,
+    AMaxTotalConnections, AMaxStreamsPerConnection, AConnectTimeoutMs,
+    AHeaderTimeoutMs, AIdleTimeoutMs, AObserver, AHttp1Fallback,
+    AClearTextPolicy);
   FFollowRedirects := AFollowRedirects;
   FMaxRedirects := AMaxRedirects;
   FHeaderTimeoutMs := AHeaderTimeoutMs;
