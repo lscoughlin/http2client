@@ -36,6 +36,11 @@ var
   GParallel: Integer;
   GBodySet: Boolean;
   GBodyWriterSet: Boolean;
+  /// A.14 flow-control case: synthesise an N-byte upload body instead of
+  /// taking it from the command line, so the body can far exceed the peer's
+  /// advertised window without being typed out
+  GUploadBytes: Integer;
+  GUploadChunk: Integer;
   GTraceFrames: Boolean;
   /// S13: cleartext policy for an http:// URL (default ctReject)
   GClearTextPolicy: TClearTextPolicy;
@@ -58,7 +63,8 @@ begin
   WriteLn(StdErr, 'h2probe: ', AMessage);
   WriteLn(StdErr,
     'usage: h2probe --url=<https-url> [--insecure] [--method=GET] ' +
-    '[--body=...] [--timeout-ms=N] [--keep-open-ms=N] [--parallel=N]');
+    '[--body=...] [--body-writer=...] [--upload-bytes=N] ' +
+    '[--upload-chunk=N] [--timeout-ms=N] [--keep-open-ms=N] [--parallel=N]');
   Halt(ExitCodeOf(poUsage));
 end;
 
@@ -72,6 +78,8 @@ begin
   GBody := '';
   GBodySet := False;
   GBodyWriterSet := False;
+  GUploadBytes := 0;
+  GUploadChunk := 7;
   GInsecure := False;
   GTraceFrames := False;
   GClearTextPolicy := ctReject;
@@ -118,6 +126,17 @@ begin
       GBodySet := True;
       GBodyWriterSet := True;
     end
+    else if Name = '--upload-bytes' then
+    begin
+      GUploadBytes := StrToIntDef(Value, 0);
+      if GUploadBytes < 0 then
+        GUploadBytes := 0;
+      GBodySet := True;
+      GBodyWriterSet := True;
+      GBody := '';
+    end
+    else if Name = '--upload-chunk' then
+      GUploadChunk := StrToIntDef(Value, 7)
     else if Name = '--timeout-ms' then
       GTimeoutMs := StrToIntDef(Value, cDefaultTimeoutMs)
     else if Name = '--keep-open-ms' then
@@ -176,6 +195,9 @@ type
     FPos: Integer;
   public
     constructor Create(const AData: string; const AChunk: Integer);
+    /// generate ACount bytes on the fly; used by the flow-control case so a
+    /// body far larger than the peer's window never has to be typed out
+    constructor CreateSynthetic(const ACount: Integer; const AChunk: Integer);
     function NextChunk(out ABuffer: TBytes): Boolean;
   end;
 
@@ -183,6 +205,20 @@ constructor TChunkWriter.Create(const AData: string; const AChunk: Integer);
 begin
   inherited Create;
   FData := TEncoding.UTF8.GetBytes(AData);
+  FChunk := AChunk;
+  if FChunk < 1 then
+    FChunk := 1;
+  FPos := 0;
+end;
+
+constructor TChunkWriter.CreateSynthetic(const ACount: Integer;
+  const AChunk: Integer);
+begin
+  inherited Create;
+  FData := nil;
+  SetLength(FData, ACount);
+  if ACount > 0 then
+    FillChar(FData[0], ACount, Ord('x'));
   FChunk := AChunk;
   if FChunk < 1 then
     FChunk := 1;
@@ -268,7 +304,11 @@ begin
   Request := Request.WithHeader('user-agent', 'http2client-h2probe');
   if ABodySet then
   begin
-    if GBodyWriterSet then
+    if GUploadBytes > 0 then
+      Request := Request.WithBodyWriter(
+        TChunkWriter.CreateSynthetic(GUploadBytes,
+          GUploadChunk))
+    else if GBodyWriterSet then
       Request := Request.WithBodyWriter(TChunkWriter.Create(ABody, 7))
     else
       Request := Request.WithBody(THttpBody.FromString(ABody));

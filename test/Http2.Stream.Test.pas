@@ -244,6 +244,12 @@ begin
   AAlloc := TStreamIdAllocator.Create;
   ALease := TStreamLease.Create(AConn, AAlloc, ARequest);
   AIL := ALease;                       // caller-held reference keeps it alive
+  // in production a lease sends no DATA before the peer has sent its SETTINGS,
+  // so DATA knows the peer's INITIAL_WINDOW_SIZE (RFC 9113 section 6.5.3).
+  // The credit gate in AcquireSendCredit withholds DATA until then. Re-apply
+  // the connection's current peer settings (a zero delta) so a test that set
+  // them beforehand, e.g. a tiny MaxFrameSize, is not clobbered.
+  AConn.ApplyPeerSettingsValue(AConn.PeerSettings);
   Result := True;
 end;
 

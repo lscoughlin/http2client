@@ -192,6 +192,8 @@ implementation
 { TFakeServerSocket }
 
 constructor TFakeServerSocket.Create;
+var
+  F: TFrame;
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
@@ -203,6 +205,10 @@ begin
   FConnectTimeoutMs := 1000;
   FReadTimeoutMs := 1000;
   FWriteTimeoutMs := 1000;
+  // a real server sends its own SETTINGS as its first frame; the client must
+  // apply it before it may send DATA, so seed it for the very first read
+  F := BuildSettingsFrame(TConnectionSettings.Defaults);
+  FIn := FrameBytes(F);
 end;
 
 destructor TFakeServerSocket.Destroy;

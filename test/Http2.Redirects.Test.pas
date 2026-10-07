@@ -222,6 +222,9 @@ begin
   FSpecs := ASpecs;
   FSpecIdx := 0;
   FReqByStream := TDictionary<LongWord, Integer>.Create;
+  // a real server sends its own SETTINGS first; the client must apply it
+  // before it may send DATA, so seed it for the first read
+  FIn := FIn + FrameBytes(BuildSettingsFrame(TConnectionSettings.Defaults));
 end;
 
 destructor TFakeFrameSocket.Destroy;

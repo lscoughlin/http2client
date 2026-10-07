@@ -531,6 +531,9 @@ begin
   FStatus := AStatus;
   FBody := ABody;
   FEndStream := True;
+  // a real server sends its own SETTINGS first; the client must apply it
+  // before it may send DATA, so seed it for the first read
+  AppendInLocked(FrameBytes(BuildSettingsFrame(TConnectionSettings.Defaults)));
 end;
 
 destructor TFramePeer.Destroy;

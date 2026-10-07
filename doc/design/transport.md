@@ -116,8 +116,13 @@ One thread per connection, responsible for *both* directions:
 1. **Create.** Dial TCP, then TLS negotiating ALPN `h2`. On negotiated `h2`,
    write the connection preface: the client magic
    `PRI * HTTP/2.0` + CRLF + CRLF + `SM` + CRLF + CRLF, then a `SETTINGS`
-   frame. The connection can open streams once the peer's `SETTINGS` is
-   received and ours is `ACK`ed.
+   frame. The connection can open streams as soon as the preface is written:
+   a request may send `HEADERS` immediately, since HEADERS is not
+   flow-controlled. `DATA`, however, is withheld until the peer's `SETTINGS`
+   is received and applied, because only then is
+   `SETTINGS_INITIAL_WINDOW_SIZE` known — the default is 65535, but a peer
+   may lower it, and emitting DATA first would overrun its window
+   (RFC 9113 section 6.5.3: `FLOW_CONTROL_ERROR`).
 2. **Steady state.** Serve streams; maintain HPACK tables, settings, and
    windows.
 3. **Keep-alive.** Idle connections may be probed with `PING` and closed

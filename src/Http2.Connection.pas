@@ -139,6 +139,12 @@ type
     FLocalSettings: TConnectionSettings;
     FPeerSettings: TConnectionSettings;
     FSettingsAcked: Boolean;
+    /// True once the peer's own SETTINGS frame has been applied, so that
+    /// InitialWindowSize is known. DATA may not be emitted before that
+    /// (RFC 9113 section 6.5.3: a peer may lower the initial window below the
+    /// 65535 default, and overrunning it is a FLOW_CONTROL_ERROR). HEADERS
+    /// are not flow-controlled and may still be sent immediately.
+    FPeerSettingsReceived: Boolean;
     FGoAwayLastStreamId: LongWord;
     FHighestStreamId: LongWord;
     FError: string;
@@ -155,6 +161,14 @@ type
     FPendingStreamCredit: TDictionary<LongWord, LongWord>;
     /// connection bytes received since the last connection WINDOW_UPDATE
     FPendingConnCredit: LongWord;
+    /// set whenever send credit may have become available (an inbound
+    /// WINDOW_UPDATE, a SETTINGS_INITIAL_WINDOW_SIZE change) or the
+    /// connection ended, so a sender parked on a starved window wakes at
+    /// once instead of sleeping out its poll interval
+    FSendCreditEvent: PRTLEvent;
+    /// senders currently parked on FSendCreditEvent; RTLEventSetEvent wakes
+    /// exactly one waiter, so the waker must signal once per parked sender
+    FSendCreditWaiters: Integer;
     function GetState: TConnectionState;
     function GetPeerSettings: TConnectionSettings;
     procedure SetState(const AValue: TConnectionState);
@@ -182,6 +196,11 @@ type
       const ALength: LongWord);
     /// emit any still-pending WINDOW_UPDATEs (e.g. when a stream ends)
     procedure FlushStreamCredit(const AStreamId: LongWord);
+    /// apply an inbound WINDOW_UPDATE to SEND-side credit (RFC 9113 section
+    /// 6.9) and wake any sender starved on this window
+    procedure ApplyWindowUpdate(const AStreamId, AIncrement: LongWord);
+    /// release every sender parked on FSendCreditEvent
+    procedure WakeSendCredit;
   public
     constructor Create(const ASocket: IHttp2Socket); overload;
     constructor Create(const ASocket: IHttp2Socket;
@@ -198,6 +217,17 @@ type
     property FlowControl: TFlowControl read FFlowControl;
     /// emit a WINDOW_UPDATE for AStreamId now, returning any pending credit
     procedure SendWindowUpdate(const AStreamId: LongWord);
+    /// block until the peer grants SEND credit on AStreamId, then reserve up
+    /// to AMax bytes of it and return the amount reserved. Returns 0 only
+    /// when ATimeoutMs expires with no credit. Raises EHttpConnectionClosed
+    /// (or the recorded connection error) if the connection ends while
+    /// blocked, so a caller can never hang past its deadline.
+    // - RFC 9113 section 6.9: a sender must not exceed either the connection
+    //   or the stream window and waits for WINDOW_UPDATE when either is
+    //   exhausted. Callers must treat a zero-length END_STREAM frame as
+    //   exempt: it carries no flow-controlled bytes
+    function AcquireSendCredit(const AStreamId: LongWord; const AMax: LongWord;
+      const ATimeoutMs: Integer): LongWord;
     /// may a new stream still be opened on this connection?
     function CanOpenStream: Boolean;
     /// RFC 7540 section 6.8: after GOAWAY, a stream with an id strictly above
@@ -631,12 +661,13 @@ begin
     // the switch above ignores, then keep the original routing unchanged
     if AFrame.Header.FrameType = ftWindowUpdate then
     begin
-      try
-        Increment := ParseWindowUpdate(AFrame);
-        TConnection(FConn).EmitWindowUpdate(AFrame.Header.StreamId, Increment);
-      except
-        // a malformed WINDOW_UPDATE is left to the normal error path
-      end;
+      // ValidateFrame already rejected a zero increment and a bad payload
+      // length, so ParseWindowUpdate cannot fail here. Apply the credit: this
+      // is what lets a sender starved on the peer's window resume
+      // (RFC 9113 section 6.9)
+      Increment := ParseWindowUpdate(AFrame);
+      TConnection(FConn).ApplyWindowUpdate(AFrame.Header.StreamId, Increment);
+      TConnection(FConn).EmitWindowUpdate(AFrame.Header.StreamId, Increment);
     end;
     if not IsKnownFrameType(AFrame.Header.FrameType) then
       TConnection(FConn).EmitDiscarded(AFrame,
@@ -651,8 +682,16 @@ begin
       TConnection(FConn).TrackReceivedData(AFrame.Header.StreamId,
         AFrame.DataLength);
     // route stream-scoped frames to their owning lease; anything unclaimed
-    // (no lease registered yet) stays on the shared inbound queue
-    if AFrame.Header.StreamId <> 0 then
+    // (no lease registered yet) stays on the shared inbound queue.
+    // A stream WINDOW_UPDATE is deliberately NOT dispatched: it has already
+    // been consumed above as a send-credit signal (ApplyWindowUpdate), the
+    // lease discards it anyway (HandleInboundFrame), and forwarding it would
+    // let replenishments pile up in a lease queue that is not drained until
+    // the request body has been fully sent -- blocking this reader (the only
+    // thread that can apply further credit) and deadlocking the upload.
+    // Stream 0 WINDOW_UPDATE never reaches here, so this restores symmetry.
+    if (AFrame.Header.StreamId <> 0) and
+       (AFrame.Header.FrameType <> ftWindowUpdate) then
     begin
       if not TConnection(FConn).DispatchStreamFrame(AFrame) then
         FInbound.Push(AFrame);
@@ -732,6 +771,8 @@ begin
   inherited Create;
   FLock := TCriticalSection.Create;
   FStateEvent := RTLEventCreate;
+  FSendCreditEvent := RTLEventCreate;
+  FSendCreditWaiters := 0;
   FSocket := ASocket;
   FOutbound := TBlockingQueue<TFrame>.Create(cDefaultQueueCapacity);
   FInbound := TBlockingQueue<TFrame>.Create(cDefaultQueueCapacity);
@@ -739,6 +780,7 @@ begin
   FPeerSettings := TConnectionSettings.Defaults;
   FState := csOpening;
   FSettingsAcked := False;
+  FPeerSettingsReceived := False;
   FGoAwayLastStreamId := MaxStreamId;
   FHighestStreamId := 0;
   FError := '';
@@ -765,6 +807,7 @@ begin
   FreeAndNil(FFlowControl);
   FreeAndNil(FStreams);
   RTLEventDestroy(FStateEvent);
+  RTLEventDestroy(FSendCreditEvent);
   FLock.Free;
   inherited Destroy;
 end;
@@ -814,6 +857,9 @@ end;
 
 function TConnection.CanOpenStream: Boolean;
 begin
+  // opening a stream only needs the connection to be open: a request may send
+  // HEADERS immediately. DATA is gated separately in AcquireSendCredit until
+  // the peer's SETTINGS_INITIAL_WINDOW_SIZE is known (RFC 9113 section 6.5.3)
   Result := GetState = csOpen;
 end;
 
@@ -875,6 +921,9 @@ begin
     FLock.Release;
   end;
   RTLEventSetEvent(FStateEvent);
+  // a sender parked on send credit must not outlive the state it waited on
+  if AValue in [csGoAway, csClosed] then
+    WakeSendCredit;
 end;
 
 procedure TConnection.MarkSettingsAcked;
@@ -897,11 +946,15 @@ begin
     // a SETTINGS_INITIAL_WINDOW_SIZE change adjusts every open stream window
     Delta := ASettings.InitialWindowSize - FPeerSettings.InitialWindowSize;
     FPeerSettings := ASettings;
+    FPeerSettingsReceived := True;
     if Delta <> 0 then
       FFlowControl.ApplyInitialWindowDelta(Delta);
   finally
     FLock.Release;
   end;
+  // wake every sender: a raised window grants credit, and a sender parked only
+  // because the peer's SETTINGS had not arrived is now unblocked
+  WakeSendCredit;
 end;
 
 procedure TConnection.MarkGoAway(const ALastStreamId: LongWord);
@@ -919,6 +972,7 @@ begin
     FLock.Release;
   end;
   RTLEventSetEvent(FStateEvent);
+  WakeSendCredit;
   EmitGoAway(ALastStreamId, ecNoError);
   // notify OUTSIDE the lock: a lease must never call back into TConnection
   // (RegisterStream/UnregisterStream) while we hold FLock, or it deadlocks
@@ -1018,6 +1072,7 @@ begin
     FLock.Release;
   end;
   RTLEventSetEvent(FStateEvent);
+  WakeSendCredit;
   // fail every in-flight stream and release every blocked waiter
   FOutbound.Shutdown;
   FInbound.Shutdown;
@@ -1111,6 +1166,126 @@ end;
 procedure TConnection.FlushStreamCredit(const AStreamId: LongWord);
 begin
   SendWindowUpdate(AStreamId);
+end;
+
+procedure TConnection.ApplyWindowUpdate(const AStreamId,
+  AIncrement: LongWord);
+begin
+  // ParseWindowUpdate has already rejected a zero increment (ValidateFrame
+  // runs first), so the only failure left is a window that overflows past
+  // 2^31-1. A stream-scoped overflow is a stream error (RST_STREAM); a
+  // connection-scoped one is a connection error (RFC 9113 section 6.9.1).
+  FLock.Acquire;
+  try
+    if AStreamId = 0 then
+    begin
+      try
+        FFlowControl.ApplyConnectionUpdate(AIncrement);
+      except
+        on E: EHttpError do
+          raise EHttpConnectionError.Create(E.Message, E.ErrorCode);
+      end;
+    end
+    else
+    begin
+      try
+        FFlowControl.ApplyStreamUpdate(AStreamId, AIncrement);
+      except
+        on E: EHttpError do
+          raise EHttpStreamError.Create(E.Message, AStreamId, E.ErrorCode);
+      end;
+    end;
+  finally
+    FLock.Release;
+  end;
+  // wake senders starved on the window this update just grew. Done outside
+  // the lock: the parked sender only reads the window after re-acquiring it.
+  WakeSendCredit;
+end;
+
+procedure TConnection.WakeSendCredit;
+var
+  Waiters: Integer;
+begin
+  // RTLEventSetEvent releases EXACTLY ONE waiter and then auto-resets (it is
+  // not a sticky flag), so signal once per parked sender. Reading the count
+  // under FLock is what makes this lossless: a sender registers itself while
+  // still holding FLock, so a wake that runs after the count is read either
+  // sees the new waiter or the waiter sees the credit it was woken for.
+  FLock.Acquire;
+  try
+    Waiters := FSendCreditWaiters;
+  finally
+    FLock.Release;
+  end;
+  while Waiters > 0 do
+  begin
+    RTLEventSetEvent(FSendCreditEvent);
+    Dec(Waiters);
+  end;
+end;
+
+function TConnection.AcquireSendCredit(const AStreamId: LongWord;
+  const AMax: LongWord; const ATimeoutMs: Integer): LongWord;
+var
+  Deadline: QWord;
+  Remaining: Integer;
+  Granted: LongWord;
+  Win: TWindow;
+begin
+  Deadline := GetTickCount64 + QWord(ATimeoutMs);
+  while True do
+  begin
+    FLock.Acquire;
+    try
+      // an ended connection can never grant credit again; surface the real
+      // reason rather than sleeping out the deadline
+      if FClosed or (FState = csClosed) then
+        if FError <> '' then
+          raise EHttpConnectionError.Create(FError, FErrorCode)
+        else
+          raise EHttpConnectionClosed.Create(
+            'connection closed while waiting for send credit');
+      // Reserve min(connection window, stream window, room left in this
+      // frame). TryConsume is the atomic check-and-decrement across BOTH
+      // windows (it leaves them untouched when either lacks credit), so a
+      // stream starved on its own window never eats the connection window.
+      Granted := 0;
+      // RFC 9113 section 6.5.3: do not emit DATA before the peer's SETTINGS
+      // has set INITIAL_WINDOW_SIZE, or a lowered window would be overrun
+      // (FLOW_CONTROL_ERROR). Treat that as "no credit yet": the sender parks
+      // and ApplyPeerSettingsValue wakes it once the settings are applied.
+      if FPeerSettingsReceived and FFlowControl.TryGetStream(AStreamId, Win) then
+      begin
+        Granted := AMax;
+        if LongWord(FFlowControl.Connection.Size) < Granted then
+          Granted := LongWord(FFlowControl.Connection.Size);
+        if LongWord(Win.Size) < Granted then
+          Granted := LongWord(Win.Size);
+        if (Granted > 0) and FFlowControl.TryConsume(AStreamId, Granted) then
+          Exit(Granted);
+      end;
+      // No credit. Register as a waiter BEFORE releasing FLock: a
+      // WINDOW_UPDATE that lands from here on will count us and signal, so no
+      // wakeup can be lost between this check and the wait below
+      Inc(FSendCreditWaiters);
+    finally
+      FLock.Release;
+    end;
+    try
+      if GetTickCount64 >= Deadline then
+        Exit(0);
+      Remaining := Integer(Deadline - GetTickCount64);
+      RTLEventWaitFor(FSendCreditEvent, Remaining);
+    finally
+      FLock.Acquire;
+      try
+        Dec(FSendCreditWaiters);
+      finally
+        FLock.Release;
+      end;
+    end;
+  end;
 end;
 
 { observer fan-out }

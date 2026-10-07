@@ -178,6 +178,10 @@ type
     FTimeoutMs: Integer;
 
     function MaxFrameSize: LongWord;
+    /// reserve up to AWant bytes of the peer's SEND window for this stream,
+    /// blocking until credit arrives or the lease deadline expires. Raises
+    /// EHttpTimeout on expiry so a stalled send fails instead of hanging.
+    function AcquireCredit(const AWant: LongWord): LongWord;
     function MakeStreamError: EHttpError;
     procedure BuildRequestHeaderBlock(out ABlock: THeaderBlock);
     procedure EmitHeaderBlock(const ABlock: TBytes; const AEndStream: Boolean);
@@ -489,6 +493,15 @@ begin
     Result := DefaultMaxFrameSize;
 end;
 
+function TStreamLease.AcquireCredit(const AWant: LongWord): LongWord;
+begin
+  Result := FConnection.AcquireSendCredit(FStreamId, AWant, FTimeoutMs);
+  if Result = 0 then
+    raise EHttpTimeout.CreateFmt(
+      'timed out after %d ms waiting for flow-control credit on stream %d',
+      [FTimeoutMs, FStreamId]);
+end;
+
 function TStreamLease.MakeStreamError: EHttpError;
 var
   Msg: string;
@@ -587,21 +600,29 @@ end;
 procedure TStreamLease.EmitData(const AData: TBytes;
   const AEndStream: Boolean);
 var
-  Max, Ofs, N: Integer;
+  Ofs, N: Integer;
+  Want: LongWord;
   Chunk: TBytes;
 begin
-  Max := Integer(MaxFrameSize);
   if Length(AData) = 0 then
   begin
+    // a zero-length DATA frame carries no flow-controlled bytes, so it must
+    // NOT consume credit: this is how EndSend half-closes a stream whose
+    // window the peer has pinned at zero
     FOutbound.Push(BuildDataFrame(FStreamId, nil, AEndStream));
     Exit;
   end;
   Ofs := 0;
   while Ofs < Length(AData) do
   begin
+    // RFC 9113 section 6.9: never send more than the peer's window permits.
+    // Split on whichever is smaller, the frame size or the credit now
+    // available, and block here until the peer grants more.
+    Want := MaxFrameSize;
     N := Length(AData) - Ofs;
-    if N > Max then
-      N := Max;
+    if LongWord(N) < Want then
+      Want := LongWord(N);
+    N := Integer(AcquireCredit(Want));
     Chunk := Copy(AData, Ofs, N);
     Inc(Ofs, N);
     FOutbound.Push(BuildDataFrame(FStreamId, Chunk,

@@ -1866,6 +1866,10 @@ begin
   end;
   // the mock answers the client preface + SETTINGS and every request HEADERS
   S.AutoRespondToRequestHeaders(St, Bd, ES);
+  // a real server's first frame is its own SETTINGS; the client must apply it
+  // before it may send DATA, so answer the client preface + SETTINGS exchange
+  // here
+  S.EnqueueSettings(TConnectionSettings.Defaults);
   Result := S;
   FLock.Acquire;
   try

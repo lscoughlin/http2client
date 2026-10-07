@@ -22,6 +22,9 @@ PLAIN_PORT="${INTEROP_PLAIN_PORT:-18480}"
 # upgrade probe.
 H2C_PORT="${INTEROP_H2C_PORT:-18481}"
 H1_PORT="${INTEROP_H1_PORT:-18482}"
+# A.14: a server that advertises a tiny stream/connection window (8 KiB), so
+# a large upload must honour flow control instead of overrunning the peer
+SMALLWIN_PORT="${INTEROP_SMALLWIN_PORT:-18483}"
 HTDOCS="$(mktemp -d /tmp/h2interop.XXXXXX)"
 BUILD="$(mktemp -d /tmp/h2interop-build.XXXXXX)"
 PROBE="$BUILD/h2probe"
@@ -41,6 +44,7 @@ rows=()
 cleanup() {
   [ -n "${NGHTTPD_PID:-}" ] && kill "$NGHTTPD_PID" 2>/dev/null
   [ -n "${NGHTTPD_PLAIN_PID:-}" ] && kill "$NGHTTPD_PLAIN_PID" 2>/dev/null
+  [ -n "${NGHTTPD_SMALLWIN_PID:-}" ] && kill "$NGHTTPD_SMALLWIN_PID" 2>/dev/null
   [ -n "${SSERVER_PID:-}" ] && kill "$SSERVER_PID" 2>/dev/null
   if [ "$DOCKER_OK" = yes ]; then
     "$DOCKER" rm -f http2client-h2c http2client-h1 >/dev/null 2>&1
@@ -183,6 +187,15 @@ NGHTTPD_PID=$!
 # --- a plaintext server for the A.9 negative control ----------------------
 "$NGHTTPD" --no-tls -d "$HTDOCS" "$PLAIN_PORT" >"$BUILD/nghttpd_plain.log" 2>&1 &
 NGHTTPD_PLAIN_PID=$!
+# --- A.14 gate server: tiny 8 KiB windows (SETTINGS_INITIAL_WINDOW_SIZE) --
+# -w 8 / -W 8 lower the stream and connection windows to 8192, so a 200 KB
+# upload MUST block on credit and be replenished by inbound WINDOW_UPDATE --
+# the exact scenario that deadlocked when stream WINDOW_UPDATE frames were
+# dispatched to a lease whose queue was not drained during the upload.
+"$NGHTTPD" -d "$HTDOCS" --echo-upload -w 8 -W 8 "$SMALLWIN_PORT" \
+  test/certs/localhost.key test/certs/localhost.crt \
+  >"$BUILD/nghttpd_smallwin.log" 2>&1 &
+NGHTTPD_SMALLWIN_PID=$!
 
 if ! wait_port 127.0.0.1 "$PORT"; then
   echo "ERROR: nghttpd did not open port $PORT" >&2
@@ -327,6 +340,27 @@ else
     "$PROBE_OUT" FAIL
 fi
 
+# --- S04 A.14: large upload under a tiny peer window (flow control) --------
+# 200 KB POST to a server whose stream window is 8192 bytes: the client must
+# split DATA on available credit, block until each WINDOW_UPDATE arrives, and
+# still return the full echo.  Regression for the WINDOW_UPDATE-routing
+# deadlock and the pre-SETTINGS InitialWindowSize race.
+if wait_port 127.0.0.1 "$SMALLWIN_PORT"; then
+  run_probe "https://localhost:$SMALLWIN_PORT/" --method=POST \
+    --upload-bytes=200000 --upload-chunk=16384
+  if [ "$PROBE_RC" = 0 ] && \
+     echo "$PROBE_OUT" | grep -q "status=200 bytes=200000"; then
+    record A.14 "200k upload, peer window 8 KiB (flow control)" \
+      "200,200000" "$PROBE_OUT" PASS
+  else
+    record A.14 "200k upload, peer window 8 KiB (flow control)" \
+      "200,200000" "$(echo "$PROBE_OUT" | tail -1)" FAIL
+  fi
+else
+  record A.14 "200k upload, peer window 8 KiB (flow control)" "200,200000" \
+    "tiny-window nghttpd did not start" FAIL
+fi
+
 # also prove the TLS+ALPN gate actually negotiated h2 (server log evidence)
 if grep -q "h2" "$BUILD/nghttpd.log" 2>/dev/null; then :; fi
 
@@ -340,7 +374,7 @@ for r in "${rows[@]}"; do
 done
 
 echo
-echo "interop: PASS=$PASS FAIL=$FAIL SKIP=$SKIP (mandatory cases: A.1-A.5,A.7,A.9,A.10,A.11,A.12,A.13)"
+echo "interop: PASS=$PASS FAIL=$FAIL SKIP=$SKIP (mandatory cases: A.1-A.5,A.7,A.9-A.14)"
 if [ "$FAIL" -eq 0 ]; then
   echo "RESULT: interop gate GREEN"
   exit 0
