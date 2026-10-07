@@ -73,8 +73,11 @@ Defaults:
 | `Http1Fallback` | `False` | allow HTTP/1.1 when the peer does not offer `h2`; see [[fallback]] |
 | `ClearTextPolicy` | `ctReject` | reject `http` origins; see [[fallback]] |
 
-Whether `WithProxy` should implement a real `CONNECT` tunnel (versus
-forwarding) is unresolved — see [[open-questions]].
+`WithProxy(host, port)` routes every dial through an HTTP `CONNECT` tunnel
+to `host:port`; the tunnel is established on the plain socket, so TLS and
+ALPN still target the origin. A proxy that refuses the `CONNECT` surfaces as
+`EHttpConnectionError`; there is no forwarding mode and no silent direct
+fallback. See [[transport]].
 
 Fluent use:
 

@@ -27,8 +27,10 @@ rather than restating an item.
    `SETTINGS_MAX_CONCURRENT_STREAMS` of 0 or "unlimited" — see
    [[client-api]].
 2. Proxy semantics: `CONNECT` tunnel only, or also forwarding? What do
-   `:authority`/`:scheme` become behind a proxy? — see [[client-api]] and
-   [[transport]].
+   `:authority`/`:scheme` become behind a proxy? — **resolved 2026-10-07:**
+   `CONNECT` tunnel only (no forwarding mode); `:authority`/`:scheme` are
+   unchanged because the tunnel is transparent to HTTP/2 — see [[transport]]
+   and [[client-api]].
 3. HTTP/1.1 fallback: fail on non-`h2` ALPN, or implement a fallback
    codec? — **resolved 2026-10-06:** implement the fallback, off by default;
    `WithHttp1Fallback` turns it on. See [[fallback]].

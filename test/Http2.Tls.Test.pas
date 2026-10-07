@@ -119,6 +119,21 @@ type
     property HandshakeResult: Integer read FHandshakeResult;
   end;
 
+  /// accepts one connection on a loopback listener, reads the CONNECT request
+  /// and replies per AReply; captures the request line for assertions
+  TLoopbackProxyServer = class(TThread)
+  private
+    FListenFd: Integer;
+    FReply: AnsiString;
+    FRequest: AnsiString;
+    FAcceptedFd: Integer;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const AListenFd: Integer; const AReply: AnsiString);
+    property Request: AnsiString read FRequest;
+  end;
+
   TTlsTest = class(TTestCase)
   protected
     procedure SetUp; override;
@@ -151,6 +166,9 @@ type
     procedure TestTlsReadReassemblesChunks;
     // 05.8 OpenSSL availability
     procedure TestOpenSslAvailability;
+    // proxy CONNECT tunnel
+    procedure TestConnectTunnelSendsRequestAndSucceeds;
+    procedure TestConnectTunnelRejectsNon2xx;
     // integration (opt-in)
     procedure TestLiveNghttpdAlpnIfEnabled;
   end;
@@ -905,6 +923,143 @@ begin
   finally
     Sock.Close;
   end;
+end;
+
+{ TLoopbackProxyServer }
+
+constructor TLoopbackProxyServer.Create(const AListenFd: Integer;
+  const AReply: AnsiString);
+begin
+  inherited Create(True);
+  FListenFd := AListenFd;
+  FReply := AReply;
+  FRequest := '';
+  FAcceptedFd := -1;
+  FreeOnTerminate := False;
+end;
+
+procedure TLoopbackProxyServer.Execute;
+var
+  C: AnsiChar;
+  opt: LongInt;
+begin
+  FAcceptedFd := fpAccept(FListenFd, nil, nil);
+  if FAcceptedFd < 0 then
+    Exit;
+  opt := 1;
+{$IFDEF DARWIN}
+  fpSetSockOpt(FAcceptedFd, SOL_SOCKET, SO_NOSIGPIPE, @opt, SizeOf(opt));
+{$ENDIF}
+  // read the request headers up to the blank line
+  repeat
+    if fpRecv(FAcceptedFd, @C, 1, 0) <> 1 then
+      Break;
+    FRequest := FRequest + C;
+  until (Length(FRequest) >= 4) and
+    (Copy(FRequest, Length(FRequest) - 3, 4) = #13#10#13#10);
+  if Length(FReply) > 0 then
+    fpSend(FAcceptedFd, @FReply[1], Length(FReply), 0);
+  // hold the tunnel open until the client closes it, so the test's teardown is
+  // deterministic rather than racing a fixed sleep
+  while fpRecv(FAcceptedFd, @C, 1, 0) = 1 do
+    ;
+  fpClose(FAcceptedFd);
+end;
+
+// host/port of a fresh loopback listener; 0 on failure
+function MakeLoopbackListener(out AListenFd: Integer; out APort: Word): Boolean;
+var
+  addr: TSockAddr;
+  alen: LongInt;
+  one: LongInt;
+begin
+  Result := False;
+  AListenFd := fpsocket(AF_INET, SOCK_STREAM, 0);
+  if AListenFd < 0 then
+    Exit;
+  one := 1;
+  fpSetSockOpt(AListenFd, SOL_SOCKET, SO_REUSEADDR, @one, SizeOf(one));
+  FillChar(addr, SizeOf(addr), 0);
+  addr.sin_family := AF_INET;
+  addr.sin_port := htons(0);
+  addr.sin_addr.s_addr := htonl($7f000001);
+  if fpbind(AListenFd, @addr, SizeOf(addr)) <> 0 then
+  begin
+    fpClose(AListenFd);
+    Exit;
+  end;
+  if fplisten(AListenFd, 1) <> 0 then
+  begin
+    fpClose(AListenFd);
+    Exit;
+  end;
+  alen := SizeOf(addr);
+  fpgetsockname(AListenFd, @addr, @alen);
+  APort := ntohs(addr.sin_port);
+  Result := True;
+end;
+
+procedure TTlsTest.TestConnectTunnelSendsRequestAndSucceeds;
+var
+  listenFd: Integer;
+  port: Word;
+  Sock: IHttp2Socket;
+  Server: TLoopbackProxyServer;
+begin
+  if not MakeLoopbackListener(listenFd, port) then
+    raise EHttpConnectionError.Create(
+      'could not create a loopback listener for the tunnel test');
+  Server := TLoopbackProxyServer.Create(listenFd,
+    'HTTP/1.1 200 Connection established'#13#10#13#10);
+  Server.Start;
+  Sleep(30);
+  try
+    Sock := TPlainSocket.Create('origin.example', 443, 2000,
+      '127.0.0.1', port);
+    AssertTrue('tunnel socket connected', Sock.Connected);
+    Sock.Close;
+    Server.WaitFor;
+    AssertTrue('proxy saw a CONNECT request',
+      Pos('CONNECT origin.example:443 HTTP/1.1', string(Server.Request)) = 1);
+    AssertTrue('CONNECT carries a Host header',
+      Pos('Host: origin.example:443', string(Server.Request)) > 0);
+  finally
+    Server.Free;
+    fpClose(listenFd);
+  end;
+end;
+
+procedure TTlsTest.TestConnectTunnelRejectsNon2xx;
+var
+  listenFd: Integer;
+  port: Word;
+  Sock: IHttp2Socket;
+  Failed: Boolean;
+  Server: TLoopbackProxyServer;
+begin
+  if not MakeLoopbackListener(listenFd, port) then
+    raise EHttpConnectionError.Create(
+      'could not create a loopback listener for the tunnel test');
+  Server := TLoopbackProxyServer.Create(listenFd,
+    'HTTP/1.1 403 Forbidden'#13#10#13#10);
+  Server.Start;
+  Sleep(30);
+  Failed := False;
+  try
+    try
+      Sock := TPlainSocket.Create('origin.example', 443, 2000,
+        '127.0.0.1', port);
+      Sock.Close;
+    except
+      on E: EHttpConnectionError do
+        Failed := Pos('proxy CONNECT failed', E.Message) > 0;
+    end;
+  finally
+    Server.WaitFor;
+    Server.Free;
+    fpClose(listenFd);
+  end;
+  AssertTrue('non-2xx CONNECT raises a connection error', Failed);
 end;
 
 initialization

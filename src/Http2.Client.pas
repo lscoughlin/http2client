@@ -93,10 +93,13 @@ type
   private
     FCACertFile: string;
     FInsecure: Boolean;
+    FProxyHost: string;
+    FProxyPort: Word;
     FProtocols: TProtocolSocketFactory;
   public
     constructor Create(const ACACertFile: string = '';
-      const AInsecure: Boolean = False);
+      const AInsecure: Boolean = False; const AProxyHost: string = '';
+      const AProxyPort: Word = 0);
     function Dial(const AHost: string; const APort: Word;
       const ATimeoutMs: Integer): IHttp2Socket;
     function DialProtocol(const AHost: string; const APort: Word;
@@ -974,18 +977,22 @@ end;
 { IHttp2SocketFactory }
 
 constructor TDefaultSocketFactory.Create(const ACACertFile: string;
-  const AInsecure: Boolean);
+  const AInsecure: Boolean; const AProxyHost: string; const AProxyPort: Word);
 begin
   inherited Create;
   FCACertFile := ACACertFile;
   FInsecure := AInsecure;
-  FProtocols := TProtocolSocketFactory.Create(ACACertFile, AInsecure);
+  FProxyHost := AProxyHost;
+  FProxyPort := AProxyPort;
+  FProtocols := TProtocolSocketFactory.Create(ACACertFile, AInsecure, AProxyHost,
+    AProxyPort);
 end;
 
 function TDefaultSocketFactory.Dial(const AHost: string; const APort: Word;
   const ATimeoutMs: Integer): IHttp2Socket;
 begin
-  Result := TTlsSocket.Dial(AHost, APort, FInsecure, ATimeoutMs, FCACertFile);
+  Result := TTlsSocket.Dial(AHost, APort, FInsecure, ATimeoutMs, FCACertFile,
+    FProxyHost, FProxyPort);
 end;
 
 function TDefaultSocketFactory.DialProtocol(const AHost: string;
@@ -1007,7 +1014,7 @@ begin
   // enforcing "h2", so the mapping happens here
   // (doc/design/fallback.md "Negotiation").
   Sock := TTlsSocket.DialWithAlpn(AHost, APort, AlpnOfferFor(AHttp1Fallback),
-    FInsecure, ATimeoutMs, FCACertFile);
+    FInsecure, ATimeoutMs, FCACertFile, FProxyHost, FProxyPort);
   // downcast with Supports, NOT a hard class cast: a hard cast reinterprets
   // the interface pointer (which is not the object base) and reads garbage
   Name := '';
@@ -1250,6 +1257,12 @@ begin
   Result := Self;
   Result.FProxyHost := AHost;
   Result.FProxyPort := APort;
+  // an explicitly injected factory still wins; otherwise carry the proxy on
+  // the default socket factory so every dial path tunnels through it
+  if not (Result.FSocketFactory is TDefaultSocketFactory) then
+    Exit;
+  Result.FSocketFactory := TDefaultSocketFactory.Create(Result.FCACertFile,
+    Result.FInsecure, AHost, APort);
 end;
 
 function THttpClientFactory.WithSocketFactory(
@@ -1267,7 +1280,8 @@ begin
   // an explicitly injected factory still wins; otherwise rebuild the default
   if not (Result.FSocketFactory is TDefaultSocketFactory) then
     Exit;
-  Result.FSocketFactory := TDefaultSocketFactory.Create(AFileName, Result.FInsecure);
+  Result.FSocketFactory := TDefaultSocketFactory.Create(AFileName, Result.FInsecure,
+    Result.FProxyHost, Result.FProxyPort);
 end;
 
 function THttpClientFactory.WithInsecureTls(
@@ -1277,7 +1291,8 @@ begin
   Result.FInsecure := AInsecure;
   if not (Result.FSocketFactory is TDefaultSocketFactory) then
     Exit;
-  Result.FSocketFactory := TDefaultSocketFactory.Create(Result.FCACertFile, AInsecure);
+  Result.FSocketFactory := TDefaultSocketFactory.Create(Result.FCACertFile, AInsecure,
+    Result.FProxyHost, Result.FProxyPort);
 end;
 
 function THttpClientFactory.WithConnectTimeout(

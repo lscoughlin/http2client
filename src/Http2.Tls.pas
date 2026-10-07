@@ -133,16 +133,22 @@ type
   private
     FCACertFile: string;
     FInsecure: Boolean;
+    FProxyHost: string;
+    FProxyPort: Word;
   public
     constructor Create(const ACACertFile: string = '';
-      const AInsecure: Boolean = False);
+      const AInsecure: Boolean = False; const AProxyHost: string = '';
+      const AProxyPort: Word = 0);
     function DialProtocol(const AHost: string; const APort: Word;
       const AScheme: string; const AHttp1Fallback: Boolean;
       const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
       out AProtocol: TNegotiatedProtocol): IHttp2Socket;
   end;
 
-  /// a plain (cleartext) TCP socket over fcl-net's TInetSocket
+  /// a plain (cleartext) TCP socket over fcl-net's TInetSocket. When a proxy
+  /// is configured the TCP connection goes to the proxy and a CONNECT tunnel
+  /// to the real target is negotiated first, so every layer above (TLS, h2c,
+  /// HTTP/1.1) sees a transparent byte stream to the origin.
   TPlainSocket = class(TInterfacedObject, IHttp2Socket)
   private
     FSocket: TInetSocket;
@@ -153,7 +159,8 @@ type
     FWriteTimeoutMs: Integer;
   public
     constructor Create(const AHost: string; const APort: Word;
-      const AConnectTimeoutMs: Integer = cDefaultSocketTimeoutMs);
+      const AConnectTimeoutMs: Integer = cDefaultSocketTimeoutMs;
+      const AProxyHost: string = ''; const AProxyPort: Word = 0);
     destructor Destroy; override;
     /// the underlying OS socket handle (needed to hand the socket to OpenSSL)
     property Handle: Integer read FHandle;
@@ -220,7 +227,8 @@ type
     class function Dial(const AHost: string; const APort: Word;
       const AInsecure: Boolean = False;
       const AConnectTimeoutMs: Integer = cDefaultSocketTimeoutMs;
-      const ACACertFile: string = ''): IHttp2Socket;
+      const ACACertFile: string = ''; const AProxyHost: string = '';
+      const AProxyPort: Word = 0): IHttp2Socket;
     /// dial and TLS-wrap while offering the caller's ALPN list (in wire form,
     /// e.g. AlpnOfferFor(True)); the negotiated name is in SelectedProtocol
     // - fallback is the caller's decision, so the strict ALPN check is skipped
@@ -228,12 +236,15 @@ type
     class function DialWithAlpn(const AHost: string; const APort: Word;
       const AAlpnOffer: TBytes; const AInsecure: Boolean = False;
       const AConnectTimeoutMs: Integer = cDefaultSocketTimeoutMs;
-      const ACACertFile: string = ''): IHttp2Socket;
+      const ACACertFile: string = ''; const AProxyHost: string = '';
+      const AProxyPort: Word = 0): IHttp2Socket;
     /// dial a CLEARTEXT TCP socket for h2c prior knowledge
     // (doc/design/fallback.md "h2c prior knowledge"); the caller writes the
     // connection preface.  No TLS, no ALPN, so SelectedProtocol is not used.
     class function DialCleartext(const AHost: string; const APort: Word;
-      const AConnectTimeoutMs: Integer = cDefaultSocketTimeoutMs): IHttp2Socket;
+      const AConnectTimeoutMs: Integer = cDefaultSocketTimeoutMs;
+      const AProxyHost: string = '';
+      const AProxyPort: Word = 0): IHttp2Socket;
     /// override the ALPN offer this socket will send in Establish; ignored by
     /// the Dial overloads, which set it for you
     procedure SetAlpnOffer(const AOffer: TBytes);
@@ -409,19 +420,113 @@ begin
   end;
 end;
 
+/// read one CRLF/LF-terminated line from the tunnel handshake; False only at
+// EOF.  Byte-at-a-time so it never consumes bytes past the CONNECT response
+// (any payload beyond the blank line belongs to the tunnel)
+function ProxyReadLine(AFd, ATimeoutMs: Integer;
+  out ALine: AnsiString): Boolean;
+var
+  C: AnsiChar;
+begin
+  ALine := '';
+  repeat
+    if SocketReadFully(AFd, 1, ATimeoutMs, C) = 0 then
+      Exit(False);
+    if C = #10 then
+      Exit(True);
+    if C <> #13 then
+      ALine := ALine + C;
+  until Length(ALine) > 16384;
+  Result := True;
+end;
+
+/// parse the 3-digit status code from an HTTP status line (the token after
+// the version, e.g. "HTTP/1.1 200 OK")
+function ProxyStatusCode(const ALine: AnsiString): Integer;
+var
+  I: Integer;
+  Digits: AnsiString;
+begin
+  Result := 0;
+  Digits := '';
+  I := 1;
+  // skip the HTTP-version token
+  while (I <= Length(ALine)) and (ALine[I] <> ' ') do
+    Inc(I);
+  while (I <= Length(ALine)) and (ALine[I] = ' ') do
+    Inc(I);
+  // collect the status-code digits
+  while (I <= Length(ALine)) and (ALine[I] >= '0') and (ALine[I] <= '9') do
+  begin
+    Digits := Digits + ALine[I];
+    Inc(I);
+  end;
+  if Length(Digits) = 3 then
+    Result := StrToIntDef(string(Digits), 0);
+end;
+
+/// negotiate an HTTP CONNECT tunnel to AHost:APort over an already-connected
+/// AFd.  Raises EHttpConnectionError unless the proxy answers a 2xx status; a
+/// non-2xx or a truncated response is a connection failure, not a fallback.
+procedure EstablishProxyTunnelFd(AFd: Integer; const AHost: string;
+  const APort: Word; const ATimeoutMs: Integer);
+var
+  Req, Line: AnsiString;
+  Code: Integer;
+begin
+  Req := 'CONNECT ' + AnsiString(AHost) + ':' + AnsiString(IntToStr(APort)) +
+    ' HTTP/1.1'#13#10'Host: ' + AnsiString(AHost) + ':' +
+    AnsiString(IntToStr(APort)) + #13#10#13#10;
+  SocketWriteFully(AFd, Length(Req), ATimeoutMs, Req[1]);
+  // skip any informational (1xx) response and any blank separators, then
+  // require a 2xx; a blank line must not be treated as a status
+  Code := 100;
+  repeat
+    if not ProxyReadLine(AFd, ATimeoutMs, Line) then
+      raise EHttpConnectionError.Create(
+        'proxy closed the connection during CONNECT');
+    if Line = '' then
+      Continue;
+    Code := ProxyStatusCode(Line);
+  until (Code < 100) or (Code >= 200);
+  if (Code < 200) or (Code >= 300) then
+    raise EHttpConnectionError.CreateFmt('proxy CONNECT failed: %s',
+      [string(Line)]);
+  // drain the response headers up to the blank line
+  repeat
+    if not ProxyReadLine(AFd, ATimeoutMs, Line) then
+      Break;
+  until Line = '';
+end;
+
 { TPlainSocket }
 
 constructor TPlainSocket.Create(const AHost: string; const APort: Word;
-  const AConnectTimeoutMs: Integer);
+  const AConnectTimeoutMs: Integer;
+  const AProxyHost: string; const AProxyPort: Word);
 var
   opt: LongInt;
+  DialHost: string;
+  DialPort: Word;
 begin
   inherited Create;
   FConnectTimeoutMs := AConnectTimeoutMs;
   FReadTimeoutMs := cDefaultSocketTimeoutMs;
   FWriteTimeoutMs := cDefaultSocketTimeoutMs;
+  // with a proxy the TCP connection goes to the proxy; everything above then
+  // talks to the origin through a CONNECT tunnel
+  if AProxyHost <> '' then
+  begin
+    DialHost := AProxyHost;
+    DialPort := AProxyPort;
+  end
+  else
+  begin
+    DialHost := AHost;
+    DialPort := APort;
+  end;
   try
-    FSocket := TInetSocket.Create(AHost, APort, AConnectTimeoutMs);
+    FSocket := TInetSocket.Create(DialHost, DialPort, AConnectTimeoutMs);
   except
     on E: ESocketError do
       if E.Code = seConnectTimeOut then
@@ -429,7 +534,7 @@ begin
           [AConnectTimeoutMs])
       else
         raise EHttpConnectionError.CreateFmt('connect to %s:%d failed: %s',
-          [AHost, APort, E.Message]);
+          [DialHost, DialPort, E.Message]);
   end;
   FHandle := FSocket.Handle;
   FConnected := True;
@@ -437,6 +542,13 @@ begin
 {$IFDEF DARWIN}
   fpSetSockOpt(FHandle, SOL_SOCKET, SO_NOSIGPIPE, @opt, SizeOf(opt));
 {$ENDIF}
+  if AProxyHost <> '' then
+    try
+      EstablishProxyTunnelFd(FHandle, AHost, APort, AConnectTimeoutMs);
+    except
+      Close;
+      raise;
+    end;
 end;
 
 destructor TPlainSocket.Destroy;
@@ -718,12 +830,14 @@ end;
 
 class function TTlsSocket.Dial(const AHost: string; const APort: Word;
   const AInsecure: Boolean; const AConnectTimeoutMs: Integer;
-  const ACACertFile: string): IHttp2Socket;
+  const ACACertFile: string; const AProxyHost: string;
+  const AProxyPort: Word): IHttp2Socket;
 var
   Transport: TPlainSocket;
   Sock: TTlsSocket;
 begin
-  Transport := TPlainSocket.Create(AHost, APort, AConnectTimeoutMs);
+  Transport := TPlainSocket.Create(AHost, APort, AConnectTimeoutMs, AProxyHost,
+    AProxyPort);
   Sock := TTlsSocket.Create(Transport, AHost, AInsecure, ACACertFile);
   Sock.ConnectTimeoutMs := AConnectTimeoutMs;
   Sock.ReadTimeoutMs := AConnectTimeoutMs;
@@ -739,12 +853,14 @@ end;
 class function TTlsSocket.DialWithAlpn(const AHost: string; const APort: Word;
   const AAlpnOffer: TBytes; const AInsecure: Boolean;
   const AConnectTimeoutMs: Integer;
-  const ACACertFile: string): IHttp2Socket;
+  const ACACertFile: string; const AProxyHost: string;
+  const AProxyPort: Word): IHttp2Socket;
 var
   Transport: TPlainSocket;
   Sock: TTlsSocket;
 begin
-  Transport := TPlainSocket.Create(AHost, APort, AConnectTimeoutMs);
+  Transport := TPlainSocket.Create(AHost, APort, AConnectTimeoutMs, AProxyHost,
+    AProxyPort);
   Sock := TTlsSocket.Create(Transport, AHost, AInsecure, ACACertFile);
   Sock.ConnectTimeoutMs := AConnectTimeoutMs;
   Sock.ReadTimeoutMs := AConnectTimeoutMs;
@@ -761,11 +877,13 @@ begin
 end;
 
 class function TTlsSocket.DialCleartext(const AHost: string; const APort: Word;
-  const AConnectTimeoutMs: Integer): IHttp2Socket;
+  const AConnectTimeoutMs: Integer; const AProxyHost: string;
+  const AProxyPort: Word): IHttp2Socket;
 var
   Sock: TPlainSocket;
 begin
-  Sock := TPlainSocket.Create(AHost, APort, AConnectTimeoutMs);
+  Sock := TPlainSocket.Create(AHost, APort, AConnectTimeoutMs, AProxyHost,
+    AProxyPort);
   Sock.SetConnectTimeoutMs(AConnectTimeoutMs);
   Sock.SetReadTimeoutMs(AConnectTimeoutMs);
   Sock.SetWriteTimeoutMs(AConnectTimeoutMs);
@@ -890,11 +1008,14 @@ end;
 { TProtocolSocketFactory }
 
 constructor TProtocolSocketFactory.Create(const ACACertFile: string;
-  const AInsecure: Boolean);
+  const AInsecure: Boolean; const AProxyHost: string;
+  const AProxyPort: Word);
 begin
   inherited Create;
   FCACertFile := ACACertFile;
   FInsecure := AInsecure;
+  FProxyHost := AProxyHost;
+  FProxyPort := AProxyPort;
 end;
 
 function TProtocolSocketFactory.DialProtocol(const AHost: string;
@@ -919,13 +1040,15 @@ begin
         // until then the caller drives HTTP/1.1 directly on this transport
         begin
           AProtocol := npHttp1Cleartext;
-          Result := TTlsSocket.DialCleartext(AHost, APort, ATimeoutMs);
+          Result := TTlsSocket.DialCleartext(AHost, APort, ATimeoutMs, FProxyHost,
+            FProxyPort);
         end;
     else
       // ctPriorKnowledge: speak HTTP/2 at once, the caller writes the preface
       begin
         AProtocol := npHttp2Cleartext;
-        Result := TTlsSocket.DialCleartext(AHost, APort, ATimeoutMs);
+        Result := TTlsSocket.DialCleartext(AHost, APort, ATimeoutMs, FProxyHost,
+          FProxyPort);
       end;
     end;
     Exit;
@@ -934,7 +1057,7 @@ begin
   // https: the ALPN offer follows the fallback flag, then the result maps to a
   // codec.  DialWithAlpn skips the strict check so we can map the name here.
   Sock := TTlsSocket.DialWithAlpn(AHost, APort, AlpnOfferFor(AHttp1Fallback),
-    FInsecure, ATimeoutMs, FCACertFile);
+    FInsecure, ATimeoutMs, FCACertFile, FProxyHost, FProxyPort);
   // $interfaces com: an interface reference points past the object's VMT, so
   // `TTlsSocket(Sock)` (a raw hard cast) would read the wrong memory.  Recover
   // the object with `as TObject` before the class cast so the property read

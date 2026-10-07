@@ -155,5 +155,10 @@ failure only for idempotent methods, or explicit opt-in. See
   them. The default stays strict. See [[fallback]].
 - Certificate validation/trust configuration is a factory concern (hostname
   verification on by default).
-- Proxy: with `WithProxy`, negotiate TLS/`h2` over a `CONNECT` tunnel to the
-  origin (assumption; confirm).
+- Proxy: with `WithProxy`, negotiate TLS/`h2` over a caller-supplied
+  forward proxy via an HTTP `CONNECT` tunnel to the origin. The TCP
+  connection goes to the proxy; the `CONNECT` is negotiated on the plain
+  socket before TLS, so SNI, certificate verification and ALPN still target
+  the origin host and the h2c/HTTP/1.1 paths tunnel identically. A non-2xx
+  `CONNECT` response raises `EHttpConnectionError` (`proxy CONNECT failed`);
+  the client never silently falls back to a direct connection.

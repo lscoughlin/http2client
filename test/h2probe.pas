@@ -46,6 +46,9 @@ var
   GClearTextPolicy: TClearTextPolicy;
   /// S13: offer http/1.1 as an ALPN alternative on https
   GHttp1Fallback: Boolean;
+  /// proxy host:port for the CONNECT tunnel (empty = direct)
+  GProxyHost: string;
+  GProxyPort: Word;
 
 function ReadOptionValue(const AArg: string): string;
 var
@@ -64,13 +67,14 @@ begin
   WriteLn(StdErr,
     'usage: h2probe --url=<https-url> [--insecure] [--method=GET] ' +
     '[--body=...] [--body-writer=...] [--upload-bytes=N] ' +
-    '[--upload-chunk=N] [--timeout-ms=N] [--keep-open-ms=N] [--parallel=N]');
+    '[--upload-chunk=N] [--timeout-ms=N] [--keep-open-ms=N] [--parallel=N] ' +
+    '[--proxy=host:port]');
   Halt(ExitCodeOf(poUsage));
 end;
 
 procedure ParseArgs;
 var
-  I: Integer;
+  I, P: Integer;
   Arg, Name, Value: string;
 begin
   GUrl := '';
@@ -84,6 +88,8 @@ begin
   GTraceFrames := False;
   GClearTextPolicy := ctReject;
   GHttp1Fallback := False;
+  GProxyHost := '';
+  GProxyPort := 0;
   GTimeoutMs := cDefaultTimeoutMs;
   GKeepOpenMs := cDefaultKeepOpenMs;
   GParallel := 1;
@@ -141,6 +147,16 @@ begin
       GTimeoutMs := StrToIntDef(Value, cDefaultTimeoutMs)
     else if Name = '--keep-open-ms' then
       GKeepOpenMs := StrToIntDef(Value, cDefaultKeepOpenMs)
+    else if Name = '--proxy' then
+    begin
+      P := Pos(':', Value);
+      if P < 1 then
+        UsageError('--proxy must be host:port');
+      GProxyHost := Copy(Value, 1, P - 1);
+      GProxyPort := Word(StrToIntDef(Copy(Value, P + 1, Length(Value)), 0));
+      if (GProxyHost = '') or (GProxyPort = 0) then
+        UsageError('--proxy must be host:port');
+    end
     else if Name = '--parallel' then
       GParallel := StrToIntDef(Value, 1)
     else
@@ -406,6 +422,8 @@ begin
     .WithInsecureTls(GInsecure)
     .WithClearText(GClearTextPolicy)
     .WithHttp1Fallback(GHttp1Fallback);
+  if GProxyHost <> '' then
+    Factory := Factory.WithProxy(GProxyHost, GProxyPort);
   if GTraceFrames then
     Factory := Factory.WithObserver(TFrameTraceObserver.Create);
   Client := Factory.Build;
