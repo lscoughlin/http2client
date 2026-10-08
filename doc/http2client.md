@@ -6,7 +6,7 @@ tags:
   - http2client
   - design
   - moc
-status: draft
+status: done
 updated: 2026-10-08
 ---
 

@@ -6,7 +6,7 @@ tags:
   - http2client
   - design
   - api
-status: draft
+status: done
 up: "[[http2client]]"
 related:
   - "[[client-api]]"
@@ -173,8 +173,8 @@ type
 - `FBody` and `FBodyWriter` are mutually exclusive: `FBodyWriter` wins and
   `FBody.IsSet=False` is required; setting both raises.
 - `FHeaders` is an interface, so copying a `THttpRequest` shares the header
-  map. Whether to share or copy-on-write is an open question — see
-  [[open-questions]].
+  map. This is deliberate shared behaviour, not a hidden copy
+  ([[messages]]).
 - Pseudo-header mapping happens at encode time (`THttpRequest.ToStreamRequest`):
   `:method` ← method token, `:scheme` ← the URL scheme (`'http'` or
   `'https'`), `:path` ← path+query (`'/'` when empty), `:authority` ←

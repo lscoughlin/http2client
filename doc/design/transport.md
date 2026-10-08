@@ -6,7 +6,7 @@ tags:
   - http2client
   - design
   - concurrency
-status: draft
+status: done
 up: "[[http2client]]"
 related:
   - "[[protocol]]"
@@ -185,9 +185,10 @@ processed by the peer, so they may be retried on a fresh connection; streams
 at or below it may have been processed and are only retried if the method is
 known safe.
 
-**Reconnect policy** (open question): transparent retry on connection
-failure only for idempotent methods, or explicit opt-in. See
-[[open-questions]].
+**Reconnect policy**: transparent retry on connection failure only for
+idempotent methods (no body writer), and only on `ecRefusedStream` or a
+`GOAWAY` that puts the stream above the last-stream-id; bounded by
+`cMaxTransparentRetries`. There is no per-request opt-in. See [[transport]].
 
 ## TLS and ALPN
 

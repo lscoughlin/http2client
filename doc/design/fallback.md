@@ -7,7 +7,7 @@ tags:
   - design
   - transport
   - protocol
-status: draft
+status: done
 up: "[[http2client]]"
 related:
   - "[[transport]]"
@@ -22,7 +22,6 @@ updated: 2026-10-08
 
 This note brings cleartext HTTP/2 (`h2c`) and HTTP/1.1 fallback into scope.
 It replaces the earlier decision in [[transport]] that both are out of scope.
-It also answers item 3 in [[open-questions]].
 
 ## Scope
 
@@ -138,6 +137,10 @@ this scope:
 - Request line: `METHOD SP request-target SP HTTP/1.1 CRLF`.
 - Headers: one `Host` header is mandatory. Header names are
   case-insensitive on the wire.
+- Header-size limit: the request head, the response head, and accumulated
+  chunked trailers are each bounded by `cHttp1MaxHeaderBytes = 64 * 1024`
+  (`src/Http2.Http1.pas:33`); exceeding it raises `EHttpProtocolError`
+  (`ecProtocolError`).
 - Body: `Content-Length` or `Transfer-Encoding: chunked`.
 - Response: status line, headers, and body. The body uses
   `Content-Length`, chunked coding, or connection close.
@@ -263,15 +266,8 @@ Current result: `interop: PASS=13 FAIL=0 SKIP=1` → `interop gate GREEN`
 
 ## Open items
 
-1. ~~The HTTP/1.1 codec needs a header-size limit.~~ **Resolved:** the
-   limit is `cHttp1MaxHeaderBytes = 64 * 1024`
-   (`src/Http2.Http1.pas:33`), enforced on the request head, the response
-   head, and accumulated chunked trailers; exceeding it raises
-   `EHttpProtocolError` (`ecProtocolError`).
-2. The client must decide if it can reuse one HTTP/1.1 connection for a
-   later `h2` upgrade. The current design says no.
-3. The observer needs one new event kind for a cleartext warning. The name
+1. The observer needs one new event kind for a cleartext warning. The name
    is open. The security rule "log one warning for each cleartext origin"
    (below) is **not yet implemented** — `IHttp2Observer` has no cleartext
    event, so a cleartext request is currently silent. See
-   [[testing-observability]].
+   [[testing-observability]] and [[open-questions]].

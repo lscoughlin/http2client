@@ -6,7 +6,7 @@ tags:
   - http2client
   - design
   - fpc
-status: draft
+status: done
 up: "[[http2client]]"
 related:
   - "[[architecture]]"
