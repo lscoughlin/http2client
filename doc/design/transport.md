@@ -14,7 +14,7 @@ related:
   - "[[fpc-runtime]]"
   - "[[fallback]]"
   - "[[open-questions]]"
-updated: 2026-10-05
+updated: 2026-10-08
 ---
 
 # Transport, Threads & Connection Lifecycle
@@ -111,6 +111,26 @@ One thread per connection, responsible for *both* directions:
   The queues themselves are interfaces, so both sides can hold one without
   a raw-pointer lifetime bug.
 
+```mermaid
+flowchart TB
+  subgraph CALLER["caller thread(s)"]
+    SEND["Send(request)"]
+    READ["read response body"]
+  end
+  subgraph CONN["TConnectionThread · sole socket writer"]
+    LOOP["read frame → route by StreamId"]
+    WRITE["write queued frames in order"]
+  end
+  SEND --> OQ["FOutbound: IBlockingQueue&lt;TFrame&gt;"]
+  OQ --> WRITE
+  LOOP --> IQ["lease FInbound: IBlockingQueue&lt;TFrame&gt;"]
+  IQ --> READ
+  WRITE --> SOCK["IHttp2Socket · TLS + ALPN h2"]
+  SOCK --> LOOP
+  LOOP -.->|"HPACK decode"| HP["THpackCodec"]
+  WRITE -.->|"HPACK encode"| HP
+```
+
 ## Connection lifecycle
 
 1. **Create.** Dial TCP, then TLS negotiating ALPN `h2`. On negotiated `h2`,
@@ -139,6 +159,31 @@ One thread per connection, responsible for *both* directions:
    cancels in-flight streams, sends `GOAWAY` where possible, stops every
    `TConnectionThread` (`Terminate`+`WaitFor`), and closes sockets.
    Idempotent.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Dialing: dial TCP + TLS (ALPN h2)
+  Dialing --> Preface: ALPN = h2
+  Dialing --> Failed: TLS / ALPN failure
+  Preface --> Steady: write magic + SETTINGS
+  note right of Preface
+    HEADERS may be sent immediately;
+    DATA is withheld until the peer's
+    SETTINGS is received and applied
+  end note
+  Steady --> Steady: streams, HPACK, windows
+  Steady --> Draining: GOAWAY received or sent
+  Steady --> Failed: transport / protocol error
+  Draining --> Closed: in-flight streams ≤ last-stream-id complete
+  Draining --> Failed: error while draining
+  Failed --> Closed: all leases on the connection fail
+  Closed --> [*]
+```
+
+`GOAWAY` semantics: streams with ids **above** the last-stream-id were never
+processed by the peer, so they may be retried on a fresh connection; streams
+at or below it may have been processed and are only retried if the method is
+known safe.
 
 **Reconnect policy** (open question): transparent retry on connection
 failure only for idempotent methods, or explicit opt-in. See

@@ -15,7 +15,7 @@ related:
   - "[[client-api]]"
   - "[[errors-redirects]]"
   - "[[open-questions]]"
-updated: 2026-10-06
+updated: 2026-10-08
 ---
 
 # Cleartext h2c and HTTP/1.1 Fallback
@@ -39,6 +39,9 @@ each origin.
 The default stays strict. The client uses `h2` over TLS only. Cleartext and
 HTTP/1.1 fallback are off until the caller enables them. See "Factory
 surface".
+
+All four modes are implemented and covered by tests and interop cases
+A.10–A.13; see "Implementation status".
 
 ## Terms
 
@@ -84,6 +87,25 @@ result for the origin. See [[client-api]] for lease acquisition.
    preface. Use HTTP/2. Send no `Upgrade` header.
 5. If the policy is **upgrade**, send the h2c upgrade procedure. See the
    next section.
+
+```mermaid
+flowchart TB
+  S["request for an origin"] --> SC{"URL scheme?"}
+  SC -->|"https"| T["dial TCP · start TLS"]
+  SC -->|"http"| P{"ClearTextPolicy?"}
+  P -->|"ctReject"| REJ["raise EHttpProtocolError"]
+  P -->|"ctPriorKnowledge"| PK["write HTTP/2 preface at once"]
+  P -->|"ctUpgrade"| UP["HTTP/1.1 request with Upgrade: h2c"]
+  T --> A{"ALPN result"}
+  A -->|"h2"| H2["HTTP/2 · write preface"]
+  A -->|"http/1.1 or empty"| FB{"Http1Fallback?"}
+  A -->|"unknown"| REJ
+  FB -->|"on"| H1["HTTP/1.1 codec"]
+  FB -->|"off"| REJ
+  UP --> R{"response code"}
+  R -->|"101"| HU["switch to HTTP/2 on the same socket<br/>response to the request is the 101 body"]
+  R -->|"other"| H1U["stay HTTP/1.1 · use that response"]
+```
 
 ## h2c upgrade procedure
 
@@ -207,41 +229,49 @@ Rules:
 4. The client must not fall back from `h2` to HTTP/1.1 without the caller's
    consent. A silent fallback can hide a downgrade attack.
 
-## Plan impact
+## Implementation status
 
-This design adds one story, S13. Story S05 keeps the TLS and ALPN work.
-Story S13 adds the cleartext and fallback work. The new tasks are:
+All of the above is implemented:
 
-| ID | Deliverable | Acceptance |
+| Area | Where | Acceptance |
 | --- | --- | --- |
-| 13.1 | `TClearTextPolicy` and factory methods | the fluent chain compiles; the defaults stay strict |
-| 13.2 | h2c prior knowledge | a GET against `nghttpd` without TLS succeeds |
-| 13.3 | h2c upgrade | a GET against `nghttpd` returns `101` and then uses HTTP/2 |
-| 13.4 | HTTP/1.1 codec | a GET and a POST against a plain HTTP/1.1 server succeed |
-| 13.5 | ALPN fallback | an `http/1.1`-only TLS server returns a response when fallback is on |
-| 13.6 | pool keys and limits | the stream limit is 1 for HTTP/1.1; the pool keeps origins apart |
-| 13.7 | interop cases A.10-A.13 | `make validate-interop` stays green |
+| `TClearTextPolicy` + factory methods | `src/Http2.Tls.pas`, `src/Http2.Client.pas` | defaults stay strict (`ctReject`, `Http1Fallback=False`) |
+| h2c prior knowledge | `src/Http2.Client.pas` (`TConnectionPool.TryH2cUpgrade` path, preface at once) | a GET against `nghttpd --no-tls` succeeds (A.10) |
+| h2c upgrade | `src/Http2.Client.pas:2107` (`AcquireUpgraded`, `BuildH2cUpgradeRequest`, `Http2SettingsBase64Url`) | a GET returns `101` then uses HTTP/2 (A.11) |
+| HTTP/1.1 codec | `src/Http2.Http1.pas` (`THttp1Connection`) | GET and POST against a plain HTTP/1.1 server succeed (A.12) |
+| ALPN fallback | `src/Http2.Http1.pas` + transport selection in `Http2.Client` | an `http/1.1`-only TLS server responds when fallback is on |
+| pool keys and limits | `TConnectionPool` selection | stream limit is 1 for HTTP/1.1; origins keep scheme apart |
+| interop A.10–A.13 | `test/h2probe.pas`, `tools/validate/interop.sh` | part of the green interop gate |
 
-The `http2/http2-test` legacy suite is draft-09 plaintext `h2c`. Task 13.2
-gives that suite a code path to exercise. `doc/verification/validation.md` holds the C.6
-skip that this note changes.
+The `http2/http2-test` legacy suite is draft-09 plaintext `h2c`; the prior
+knowledge path gives that suite a code path to exercise.
 
 ## Validation
 
-The client adds four interop cases to the probe
-(`test/h2probe.pas`) and to `tools/validate/interop.sh`:
+Four interop cases live in the probe (`test/h2probe.pas`) and
+`tools/validate/interop.sh`:
 
 | ID | Case | Pass condition |
 | --- | --- | --- |
 | A.10 | h2c prior knowledge | a GET against `nghttpd --no-tls` returns `200` |
-| A.11 | h2c upgrade | a GET returns `101` and the response body arrives over HTTP/2 |
+| A.11 | h2c upgrade | `Upgrade: h2c` → `101`, then the response body arrives over HTTP/2 |
 | A.12 | HTTP/1.1 fallback | a GET against an HTTP/1.1 server returns `200` |
 | A.13 | strict mode | a cleartext request raises `EHttpProtocolError` |
 
+Current result: `interop: PASS=13 FAIL=0 SKIP=1` → `interop gate GREEN`
+(see [[validation]]).
+
 ## Open items
 
-1. The HTTP/1.1 codec needs a header-size limit. The value is open.
+1. ~~The HTTP/1.1 codec needs a header-size limit.~~ **Resolved:** the
+   limit is `cHttp1MaxHeaderBytes = 64 * 1024`
+   (`src/Http2.Http1.pas:33`), enforced on the request head, the response
+   head, and accumulated chunked trailers; exceeding it raises
+   `EHttpProtocolError` (`ecProtocolError`).
 2. The client must decide if it can reuse one HTTP/1.1 connection for a
    later `h2` upgrade. The current design says no.
 3. The observer needs one new event kind for a cleartext warning. The name
-   is open.
+   is open. The security rule "log one warning for each cleartext origin"
+   (below) is **not yet implemented** — `IHttp2Observer` has no cleartext
+   event, so a cleartext request is currently silent. See
+   [[testing-observability]].

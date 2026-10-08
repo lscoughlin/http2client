@@ -89,8 +89,10 @@ false pass. A.10 uses the existing `nghttpd --no-tls` server on
 `INTEROP_PLAIN_PORT` (default 18480). When docker is unavailable, A.11 and
 A.12 report SKIP with that reason.
 
-**Result (2026-10-05): `PASS=8 FAIL=0 SKIP=1` → `RESULT: interop gate GREEN`.**
-A.1–A.7 and A.9 PASS; **A.8 is SKIP**. A.3 was closed by adding a
+**Result (2026-10-08): `PASS=13 FAIL=0 SKIP=1` → `RESULT: interop gate GREEN`.**
+A.1–A.7 and A.9–A.13 PASS; **A.8 is SKIP**. The S13 cases A.10–A.13
+(h2c prior knowledge, h2c upgrade, HTTP/1.1 fallback, strict-mode reject)
+were added after the first green; A.3 was closed by adding a
 `--body-writer` mode to `test/h2probe.pas` (`TChunkWriter`, 7-byte chunks)
 and a matching `run_probe ... --body-writer=...` case in `interop.sh`. A.7
 exposed and fixed a real client bug — see the S12 note below. A.8 has no
@@ -98,6 +100,9 @@ nghttpd trigger to force a mid-flight GOAWAY; the same semantics are covered
 by unit tests (`TStreamLease.OnConnectionGoAway` sets
 `FRetryable := FStreamId > ALastStreamId`; `TestGoAwayNotifiesEveryStream`
 in `test/Http2.ConnectionLifecycle.Test.pas`).
+
+The cleartext and fallback paths these cases exercise are described in
+[[fallback]] (`src/Http2.Http1.pas`, `src/Http2.Client.pas`).
 
 **A.7 found a real bug: flow control was never wired.** `TFlowControl` was
 implemented and unit-tested but referenced by no runtime code, so the client
@@ -163,14 +168,14 @@ directly onto S11 scripts). Record the draft-09 divergences.
 | C.4 | `stream/data-when-*` / `rst-stream` | `test/Http2.Stream.Test.pas` — `TestRstMidBodySurfacesFromRead`, `TestReadAfterEofRaises`, `TestCleanupHappensExactlyOnce`; `test/Http2.ConnectionLifecycle.Test.pas` |
 | C.5 | `window-update-when-*` | `test/Http2.FlowControl.Test.pas` — `TestZeroIncrementUpdateRaisesProtocolError`, `TestUpdateOverflowRaisesFlowControlError`, `TestApplyUpdateAppliesDelta`, `TestInitialWindowDeltaAdjustsEveryOpenStream` |
 
-Intents verified present by grep on 2026-10-05; each maps a draft-09 client
-intent onto the equivalent RFC 7540/7541 unit test. The draft-09 wire details
-differ (different preface/ALPN, no mandatory TLS), so the *intent* is ported,
-not the bytes.
+Intents verified present by grep on 2026-10-05 (C.1–C.5); each maps a
+draft-09 client intent onto the equivalent RFC 7540/7541 unit test. The
+draft-09 wire details differ (different preface/ALPN, no mandatory TLS), so
+the *intent* is ported, not the bytes.
 
 | ID | Legacy raw run (stretch) | Condition |
 |---|---|---|
-| C.6 | `grunt mochaTest:client` with `HTTP2_BROWSER=test/testclient` | **Ported, not raw-run.** The suite speaks draft-09 plaintext `h2c`, and the shipped client is TLS-only. Story S13 adds an h2c path (`ctPriorKnowledge` / `ctUpgrade`) that can exercise this suite; see [[fallback]]. Until S13 lands, the raw run cannot exercise our code (`grep` finds only the TLS preface `cClientPreface` in `src/Http2.Connection.pas`). Recorded as a documented skip. |
+| C.6 | `grunt mochaTest:client` with `HTTP2_BROWSER=test/testclient` | **Ported, not raw-run.** The suite speaks **draft-09** plaintext `h2c`; the shipped client implements the RFC 7540 cleartext paths (`ctPriorKnowledge` / `ctUpgrade`, see [[fallback]]) but not the draft-09 wire dialect (different preface/ALPN, and the 2014 node deps do not run on node v26). The h2c code path is instead covered by interop A.10–A.13 and by `test/Http2.ClearText.Test.pas`. Recorded as a documented skip. |
 
 ## D. h2spec (optional appendix)
 
@@ -220,7 +225,10 @@ when A and B are green.
 | `h2-client-test-harness` image | `h2-test-harness`, digest `sha256:745149517ede…` |
 | `third_party/h2-client-test-harness` | git `0bc075c` |
 | Container runtime | Rancher Desktop `docker` (`~/.rd/bin/docker`) |
-| Unit suite | 292 tests, 0 errors, 0 failures |
+| Unit suite (2026-10-05, at that revision) | 292 tests, 0 errors, 0 failures |
+| Unit suite (current) | 315 tests, 0 errors, 0 failures |
+| Library units | 14 in `src/` (13 core + optional `Http2.Readers`) |
+| Example programs | 5 in `examples/` (`make examples`) |
 
 Skips, each with its reason: **A.8** (no nghttpd GOAWAY trigger; covered by
 unit tests), **C.6** (draft-09 plaintext `h2c`; client is TLS-only), **D**

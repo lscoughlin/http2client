@@ -11,7 +11,7 @@ up: "[[http2client]]"
 related:
   - "[[architecture]]"
   - "[[transport]]"
-updated: 2026-10-05
+updated: 2026-10-08
 ---
 
 # FPC Runtime & Memory Model
@@ -77,6 +77,9 @@ prose in the original sketch. They drive the choices in this design.
 | `generic TBox<T>` + `specialize TBox<Integer>.Echo` | works | generic classes are fine |
 | generic `class procedure Foo<T>` | **only under `{$mode delphi}`** (`TUtil.Foo<Integer>` compiles; `specialize TUtil.Foo<Integer>` under `objfpc` does not) | generic methods are allowed, but pin the mode |
 | `specialize TDictionary<K,V>` under `objfpc` | requires the `specialize` keyword in `uses`-visible code | handled by the `delphi` mode |
+| `UTF8String` as a distinct `TypeInfo` kind | on FPC 3.2.4 `UTF8String` is **`tkAString`** — the same branch as `AnsiString` | `TResponseReader<string>`, `TResponseReader<UTF8String>`, and `ReadText` all take the byte-preserving path; no transcoding is attempted |
+| `fpjson.GetJSON` in a unit that does not name `jsonparser` | raises `EJSON: No JSON parser handler installed` | `Http2.Readers` names `jsonparser` explicitly |
+| FPC output name for a program | the binary is named after the **source file** (`examples/basic_get.pas` → `basic_get`), not the unit | `make examples`/`task examples` write `bin/<source-stem>` |
 
 Probe sources are preserved in
 [`reference/fpc-verified/`](../reference/fpc-verified/README.md) (see its
@@ -108,6 +111,23 @@ type
     procedure Close;
   end;
 ```
+
+```mermaid
+flowchart TB
+  IF["interface ref (ARC)"] -->|"AddRef / Release"| OBJ["object owned by its interface refs"]
+  OBJ -->|"field"| IF2["nested interface field<br/>shared by refcount"]
+  REC["value record<br/>copied, no heap"] -->|"may hold"| IF2
+  TH["background thread"] -->|"weak reference (no AddRef)"| OBJ
+  OBJ -->|"Terminate + WaitFor before release"| TH
+```
+
+Rules that follow from it:
+
+- Never hold a raw pointer to a class that is kept alive only by an
+  interface.
+- Never `Free` an object that an interface already owns.
+- Break thread/owner cycles explicitly — a thread holding an interface to its
+  owner is a cycle ARC cannot collect.
 
 - `TInterfacedObject` provides `_AddRef`/`_Release`; `_Release` frees the
   object when the count reaches zero. Never hold a raw pointer to a class

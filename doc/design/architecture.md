@@ -12,7 +12,7 @@ related:
   - "[[client-api]]"
   - "[[transport]]"
   - "[[fpc-runtime]]"
-updated: 2026-10-05
+updated: 2026-10-08
 ---
 
 # Architecture
@@ -39,34 +39,34 @@ depends on it:
   opens a new connection (until `MaxConnectionsPerHost` /`MaxTotalConnections`);
   otherwise the lease waits.
 
-```
-THttpClient
- ├─ FPool["api.example:443"] -> [Conn1, Conn2]
- │     Conn1 (1 read thread, 1 TLS socket, HPACK state)
- │       ├─ Stream 1 <- Lease A  (GET /a)
- │       ├─ Stream 3 <- Lease B  (POST /b)
- │       └─ Stream 5 <- Lease C  (GET /c)
- │     Conn2
- │       └─ Stream 1 <- Lease D
- └─ caps: MaxConnectionsPerHost (TCP per host), MaxTotalConnections (TCP pool),
-          MaxStreamsPerConnection (streams)
+```mermaid
+flowchart TB
+  C["THttpClient · FPool"]
+  C --> K1["api.example:443"]
+  C --> K2["other.example:443"]
+  K1 --> A["Conn 1 · 1 read thread · 1 TLS socket · HPACK"]
+  K1 --> B["Conn 2"]
+  A --> A1["Stream 1 · Lease A · GET /a"]
+  A --> A2["Stream 3 · Lease B · POST /b"]
+  A --> A3["Stream 5 · Lease C · GET /c"]
+  B --> B1["Stream 1 · Lease D"]
+  K2 --> D["Conn 1"]
+  C -.-> CAP["caps: MaxConnectionsPerHost · MaxTotalConnections · MaxStreamsPerConnection"]
 ```
 
 ## Component diagram
 
-```
-THttpClientFactory (record, immutable)
-        │ Build: IHttpClient
-        ▼
-IHttpClient ───────── owns ──────────► TConnectionPool
-   │  Send(const ARequest: THttpRequest): IHttpResponse   TDictionary<string, TConnectionList>
-   │  lease acquisition                                   (bounded by FMaxTotalConnections)
-   ▼                                                           │
-TStreamLease (one stream) ─ attached to ─► IConnection ───────┘
-   FStreamId                                     │ owns
-   FOutbound: IBlockingQueue<TFrame>             ├─ TSSLSocket (ALPN "h2")
-   FInbound:  IBlockingQueue<TFrame>             ├─ TConnectionThread (1 per connection)
-   FResponseState                                └─ THpackCodec (encoder + decoder, stateful)
+```mermaid
+flowchart TB
+  F["THttpClientFactory · pure value record"]
+  F -->|"Build: IHttpClient"| C["IHttpClient · THttpClient"]
+  C -->|"owns"| P["TConnectionPool · TDictionary origin → TConnectionList"]
+  C -.->|"lease acquisition"| L["TStreamLease · one stream"]
+  L -->|"attached to"| N["IConnection · TConnection"]
+  P --> N
+  N -->|"owns"| S["IHttp2Socket · TSSLSocket · ALPN h2"]
+  N -->|"owns"| T["TConnectionThread · 1 per connection"]
+  N -->|"owns"| H["THpackCodec · encoder + decoder, stateful"]
 ```
 
 Layering, top down:
@@ -85,17 +85,41 @@ Layering, top down:
 
 ## Unit layout and naming
 
+Fourteen units in `src/`, listed in dependency order:
+
 ```pascal
-unit Http2.Client;          // factory, IHttpClient, THttpRequest/Response
-unit Http2.Headers;         // IHttpHeaders, THttpHeaders, THttpHeaderNames
-unit Http2.Frames;          // TFrameType, TFrame, TFrameHeader, TSettings
-unit Http2.Connection;      // IConnection, TConnection, TConnectionPool
-unit Http2.Stream;          // TStreamLease, stream state machine
-unit Http2.Hpack;           // THpackCodec (static + dynamic tables)
-unit Http2.FlowControl;     // TWindow, connection/stream window accounting
-unit Http2.Tls;             // ALPN, TLS context, cert validation
-unit Http2.Errors;          // exception types / result records
+unit Http2.Errors;      // EHttpError hierarchy, THttp2ErrorCode
+unit Http2.Frames;      // TFrameType, TFrame, TFrameHeader, TConnectionSettings
+unit Http2.Headers;     // IHttpHeaders, THttpHeaders, header-name constants
+unit Http2.Hpack;       // THpackCodec (static + dynamic tables)
+unit Http2.FlowControl; // TWindow, connection/stream window accounting
+unit Http2.Tls;         // IHttp2Socket, ALPN, TLS context, cert validation,
+                        // TClearTextPolicy, TNegotiatedProtocol
+unit Http2.Messages;    // IHttpResponse, IResponseReader<T> (re-exports TLS enums)
+unit Http2.Http1;       // THttp1Connection, HTTP/1.1 codec + h2c upgrade
+unit Http2.Connection;  // TConnection, TConnectionThread, IConnectionStream,
+                        // IBlockingQueue<T>, TBlockingQueue<T>
+unit Http2.Stream;      // TStreamLease, THttpMethod, THttpBody, IBodyWriter,
+                        // IHttpBodyStream, TStreamIdAllocator
+unit Http2.Observer;    // IHttp2Observer
+unit Http2.Client;      // THttpClientFactory, IHttpClient, THttpRequest,
+                        // TConnectionPool, IPooledConnection,
+                        // THttpConnection, THttp1PooledConnection,
+                        // IHttp2SocketFactory, TResponseReader<T>,
+                        // WithTextBody / ReadText
+unit Http2.Readers;     // optional: JSON/XML readers + send helpers (fcl-json/fcl-xml)
+unit Http2;             // umbrella: re-exports every unit above EXCEPT Http2.Readers
 ```
+
+`Http2.Readers` is deliberately **outside** the umbrella and the 13-unit
+core: it is the only unit that depends on `fcl-json`/`fcl-xml`, so a caller
+links it only by naming it in their own `uses` clause. See [[messages]].
+
+**Dependency direction.** `Http2.Client` and `Http2.Connection` are the
+concurrency owners; the layers below them are pure and independently
+testable. `Http2.Messages` re-exports `TClearTextPolicy` and
+`TNegotiatedProtocol` from `Http2.Tls`, so a caller that only needs the
+public message types does not pull in the socket layer's details.
 
 Conventions:
 

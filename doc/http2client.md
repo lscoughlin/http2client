@@ -7,7 +7,7 @@ tags:
   - design
   - moc
 status: draft
-updated: 2026-10-05
+updated: 2026-10-08
 ---
 
 # HTTP/2 Client
@@ -28,6 +28,16 @@ them **across all authorities**; `MaxStreamsPerConnection` (and the peer's
 `SETTINGS_MAX_CONCURRENT_STREAMS`) caps **concurrent requests**. This
 resolves the contradiction in the original sketch and the rest of the
 design depends on it. Details in [[architecture]].
+
+```mermaid
+flowchart TB
+  A["THttpClientFactory<br/>immutable value record"] --> B["IHttpClient<br/>thread-safe, owns the pool"]
+  B --> C["TConnectionPool<br/>one bucket per origin"]
+  C --> D["TConnection<br/>1 TLS socket + 1 thread + HPACK"]
+  D --> E["TStreamLease<br/>1 stream = 1 request"]
+  E --> F["IHttpResponse<br/>status + headers + body stream"]
+  F --> G["read helpers<br/>TResponseReader · ReadText · JSON/XML"]
+```
 
 ## Document map
 
@@ -75,4 +85,25 @@ end;
 ```
 
 See [[client-api]] for the full factory surface and [[messages]] for
-request/response construction.
+request/response construction. On this machine the binary must also find
+OpenSSL at runtime:
+
+```sh
+OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib ./myprogram
+```
+
+## Examples
+
+`examples/` holds five small programs — see `examples/README.md`:
+
+| Program | Shows |
+|---|---|
+| `basic_get` | factory, `Send`, reading the body |
+| `post_text` | `WithTextBody`, a plain-text request body |
+| `json_request` | `Http2.Readers` JSON send + read |
+| `xml_request` | `Http2.Readers` XML send + read |
+| `threaded_get` | one shared `IHttpClient` driven by many threads |
+
+```sh
+make examples     # or: task examples  ->  bin/<program>
+```

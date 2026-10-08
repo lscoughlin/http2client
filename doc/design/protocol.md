@@ -12,7 +12,7 @@ related:
   - "[[transport]]"
   - "[[messages]]"
   - "[[open-questions]]"
-updated: 2026-10-05
+updated: 2026-10-08
 ---
 
 # Protocol Layer
@@ -42,11 +42,22 @@ type
     FrameType: TFrameType;
     Flags: TFrameFlags;
     StreamId: LongWord;    // reserved bit masked off
+    procedure Clear;
+    procedure WriteTo(const ABuffer: TBytes);          // serialize 9 bytes
+    class function ReadFrom(const ABuffer: TBytes): TFrameHeader; static;
   end;
 
   TFrame = record
     Header: TFrameHeader;
     Payload: TBytes;
+    class function Create(const AFrameType: TFrameType; const AFlags: TFrameFlags;
+      const AStreamId: LongWord; const APayload: TBytes): TFrame; static;
+    function DataLength: LongWord;      // payload length
+    function IsEndStream: Boolean;
+    function IsEndHeaders: Boolean;
+    function IsAck: Boolean;
+    function IsPadded: Boolean;
+    function IsPriority: Boolean;       // HEADERS-only: 5-byte PRIORITY block
   end;
 
   TConnectionSettings = record
@@ -72,10 +83,30 @@ API:
 | `ftRstStream` | yes | yes | cancellation / stream error |
 | `ftGoAway` | yes (shutdown) | yes | connection drain |
 | `ftPing` | yes | yes | keep-alive / RTT |
-| `ftPriority` | optional | yes | prioritization (may be ignored) |
+| `ftPriority` | **no** (never sent) | yes (parsed, not scheduled on) | prioritization — ignored |
+| `ftPushPromise` | n/a | yes (ignored; push is disabled) | server push |
 
 `Send` returning "status + headers" is exactly `ftHeaders` with
 `ffEndHeaders` decoded and `:status` present. See [[messages]].
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant S as Server
+  C->>S: SETTINGS
+  S->>C: SETTINGS
+  C->>S: SETTINGS ACK
+  S->>C: SETTINGS ACK
+  Note over C,S: DATA is withheld until the peer SETTINGS is applied
+  C->>S: HEADERS (stream 1, END_HEADERS)
+  C->>S: DATA (stream 1)
+  C->>S: DATA (stream 1, END_STREAM)
+  S->>C: HEADERS (stream 1, :status 200, END_HEADERS)
+  S->>C: DATA (stream 1)
+  S->>C: DATA (stream 1, END_STREAM)
+  S-->>C: WINDOW_UPDATE (0 and 1) as the body is consumed
+  C->>S: GOAWAY on shutdown
+```
 
 ## HPACK
 
@@ -86,15 +117,24 @@ codec lives on `TConnection` (see [[transport]]):
 type
   THpackCodec = class
   private
-    FEncoder: THpackEncoder;   // dynamic table, write side
-    FDecoder: THpackDecoder;   // dynamic table, read side
+    FEncoder: THpackTableState;   // dynamic table, write side
+    FDecoder: THpackTableState;   // dynamic table, read side
     FMaxTableSize: LongWord;
+    FHuffman: Boolean;            // default True
   public
     function Encode(const AHeaders: THeaderBlock): TBytes;
     function Decode(const AData: TBytes): THeaderBlock;
-    procedure ApplySettings(const ASettings: TConnectionSettings);
+    procedure ApplySettings(aMaxTableSize: LongWord);
+
+    property EncoderTableSize: LongWord;   // bytes used, encoder table
+    property DecoderTableSize: LongWord;   // bytes used, decoder table
+    property EncoderMaxSize: LongWord;     // current encoder cap
+    property DecoderMaxSize: LongWord;     // current decoder cap
+    property Huffman: Boolean;             // encode string literals as Huffman
   end;
 ```
+
+A malformed block raises `EHttpProtocolError` (`ecCompressionError`).
 
 - **Static table** — fixed, known to both peers.
 - **Dynamic table** — grows/shrinks as fields are sent/received; encoder and
@@ -109,19 +149,64 @@ type
 
 ## Flow control
 
+`src/Http2.FlowControl.pas` holds two types: `TWindow` (one window's
+arithmetic) and `TFlowControl` (the connection-level aggregate — the shared
+connection window plus one `TWindow` per open stream), plus the pure
+batching predicate `ShouldEmitWindowUpdate`:
+
 ```pascal
 type
   TWindow = record
   private
-    FSize: LongInt;       // can go negative for the send window
-    FConsumed: LongInt;   // bytes consumed since last WINDOW_UPDATE
+    FSize: Int64;      // signed: the send window may go negative
+    FConsumed: Int64;  // receive credit accrued since the last WINDOW_UPDATE
   public
-    procedure Consume(const ACount: LongInt);
+    class function Defaults(const AInitial: LongInt): TWindow; static;
+    function Size: Int64;
+    function Consumed: Int64;
+    function CanSend: Boolean;
+    function CanSendN(const AN: LongWord): Boolean;
+    function TryConsume(const AN: LongWord): Boolean;   // fails without mutating
     procedure ApplyUpdate(const AIncrement: LongWord);
+    procedure ApplyDataSent(const AN: LongWord);
+    procedure ApplyDataReceived(const AN: LongWord);
+    procedure ApplyInitialWindowDelta(const ADelta: Int64);
     function NeedsUpdate(const AThreshold: LongInt): Boolean;
     function UpdateIncrement: LongWord;
   end;
 ```
+
+`ApplyUpdate` treats a zero increment as `ecProtocolError` and an overflow
+past 2^31-1 as `ecFlowControlError`; `TryConsume` is the send-side guard
+that leaves the window untouched on failure.
+
+`TFlowControl` wraps the pair so a blocked stream never drains the shared
+connection window:
+
+```pascal
+type
+  TFlowControl = class
+  public
+    constructor Create(const AConnectionWindow, AInitialStreamWindow: LongInt);
+    procedure OpenStream(const AStreamId: LongWord);
+    procedure CloseStream(const AStreamId: LongWord);
+    function TryGetStream(const AStreamId: LongWord; out AWindow: TWindow): Boolean;
+    /// decrement both windows for AN DATA bytes; False (nothing changed) when
+    /// either lacks credit
+    function TryConsume(const AStreamId: LongWord; const AN: LongWord): Boolean;
+    procedure ApplyConnectionUpdate(const AIncrement: LongWord);
+    procedure ApplyStreamUpdate(const AStreamId: LongWord;
+      const AIncrement: LongWord);
+    /// apply a SETTINGS_INITIAL_WINDOW_SIZE delta to every open stream and
+    /// to the initial size used for streams opened later
+    procedure ApplyInitialWindowDelta(const ADelta: Int64);
+    property Connection: TWindow read FConnection;
+    property InitialStreamWindow: LongInt read FInitialStreamWindow;
+  end;
+```
+
+`TConnection` drives `TFlowControl` (`TrackReceivedData`, `SendWindowUpdate`,
+`ApplyPeerSettingsValue`); see the implementation note below.
 
 Two nested windows, both counting **only** DATA bytes:
 
@@ -141,10 +226,30 @@ Rules:
   `TWindow.NeedsUpdate(Threshold)` is true, so small reads do not emit one
   frame per call.
 
+```mermaid
+flowchart TB
+  subgraph SEND["send path"]
+    D["DATA frame to write"] --> C1{"stream window has credit?"}
+    C1 -->|"no"| W1["AcquireCredit blocks until WINDOW_UPDATE<br/>or lease deadline → EHttpTimeout"]
+    W1 --> C1
+    C1 -->|"yes"| C2{"connection window has credit?"}
+    C2 -->|"no"| W1
+    C2 -->|"yes"| W["write DATA · decrement both windows"]
+  end
+  subgraph RECV["receive path"]
+    R["DATA frame received"] --> A["ApplyDataReceived · accrue credit"]
+    A --> B{"accrued ≥ 32768 bytes?"}
+    B -->|"yes"| U["emit WINDOW_UPDATE<br/>stream 0 + stream id"]
+    B -->|"no"| H["hold credit"]
+  end
+```
+
 ### Implementation note (S12 validation finding)
 
 `TFlowControl` was implemented and unit-tested but initially wired into
-**nothing**: `TConnection` received DATA without ever returning window
+**nothing** — `TWindow` existed but returned no credit: `TConnection`
+received DATA without ever returning window
+
 credit, so a body larger than the advertised 65535-byte window stalled once
 the peer's window hit zero — nghttpd simply stopped sending and the read
 raised `EHttpTimeout` (`timed out reading response body`). Interop case A.7

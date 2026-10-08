@@ -7,7 +7,7 @@ tags:
   - verification
 status: done
 up: "[[http2client]]"
-updated: 2026-10-05
+updated: 2026-10-08
 ---
 
 # Toolchain and environment
@@ -60,6 +60,7 @@ S00 and record the exact revision used.
 | `go` | **absent** | do not rely on `go run` for the harness — use Docker. |
 | `node` v26.10.0, `npm` | present | legacy `http2/http2-test` only (best-effort). |
 | `make` | present (`/usr/bin/make`) | build. **No `cmake`** (absent). |
+| `task` (go-task) | present `3.54.0` (`/opt/homebrew/bin/task`) | the primary build/test entry point (`task build`, `task test`, `task examples`, `task validate:*`); `Makefile` remains a thin mirror. Note go-task's embedded shell (mvdan/sh) does **not** support `ulimit`. |
 | `openssl` CLI | present (3.6.5) | generate test certs. |
 | `h2spec` | absent | server-conformance only; optional appendix in S12. |
 
@@ -106,6 +107,7 @@ IDE as a design-time package.
 |---|---|
 | Package name / type | `http2client`, `RunAndDesignTime`, `Version 0.14.0` |
 | Units | all 14 in `src/`, `Http2.pas` (umbrella) first; `Http2.Readers.pas` is the optional JSON/XML unit |
+| Test suite | 315 tests, 0 errors, 0 failures (registration list: `test/Http2.TestRunner.pas`); see [[testing-observability]] |
 | `OtherUnitFiles` | `src` + the four vendored mormot dirs (`core`, `lib`, `net`, `crypt`) |
 | `RequiredPkgs` | `FCL` **only** — deliberately **not** the IDE `mormot2` package (see below) |
 | Unit output | `lib/$(TargetCPU)-$(TargetOS)` (gitignored) |
@@ -152,8 +154,25 @@ lazbuild --opt=-Fu/tmp/lpkintf \
 
 Verified: `83049 lines compiled`, all 13 units produced `.ppu`/`.o` in
 `lib/aarch64-darwin/`. A stock Lazarus matched to its FPC would not need the
-`--opt` workaround. (`Http2.Readers.pas` was added after that build; the count
-is now 14.)
+`--opt` workaround. (`Http2.Readers.pas` was added after that build, so the
+current count is 14 and a fresh `lazbuild` compiles one more unit than the
+`83049 lines` figure above.)
+
+## Example programs
+
+`examples/` holds five programs (`basic_get`, `post_text`, `json_request`,
+`xml_request`, `threaded_get`) — see `examples/README.md`. Build and run:
+
+```sh
+make examples          # or: task examples  ->  bin/<source-stem>
+OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib bin/basic_get
+```
+
+FPC names the output binary after the **source file stem** (`basic_get.pas` →
+`bin/basic_get`), not after any unit. Every example needs `OPENSSL_LIBPATH`
+exported at runtime (the library loads OpenSSL dynamically); a threaded
+example additionally needs `{$IFDEF UNIX}cthreads,{$ENDIF}` first in its
+`uses` clause.
 
 ## Prerequisites for a fresh clone (expanded)
 

@@ -125,13 +125,17 @@ Use it during development.
 ### Sanity checks
 
 The sanity script proves that the probe does not report success always.
-It checks five conditions:
+It checks five conditions, run by `task validate:sanity` (or
+`tools/validate/h2probe-sanity.sh`):
 
-1. An unreachable port gives exit code 2.
-2. A harness stream error gives exit code 3. This check is a SKIP when the
-   harness image is absent.
+1. An unreachable port gives exit code 2 (connection error).
+2. A reset that follows a 200 response gives exit code 3 (stream error).
+   The peer is a local fabricated server (`tools/validate/fake_rst_server.py`)
+   that sends `HEADERS(200)` then `RST_STREAM(CANCEL)` and holds the socket
+   open, so classification is deterministic with no container or host-port
+   race.
 3. Bad command-line usage gives exit code 1.
-4. A peer without `h2` ALPN gives exit code 2.
+4. A peer that does not offer `h2` over ALPN gives exit code 2.
 5. A live `nghttpd` GET gives exit code 0. This check is a SKIP when
    `nghttpd` is absent.
 
@@ -148,7 +152,9 @@ fails.
 Case A.8 is a SKIP. No `nghttpd` trigger can force a GOAWAY in the middle of
 a request. The unit suite covers the same behavior.
 
-Cases A.11 and A.12 are SKIPs when Docker is absent.
+Cases A.11 and A.12 are SKIPs when Docker is absent. A.10–A.13 cover the
+cleartext and fallback paths (h2c prior knowledge, h2c upgrade, HTTP/1.1
+fallback, strict-mode reject).
 
 ### Conformance harness
 
@@ -168,17 +174,29 @@ Then the script compares the two outcomes. The verdicts are:
 
 The gate passes when there are zero WORSE rows.
 
-The last full sweep gave this result:
+The last full sweep (2026-10-08) gave this result:
 
 | Verdict | Count |
 |---|---|
-| MATCH | 28 |
-| BETTER | 42 |
+| MATCH | 25 |
+| BETTER | 44 |
 | WORSE | 0 |
-| CLASS-DIFF | 12 |
+| CLASS-DIFF | 13 |
 | UNKNOWN | 64 |
 
-The script writes the table to `bin/validation-results.md`.
+`PASS = MATCH + BETTER = 69; FAIL = WORSE = 0`.
+
+The script writes the table to `bin/validation-results.md`; the raw per-id
+log is `doc/verification/harness-run-full.log`.
+
+The harness server binds host port 8080, so **the sweep must run alone**. A
+second concurrent sweep, or any other heavy work, makes the probe hit the
+wrong peer and records spurious `timeout`/`WORSE` rows. Re-check a suspect id
+in isolation:
+
+```sh
+HARNESS_IDS="5.4.1/2" bash tools/validate/harness.sh
+```
 
 ## Use the client
 
@@ -326,6 +344,9 @@ and to the raw sweep log at `[[harness-log]]`.
 - The `http2/http2-test` suite uses draft-09 and cleartext. No conformance
   claim depends on it.
 - `h2spec` is a server test tool. It does not apply to this client.
+- The cleartext warning is not wired to the observer: `IHttp2Observer` has
+  no cleartext event, so a cleartext request is currently silent. Tracked in
+  `doc/design/open-questions.md` and `doc/design/fallback.md`.
 
 ## License
 

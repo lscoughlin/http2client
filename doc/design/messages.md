@@ -12,16 +12,25 @@ related:
   - "[[client-api]]"
   - "[[protocol]]"
   - "[[open-questions]]"
-updated: 2026-10-05
+updated: 2026-10-08
 ---
 
 # Messages
 
 ## HttpResponse
 
+`IHttpResponse` and `IResponseReader<T>` live in `src/Http2.Messages.pas`;
+`IHttpBodyStream` lives in `src/Http2.Stream.pas` (it is wired to the
+HTTP/2 lease). `Http2.Messages` exists as a separate, transport-neutral unit
+so a second codec (the HTTP/1.1 fallback in `src/Http2.Http1.pas`) can
+implement `IHttpResponse` without depending on `Http2.Client` — which would
+be circular, since the client uses the codec to send.
+
 ```pascal
+// src/Http2.Messages.pas
 type
   IHttpResponse = interface
+    ['{8B1C2D3E-4F50-4A61-9C72-0123456789AB}']
     function GetStatusCode: LongInt;
     function GetHeaders: IHttpHeaders;
     function GetBody: IHttpBodyStream;
@@ -30,42 +39,61 @@ type
     property Body: IHttpBodyStream read GetBody;
   end;
 
+// src/Http2.Stream.pas
+type
   IHttpBodyStream = interface
+    /// block until bytes are available or END_STREAM. The first Read that
+    /// observes EOF returns 0; a Read after EOF raises EHttpStreamError.
     function Read(var ABuffer; const ACount: LongInt): LongInt;
+    /// true once END_STREAM (or a bodyless response) is observed and any
+    /// buffered bytes are exhausted
     function Eof: Boolean;
   end;
 ```
+
+`Http2.Messages` also re-exports `TClearTextPolicy`, `TNegotiatedProtocol`,
+and `ICleartextSocketFactory` as aliases of the types declared in
+`Http2.Tls` (they cannot live here, or `Http2.Tls` would need this unit
+while this unit needs `Http2.Tls` for `IHttp2Socket`).
 
 The generic read helper (see the syntax note below) maps a response body to
 a `T`:
 
 ```pascal
+// src/Http2.Messages.pas
 {$mode delphi}
 type
   IResponseReader<T> = interface
     function Read(const AResponse: IHttpResponse): T;
   end;
 
+// src/Http2.Client.pas
+type
   TResponseReader<T> = class(TInterfacedObject, IResponseReader<T>)
   public
-    class procedure Read(const AResponse: IHttpResponse; out AValue: T);
+    function Read(const AResponse: IHttpResponse): T; overload;
+    class procedure Read(const AResponse: IHttpResponse;
+      out AValue: T); overload; static;
   end;
-
-class procedure TResponseReader<T>.Read(const AResponse: IHttpResponse;
-  out AValue: T);
-begin
-  // Pull from AResponse.Body until Eof or enough bytes for T, then decode.
-  // A malformed/short body raises EHttpProtocolError here, not in Send.
-end;
 ```
 
-Usage:
+The implementation pulls from `AResponse.Body` until Eof or enough bytes
+for `T`, then decodes: a `tkAString` type (which includes `UTF8String` on
+FPC 3.2.4) is decoded as an `AnsiString` **without conversion**, a
+dynamic-array type is read as `TBytes`, and any other type is `memcpy`'d
+from `SizeOf(T)` bytes. A malformed or short body raises
+`EHttpProtocolError` here, not in `Send`.
+
+Usage — both forms exist, so pick the one that fits:
 
 ```pascal
 var
   Dto: TMyDto;
 begin
   Response := Client.Send(Request);
+  // instance form (interface-compatible, dependency-injectable):
+  Dto := TResponseReader<TMyDto>.Create.Read(Response);
+  // static form (no temporary object):
   TResponseReader<TMyDto>.Read(Response, Dto);
 end;
 ```
@@ -159,6 +187,7 @@ type
 `IHttpHeaders` is a map of `string` → list of `string`:
 
 ```pascal
+// src/Http2.Headers.pas
 type
   IHttpHeaders = interface
     procedure Add(const AName, AValue: string);
@@ -168,13 +197,20 @@ type
     function Contains(const AName: string): Boolean;
     procedure Remove(const AName: string);
     function Names: TArray<string>;
+    /// carry a pseudo-header (name starts with ':') without entering the map
+    procedure AddPseudo(const AName, AValue: string);
+    /// read a pseudo-header set via AddPseudo, or '' when absent
+    function GetPseudo(const AName: string): string;
   end;
 ```
 
-Implementation uses `TDictionary<string, TStringList>` (or
-`TFPGMap<string, TStringList>`) inside a `TInterfacedObject`. Header names
-are normalized to lowercase on `Add`/`SetValue`; values are preserved
-verbatim.
+Implementation (`THttpHeaders`) uses `TDictionary<string, TStringList>` for
+regular headers plus a separate `TDictionary<string, string>` for
+pseudo-headers, inside a `TInterfacedObject`. Header names are normalized to
+lowercase on `Add`/`SetValue`; values are preserved verbatim. Adding a
+connection-specific header is rejected: `ForbiddenHeaders` is
+`connection`, `keep-alive`, `transfer-encoding`, `upgrade`,
+`proxy-connection`.
 
 Header names are a set of constants of common HTTP header names:
 
@@ -205,6 +241,20 @@ const
 
 Do not include connection-specific headers (`connection`, `keep-alive`,
 `transfer-encoding`) — they are forbidden in HTTP/2.
+
+```mermaid
+flowchart TB
+  R["THttpRequest"] --> E["HPACK encode"]
+  E --> PH[":method · :scheme · :path · :authority"]
+  E --> RH["regular headers, lowercased"]
+  PH --> W["HEADERS + DATA on the wire"]
+  RH --> W
+  W --> D["decode response"]
+  D --> ST[":status → StatusCode"]
+  D --> HH["regular headers → Headers map"]
+  D --> BS["DATA frames → Body stream"]
+  BS --> RD["TResponseReader&lt;T&gt; · ReadText · JSON/XML readers"]
+```
 
 ## Request and response streaming
 

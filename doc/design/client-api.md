@@ -12,7 +12,7 @@ related:
   - "[[architecture]]"
   - "[[messages]]"
   - "[[open-questions]]"
-updated: 2026-10-07
+updated: 2026-10-08
 ---
 
 # Client API
@@ -42,6 +42,10 @@ type
     FIdleTimeoutMs: Integer;
     FProxyHost: string;
     FProxyPort: Word;
+    FSocketFactory: IHttp2SocketFactory;   // test seam / custom transport
+    FCACertFile: string;                   // trust anchor bundle
+    FInsecure: Boolean;                    // skip certificate verification
+    FObserver: IHttp2Observer;
     FHttp1Fallback: Boolean;
     FClearTextPolicy: TClearTextPolicy;
   public
@@ -53,9 +57,20 @@ type
     function WithFollowRedirects(const AFollow: Boolean): THttpClientFactory;
     function WithMaxRedirects(const AMax: Integer): THttpClientFactory;
     function WithProxy(const AHost: string; const APort: Word): THttpClientFactory;
-    function WithHttp1Fallback(const AEnable: Boolean): THttpClientFactory;
+    function WithConnectTimeout(const AMs: Integer): THttpClientFactory;
+    function WithHeaderTimeout(const AMs: Integer): THttpClientFactory;
+    function WithIdleTimeout(const AMs: Integer): THttpClientFactory;
+    function WithSocketFactory(const AFactory: IHttp2SocketFactory): THttpClientFactory;
+    function WithCACertFile(const AFileName: string): THttpClientFactory;
+    function WithInsecureTls(const AInsecure: Boolean = True): THttpClientFactory;
+    function WithHttp1Fallback(const AEnable: Boolean = True): THttpClientFactory;
     function WithClearText(const APolicy: TClearTextPolicy): THttpClientFactory;
+    function WithObserver(const AObserver: IHttp2Observer): THttpClientFactory;
     function Build: IHttpClient;
+    // read-only accessors: MaxConnections, MaxConnectionsPerHost,
+    // MaxTotalConnections, MaxStreamsPerConnection, FollowRedirects,
+    // MaxRedirects, ConnectTimeoutMs, HeaderTimeoutMs, IdleTimeoutMs,
+    // CACertFile, Http1Fallback, Observer
   end;
 ```
 
@@ -105,6 +120,29 @@ ALPN still target the origin. A proxy that refuses the `CONNECT` surfaces as
 `EHttpConnectionError`; there is no forwarding mode and no silent direct
 fallback. See [[transport]].
 
+The three timeout setters take a single value each — `WithConnectTimeout`,
+`WithHeaderTimeout`, `WithIdleTimeout` — and override the matching default
+below for every request on the built client. See [[errors-redirects]].
+
+`WithSocketFactory` replaces the transport wholesale. It is the seam the
+test suite uses (`IHttp2SocketFactory` with an in-memory socket) and the
+hook for a caller who must supply their own TLS stack. `WithCACertFile`
+points certificate verification at a specific trust bundle;
+`WithInsecureTls` disables verification (test/development only, never a
+default). `WithObserver` installs an `IHttp2Observer` for connection,
+stream, and frame-level events — see [[testing-observability]].
+
+### TLS and trust
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `SocketFactory` | `TDefaultSocketFactory` | the socket/TLS implementation; overridable for tests |
+| `CACertFile` | empty (system store) | PEM trust anchor bundle used to verify the peer |
+| `Insecure` | `False` | when true, skip certificate and hostname verification |
+
+`Insecure` is exposed for tests and local servers only. It is not set by
+any example and is not reachable through the plain `Create` defaults.
+
 Fluent use:
 
 ```pascal
@@ -125,7 +163,7 @@ end;
 ```pascal
 type
   IHttpClient = interface
-  ['{6B1C2D3E-...}']
+  ['{6B1C2D3E-4F50-4A61-9C72-000000000001}']
     function Send(const ARequest: THttpRequest): IHttpResponse;
     procedure Close;
   end;
@@ -160,6 +198,21 @@ releases them.
 5. Allocate the next odd stream id on the chosen connection, build a
    `TStreamLease`, and enqueue the request frames on the connection's
    `TBlockingQueue<TFrame>`.
+
+```mermaid
+flowchart TB
+  S["Send(THttpRequest)"] --> O["origin = host:port"]
+  O --> LOOK["least-loaded eligible connection?"]
+  LOOK -->|"yes"| ACQ["acquire stream slot"]
+  LOOK -->|"no"| HOST{"origin &lt; MaxConnectionsPerHost<br/>and pool &lt; MaxTotalConnections?"}
+  HOST -->|"yes"| OPEN["dial + TLS + ALPN h2"]
+  HOST -->|"no"| WAIT["wait for a free slot · EHttpTimeout on expiry"]
+  WAIT --> LOOK
+  OPEN --> ACQ
+  ACQ --> ID["allocate next odd stream id"]
+  ID --> Q["enqueue frames on IBlockingQueue&lt;TFrame&gt;"]
+  Q --> R["connection thread is sole socket writer"]
+```
 
 The connection thread is the **sole writer** to the socket: callers never
 touch the socket directly, they only enqueue frames. This keeps
