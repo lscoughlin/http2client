@@ -10,7 +10,7 @@ tags:
   - validation
 status: validated
 up: "[[http2client]]"
-updated: 2026-10-05
+updated: 2026-10-08
 validation-results: "bin/validation-results.md"
 harness-log: "doc/verification/harness-run-full.log"
 ---
@@ -237,13 +237,26 @@ Positive control `6.5/1`: **pass** (when it does not, every row is scored
 
 | Verdict | Count |
 |---|---|
-| MATCH | 28 |
-| BETTER | 42 |
+| MATCH | 25 |
+| BETTER | 44 |
 | **WORSE** | **0** |
-| CLASS-DIFF | 12 |
+| CLASS-DIFF | 13 |
 | UNKNOWN | 64 |
 
-`PASS = MATCH+BETTER = 70; FAIL = WORSE = 0`.
+`PASS = MATCH+BETTER = 69; FAIL = WORSE = 0`.
+
+**Method note (environment).** The harness server binds `--network host` port
+8080, so the sweep must run **alone**: a second concurrent sweep (or anything
+else on 8080) makes the probe hit the wrong peer and records spurious
+`ours=timeout`/`conn-error` rows, including `WORSE` on ids that are `MATCH`
+when run in isolation. The figures above are from a sweep run with no other
+sweep active. Several ids (`5.4.1/2`, `6.5/2`, `6.1/3`, `5.1/13`, `4.1/1`,
+`6.9/2`, …) are *load-sensitive*: under heavy host load (a parallel container
+build, or another sweep) the declared detection can arrive after the 4 s probe
+deadline and be recorded as `timeout`. They pass 40+ consecutive isolated runs.
+Re-run a suspect id alone with
+`HARNESS_IDS="<id>" bash tools/validate/harness.sh` before treating a `WORSE`
+as a client defect.
 
 **Scoring rule.** The expected outcome class for every id is *declared* by the
 harness's own verifier sources, extracted by `tools/validate/extract_expectations.py`
