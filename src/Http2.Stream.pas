@@ -1058,7 +1058,16 @@ begin
       Exit(0);
     end;
     if not PopInbound(Frame, FTimeoutMs) then
+    begin
+      // the queue can shut down because the stream failed (RST_STREAM,
+      // GOAWAY, connection loss) rather than because the deadline expired;
+      // surface that cause instead of masking it as a timeout, else a caller
+      // cannot distinguish a dead connection from a slow peer (mirrors
+      // WaitForResponseHeader)
+      if FFailed then
+        raise MakeStreamError;
       raise EHttpTimeout.Create('timed out reading response body');
+    end;
     HandleInboundFrame(Frame);
   end;
 end;

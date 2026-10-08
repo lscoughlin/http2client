@@ -81,6 +81,9 @@ type
     procedure TestContentLengthMismatchRaises;
     // 08.7
     procedure TestRstMidBodySurfacesFromRead;
+    // a connection failure while the caller is blocked in a body read must
+    // surface as EHttpConnectionError, not a masked EHttpTimeout
+    procedure TestBlockedBodyReadSurfacesConnectionFailure;
     // 08.8
     procedure TestInvalidTransitionsRaise;
     // 08.9
@@ -947,6 +950,98 @@ begin
       AssertEquals('unregister still exactly once', 1, Lease.UnregisterCount);
       AssertEquals('release still exactly once', 1, Lease.ReleaseCount);
       AssertEquals('no leak', 0, Conn.StreamCount);
+    finally
+      Lease.ReleaseLease;
+      IL := nil;
+      Alloc.Free;
+    end;
+  finally
+    Conn.Free;
+  end;
+end;
+
+type
+  /// fails the connection from another thread while ReadBody is blocked in
+  /// PopInbound, so the failure arrives via the queue shutdown path.
+  TFailingDriver = class(TThread)
+  private
+    FConn: TConnection;
+    FDelayMs: Integer;
+  public
+    constructor Create(const AConn: TConnection; const ADelayMs: Integer);
+    procedure Execute; override;
+  end;
+
+constructor TFailingDriver.Create(const AConn: TConnection;
+  const ADelayMs: Integer);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FConn := AConn;
+  FDelayMs := ADelayMs;
+end;
+
+procedure TFailingDriver.Execute;
+begin
+  Sleep(FDelayMs);
+  FConn.FailWith('socket reset', ecConnectError);
+end;
+
+procedure TStreamLeaseTest.TestBlockedBodyReadSurfacesConnectionFailure;
+var
+  Sock: TMockSocket;
+  Conn: TConnection;
+  Lease: TStreamLease;
+  IL: IConnectionStream;
+  Alloc: TStreamIdAllocator;
+  Req: TStreamRequest;
+  Enc: THpackCodec;
+  Empty: THeaderBlock;
+  Driver: TFailingDriver;
+  Buf: array[0..7] of Byte;
+  Raised: Boolean;
+  IsTimeout: Boolean;
+  IsConnError: Boolean;
+begin
+  Sock := TMockSocket.Create;
+  Conn := TConnection.Create(Sock);
+  try
+    Req := TStreamRequest.WithMethod(hmGet, 'api.example');
+    MakeLease(Conn, Req, Alloc, Lease, IL);
+    try
+      Lease.Start;
+      Enc := THpackCodec.Create;
+      try
+        Empty := nil;
+        // a 200 response with a body still open: the read below blocks
+        Conn.DispatchStreamFrame(ResponseHeadersFrame(Enc, '200', Empty,
+          Lease.StreamId, False));
+      finally
+        Enc.Free;
+      end;
+      AssertTrue('headers received as a normal value',
+        Lease.WaitForResponseHeader(1000));
+
+      // block in ReadBody; the driver fails the connection underneath it
+      Driver := TFailingDriver.Create(Conn, 150);
+      try
+        Driver.Start;
+        IsTimeout := False;
+        IsConnError := False;
+        try
+          Lease.ReadBody(Buf, SizeOf(Buf));
+        except
+          on E: EHttpConnectionError do IsConnError := True;
+          on E: EHttpTimeout do IsTimeout := True;
+        end;
+      finally
+        Driver.WaitFor;
+        Driver.Free;
+      end;
+      AssertFalse('a dead connection is not reported as a timeout',
+        IsTimeout);
+      AssertTrue('the connection failure reaches the blocked read',
+        IsConnError);
     finally
       Lease.ReleaseLease;
       IL := nil;
