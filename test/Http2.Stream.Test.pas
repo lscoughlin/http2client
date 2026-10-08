@@ -79,6 +79,8 @@ type
     procedure TestHeadContentLengthIsNotComparedAgainstBody;
     // restores the mismatch check guarded by the HEAD exemption above
     procedure TestContentLengthMismatchRaises;
+    // RFC 9113 8.2.2: a response 'te' must be 'trailers' (harness 8.1.2.2/2)
+    procedure TestResponseTeHeaderMustBeTrailers;
     // 08.7
     procedure TestRstMidBodySurfacesFromRead;
     // a connection failure while the caller is blocked in a body read must
@@ -781,6 +783,66 @@ begin
       IL := nil;
       Alloc.Free;
     end;
+  finally
+    Conn.Free;
+  end;
+end;
+
+procedure TStreamLeaseTest.TestResponseTeHeaderMustBeTrailers;
+var
+  Sock: TMockSocket;
+  Conn: TConnection;
+
+  procedure ExpectTe(const AValue: string; const AShouldRaise: Boolean);
+  var
+    L: TStreamLease;
+    A: TStreamIdAllocator;
+    R: IConnectionStream;
+    E: THpackCodec;
+    X: array[0..0] of THttpHeaderField;
+    LReq: TStreamRequest;
+    Ok: Boolean;
+    Caught: Boolean;
+  begin
+    LReq := TStreamRequest.WithMethod(hmGet, 'api.example');
+    MakeLease(Conn, LReq, A, L, R);
+    try
+      L.Start;
+      E := THpackCodec.Create;
+      try
+        X[0].Name := 'te';
+        X[0].Value := AValue;
+        X[0].Sensitive := False;
+        Conn.DispatchStreamFrame(ResponseHeadersFrame(E, '200', X,
+          L.StreamId, True));
+      finally
+        E.Free;
+      end;
+      Caught := False;
+      try
+        Ok := L.WaitForResponseHeader(1000);
+      except
+        on E: EHttpStreamError do Caught := True;
+      end;
+      AssertEquals('te=' + AValue + ' raise', AShouldRaise, Caught);
+      if not AShouldRaise then
+        AssertTrue('te=trailers accepted', Ok);
+    finally
+      L.ReleaseLease;
+      R := nil;
+      A.Free;
+    end;
+  end;
+
+begin
+  Sock := TMockSocket.Create;
+  Conn := TConnection.Create(Sock);
+  try
+    // the one legal value is accepted
+    ExpectTe('trailers', False);
+    // any other value is a stream PROTOCOL_ERROR
+    ExpectTe('trailers, deflate', True);
+    ExpectTe('deflate', True);
   finally
     Conn.Free;
   end;

@@ -895,6 +895,14 @@ begin
             ecProtocolError);
         if SameText(F.Name, 'content-length') then
           FExpectedLength := StrToInt64Def(F.Value, -1);
+        // RFC 9113 section 8.2.2: 'te' is the one connection-specific field
+        // allowed in HTTP/2, and a *response* may carry it only with the
+        // value 'trailers'. Any other value is malformed -> STREAM
+        // PROTOCOL_ERROR (harness 8.1.2.2/2).
+        if SameText(F.Name, 'te') and (not SameText(Trim(F.Value), 'trailers')) then
+          raise EHttpStreamError.Create(
+            'response te header must be "trailers": ' + F.Value, FStreamId,
+            ecProtocolError);
         FResponseHeaders.Add(F.Name, F.Value);
       end;
     end;
