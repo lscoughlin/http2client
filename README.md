@@ -87,7 +87,7 @@ task test
 ```
 
 The `test` task compiles the library and the unit suite. Then it runs the
-suite. The suite has 315 tests.
+suite. The suite has 317 tests.
 
 The suite uses `fpcunit` and a mock socket. It needs no network and no server.
 
@@ -178,13 +178,19 @@ The last full sweep (2026-10-08) gave this result:
 
 | Verdict | Count |
 |---|---|
-| MATCH | 25 |
-| BETTER | 44 |
+| MATCH | 29 |
+| BETTER | 41 |
 | WORSE | 0 |
 | CLASS-DIFF | 13 |
-| UNKNOWN | 64 |
+| UNKNOWN | 63 |
 
-`PASS = MATCH + BETTER = 69; FAIL = WORSE = 0`.
+`PASS = MATCH + BETTER = 70; FAIL = WORSE = 0`.
+
+This is a **representative snapshot**, not a reproducible constant: individual
+rows move between runs within a few load-sensitive families, and the client's
+own fixes moved some of them (e.g. `8.1.2.2/2` went from `success` to
+`stream-error` once response `te` validation landed). What is stable is the
+strictness level — **WORSE = 0** whenever the sweep runs alone.
 
 The script writes the table to `bin/validation-results.md`; the raw per-id
 log is `doc/verification/harness-run-full.log`.

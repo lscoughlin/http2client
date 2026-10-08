@@ -84,7 +84,7 @@ API:
 | `ftGoAway` | yes (shutdown) | yes | connection drain |
 | `ftPing` | yes | yes | keep-alive / RTT |
 | `ftPriority` | **no** (never sent) | yes (parsed, not scheduled on) | prioritization — ignored |
-| `ftPushPromise` | n/a | yes (ignored; push is disabled) | server push |
+| `ftPushPromise` | n/a | yes | **rejected**: the client advertises `ENABLE_PUSH=0`, so a PUSH_PROMISE is a connection error (`ecProtocolError`), not silently dropped |
 
 `Send` returning "status + headers" is exactly `ftHeaders` with
 `ffEndHeaders` decoded and `:status` present. See [[messages]].

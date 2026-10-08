@@ -175,10 +175,15 @@ type
 - `FHeaders` is an interface, so copying a `THttpRequest` shares the header
   map. Whether to share or copy-on-write is an open question — see
   [[open-questions]].
-- Pseudo-header mapping happens at encode time:
-  `:method` ← method token, `:scheme` ← `'https'`, `:path` ← path+query
-  (`'/'` when empty), `:authority` ← `host[:port]` (port omitted when the
-  scheme default). Regular headers follow, all names lowercased.
+- Pseudo-header mapping happens at encode time (`THttpRequest.ToStreamRequest`):
+  `:method` ← method token, `:scheme` ← the URL scheme (`'http'` or
+  `'https'`), `:path` ← path+query (`'/'` when empty), `:authority` ←
+  `host[:port]` (port omitted when the scheme default). Regular headers
+  follow, all names lowercased. The scheme also drives transport selection
+  (TLS vs cleartext, and the cleartext policy) — see [[fallback]].
+- `AddPseudo` is how the codec carries the pseudo-headers without them
+  entering the public `Headers` map; `GetPseudo` reads one back. A caller
+  cannot inject a pseudo-header into `Headers` by accident.
 - A `FBodyWriter` body is single-use / non-replayable (see
   [[errors-redirects]]).
 
@@ -210,7 +215,11 @@ pseudo-headers, inside a `TInterfacedObject`. Header names are normalized to
 lowercase on `Add`/`SetValue`; values are preserved verbatim. Adding a
 connection-specific header is rejected: `ForbiddenHeaders` is
 `connection`, `keep-alive`, `transfer-encoding`, `upgrade`,
-`proxy-connection`.
+`proxy-connection`. The one RFC-defined exception is `te`, which HTTP/2
+permits (RFC 9113 section 8.2.2); a **response** may carry it only with the
+value `trailers`, and any other value raises `EHttpStreamError` with
+`ecProtocolError` while the response headers are decoded
+(`TStreamLease.HandleInboundFrame` in `src/Http2.Stream.pas`).
 
 Header names are a set of constants of common HTTP header names:
 

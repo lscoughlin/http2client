@@ -226,7 +226,7 @@ when A and B are green.
 | `third_party/h2-client-test-harness` | git `0bc075c` |
 | Container runtime | Rancher Desktop `docker` (`~/.rd/bin/docker`) |
 | Unit suite (2026-10-05, at that revision) | 292 tests, 0 errors, 0 failures |
-| Unit suite (current) | 315 tests, 0 errors, 0 failures |
+| Unit suite (current) | 317 tests, 0 errors, 0 failures |
 | Library units | 14 in `src/` (13 core + optional `Http2.Readers`) |
 | Example programs | 5 in `examples/` (`make examples`) |
 
@@ -245,13 +245,19 @@ Positive control `6.5/1`: **pass** (when it does not, every row is scored
 
 | Verdict | Count |
 |---|---|
-| MATCH | 25 |
-| BETTER | 44 |
+| MATCH | 29 |
+| BETTER | 41 |
 | **WORSE** | **0** |
 | CLASS-DIFF | 13 |
-| UNKNOWN | 64 |
+| UNKNOWN | 63 |
 
-`PASS = MATCH+BETTER = 69; FAIL = WORSE = 0`.
+`PASS = MATCH+BETTER = 70; FAIL = WORSE = 0`.
+
+These are a **representative snapshot**, not a reproducible constant — see the
+method note below. What is invariant is the *strictness level*: **WORSE = 0**
+as long as the sweep runs alone. Individual rows move between runs within the
+load-sensitive families, so compare the `ours=` column and re-run a suspect id
+in isolation rather than trusting the tally.
 
 **Method note (environment).** The harness server binds `--network host` port
 8080, so the sweep must run **alone**: a second concurrent sweep (or anything
@@ -259,12 +265,27 @@ else on 8080) makes the probe hit the wrong peer and records spurious
 `ours=timeout`/`conn-error` rows, including `WORSE` on ids that are `MATCH`
 when run in isolation. The figures above are from a sweep run with no other
 sweep active. Several ids (`5.4.1/2`, `6.5/2`, `6.1/3`, `5.1/13`, `4.1/1`,
-`6.9/2`, …) are *load-sensitive*: under heavy host load (a parallel container
-build, or another sweep) the declared detection can arrive after the 4 s probe
-deadline and be recorded as `timeout`. They pass 40+ consecutive isolated runs.
-Re-run a suspect id alone with
+`6.9/2`, `6.10/5`, …) are *load-sensitive*: under heavy host load (a parallel
+container build, or another sweep) the declared detection can arrive after the
+4 s probe deadline and be recorded as `timeout`. They pass 40+ consecutive
+isolated runs. Re-run a suspect id alone with
 `HARNESS_IDS="<id>" bash tools/validate/harness.sh` before treating a `WORSE`
 as a client defect.
+
+**Runs are not bit-for-bit reproducible.** Consecutive sweeps disagree on
+several accepted-response ids (`6.4/2`, `6.3/2`, `8.1.2.2/2`, `5.1/5`,
+`8.1.2.6/1`, `6.2/1`), and even two *identical* isolated batches disagree with
+each other on a cell or two; the differing cell correlates with which id
+immediately precedes the row. **Hypothesis** (unproven, and a host-forwarder
+artifact rather than a client defect): the harness accepts exactly **one**
+connection (`third_party/h2-client-test-harness/main.go`, single
+`listener.Accept()`), and `h2probe` lingers ~200 ms after finishing
+(`--keep-open-ms=200`), so the next container's host-forwarded port 8080 can
+receive that lingering socket and its one `Accept()` is consumed before the
+case's own frames are read — the client then sees a dead/idle peer and reports
+`success` or `conn-error` instead of the declared stream error. We did not
+change `--keep-open-ms` or the harness: both are load-bearing for other
+verdicts. Treat the sweep as a survey and per-id isolation as the tiebreaker.
 
 **Scoring rule.** The expected outcome class for every id is *declared* by the
 harness's own verifier sources, extracted by `tools/validate/extract_expectations.py`
@@ -279,7 +300,7 @@ have demonstrated the declaration while our client did not.
 **WORSE = 0.** This is the gate. No case exists where the reference
 produced the declared outcome and our client failed to produce *an* error.
 
-**UNKNOWN = 64.** Every one of these has `ref=fail` — the reference verifier
+**UNKNOWN = 63.** Every one of these has `ref=fail` — the reference verifier
 itself did not resolve the case. Two shapes dominate:
 
 * cases declaring `success` whose harness function never writes a response
@@ -290,19 +311,57 @@ itself did not resolve the case. Two shapes dominate:
   harness-case defect, not a client defect.
 * cases that need an environment feature the image does not provide.
 
-Our client produced a clean error (never a timeout-with-no-diagnosis) in all
-64; that is why none is `WORSE`.
+Our client produced a clean, named error in nearly all of them; the handful
+recorded as `ours=timeout` in any given sweep are load artifacts, not client
+defects. For example a `--trace-frames` re-run of `4.1/1` (declares `success`;
+the harness never writes a response HEADERS frame, so no compliant client can
+observe success) shows the client receiving `UNKNOWN(255)` then `PING`, ACKing
+the PING, and reporting `connection closed while reading frame header`
+(`conn-error`) when the harness closes. Checked individually:
 
-**CLASS-DIFF = 12** — both sides produced an error, at different levels
-(connection vs stream). Each is justified below. RFC 7540 / RFC 9113 map the
-stream-state rules in section 5.1 to explicit levels, so where our client is
-the stricter (connection) level we keep it: a stricter level never lets a
-broken stream corrupt connection state.
+```sh
+HARNESS_IDS="4.1/1" bash tools/validate/harness.sh
+```
+
+**A masked timeout found a real defect.** The sweep recorded `6.9/2` as
+`ours=timeout` with `RESULT=conn-error class=EHttpTimeout code=INTERNAL_ERROR`:
+the harness cannot emit its zero-increment WINDOW_UPDATE (Go rejects it), so it
+sends a `HEADERS(200)` frame and drops the connection — our client's *body read*
+then blocked until its own deadline. `TStreamLease.ReadBody` raised
+`EHttpTimeout` unconditionally when `PopInbound` returned `false`, but the
+inbound queue also shuts down when the stream fails, so a dead connection was
+reported as a slow peer and the failure was hidden from the transparent-retry
+path. `WaitForResponseHeader` already re-checked `FFailed` in exactly this
+case; `ReadBody` did not. Fixed in `src/Http2.Stream.pas` (commit `9b79847`)
+with the regression test `TestBlockedBodyReadSurfacesConnectionFailure`. After
+the fix, `HARNESS_IDS="6.9/2"` reports `ours=conn-error` (a CLASS-DIFF against
+the declared `stream-error`).
+
+**A second real defect: the response `te` header.** The sweep first recorded
+`8.1.2.2/2` as `ours=success`. RFC 9113 section 8.2.2 allows the `te` field in
+HTTP/2 only with the value `trailers`, and a response that carries any other
+value is malformed. The client already rejected the other
+connection-specific fields (`ForbiddenHeaders` in `src/Http2.Headers.pas`) but
+never constrained `te`'s value, so it accepted `te: trailers, deflate`. Fixed
+in `src/Http2.Stream.pas` (commit `14657d9`) with the regression test
+`TestResponseTeHeaderMustBeTrailers`; `8.1.2.2/2` now reports
+`ours=stream-error` (verdict BETTER — the reference verifier cannot resolve the
+case).
+
+**CLASS-DIFF = 13** — both sides produced an error, at different levels
+(connection vs stream). RFC 7540 / RFC 9113 map the stream-state rules in
+section 5.1 to explicit levels, so where our client is the stricter
+(connection) level we keep it: a stricter level never lets a broken stream
+corrupt connection state. **Exactly which ids fall in this bucket is not fixed
+across revisions or even across runs** (see the method note): the count we
+observed is 13, but membership moves within the families below, so the rows are
+grouped by *family* with the reasoning, not pinned to a run.
 
 | id | declaration | ours | justification |
 |---|---|---|---|
 | `5.1/2` | conn-error | stream-error (`CANCEL`) | RST_STREAM on an idle stream. We surface the peer's RST as a stream error on the requesting lease. Section 5.1 makes this a connection error; we would rather not tear down the whole connection for a stream we never opened. Accepted divergence; no response data is trusted. |
-| `6.4/2` | conn-error | stream-error (`CANCEL`) | Same shape as `5.1/2` (RST_STREAM on an idle stream). |
+| `5.1/5` | stream-error | conn-error (`PROTOCOL_ERROR`) | DATA on a half-closed (remote) stream. RFC 9113 section 5.1 makes this a stream error of type STREAM_CLOSED; we are stricter and treat DATA after the peer's END_STREAM as a connection error. Same stricter-level family as `6.1/2`. |
+| `8.1.2.6/1` | stream-error | conn-error (`PROTOCOL_ERROR`) | A response `content-length` that does not equal the DATA payload length. The harness declares stream scope; we reject a body-length contradiction at connection scope because it corrupts framing accounting for the connection. Same stricter-level family as `8.1.2.1/3`. |
 | `5.1.1/2`,`5.1/12`,`5.1/13`,`6.2/1` | conn-error | stream-error (`PROTOCOL_ERROR`) | The harness sends a frame whose HPACK block decodes to a **request** pseudo-header (`:method`) on a server-to-client stream. We reject it while decoding the response, as a stream error (`unexpected pseudo-header in response`). The case declares a connection error. We choose stream scope: the malformed block is confined to one stream. |
 | `hpack/6.3/1` | conn-error | stream-error (`PROTOCOL_ERROR`) | Same HPACK shape as above; the harness's dynamic-table intent still holds (we reject the block), only the level differs. |
 | `4.2/2` | stream-error | conn-error (`FRAME_SIZE_ERROR`) | A DATA frame exceeding `SETTINGS_MAX_FRAME_SIZE`. Section 4.2 makes an oversized frame a connection error of type FRAME_SIZE_ERROR; the case declares stream scope. We are stricter, per the RFC. |
@@ -310,15 +369,32 @@ broken stream corrupt connection state.
 | `6.1/2` | stream-error | conn-error (`PROTOCOL_ERROR`) | DATA on a stream not in open/half-closed(local) — here an idle stream, since the harness never opened it. We raise `DATA before response HEADERS` at connection scope. Section 5.1 makes DATA on an idle stream a connection error; the case declares stream scope. We are stricter, per the RFC. |
 | `8.1.2.1/3` | stream-error | conn-error (`PROTOCOL_ERROR`) | A pseudo-header field in trailers. We reject while decoding; the harness declares stream scope. RFC 9113 permits either level here; we keep connection scope because the forbidden field corrupts the header block. |
 | `8.1.2.2/1` | stream-error | conn-error (`PROTOCOL_ERROR`) | A connection-specific header field (`connection`) in a response. Same reasoning as `8.1.2.1/3`. |
+| `6.4/2` | stream-error | conn-error (`PROTOCOL_ERROR`) | END_STREAM on a stream the harness never opened. Section 5.1 makes a frame on an idle stream a connection error; the case declares stream scope. We are stricter, per the RFC. |
+| `6.9/2` | stream-error | conn-error (`INTERNAL_ERROR`) | The harness cannot emit its zero-increment WINDOW_UPDATE (Go rejects it), so it sends HEADERS(200) and drops the connection; we report the dead connection. See the worked example above — this row is what exposed the masked-timeout defect. |
 
 Every CLASS-DIFF is therefore one of: (a) our client is *stricter* and acting
-per the explicit RFC section (4.2/2, 6.3/2, 6.1/2, 8.1.2.1/3, 8.1.2.2/1), or
-(b) our client is *narrower* (a peer RST or malformed HPACK block is surfaced at
-stream scope rather than tearing down the connection: 5.1/2, 6.4/2, 5.1.1/2,
-5.1/12, 5.1/13, 6.2/1, hpack/6.3/1). In both directions our client detects
-and reports the violation; no malformed input is silently accepted. The gate
-therefore holds: **no WORSE**, and every divergence is a deliberate,
-RFC-grounded level choice rather than an unhandled case.
+per the explicit RFC section (4.2/2, 5.1/5, 6.3/2, 6.1/2, 6.4/2, 8.1.2.6/1,
+8.1.2.1/3, 8.1.2.2/1), or (b) our client is *narrower* (a peer RST or
+malformed HPACK block is surfaced at stream scope rather than tearing down the
+connection: 5.1/2, 5.1.1/2, 5.1/12, 5.1/13, 6.2/1, hpack/6.3/1), or (c) the
+harness case is itself degraded and we report the resulting dead connection
+(6.9/2). In all cases our client detects and reports the violation; no
+malformed input is silently accepted. The gate therefore holds: **no WORSE**,
+and every divergence is a deliberate, RFC-grounded level choice rather than an
+unhandled case.
+
+Note the set is not fixed across revisions. `6.4/2` (RST_STREAM on an idle
+stream) was a CLASS-DIFF in the 2026-10-06 archive and is a **MATCH** at HEAD
+(the flow-control routing fix `a422cfb` and the pool split `026971e` changed
+which level our client reports); conversely `5.1/5` and `8.1.2.6/1` are
+CLASS-DIFFs only because the 2026-10-08 sweep scored against the declared
+expectation for the first time, and `8.1.2.2/2` moved from `success` (missing
+validation) through CLASS-DIFF to **BETTER** once the `te` value check landed.
+Compare the `ours=` column, not the verdict, when auditing a revision. For
+`5.1/5` and `8.1.2.6/1` the sweep recorded `ref=fail/unresolved`, so those rows
+are *declaration-only* divergences: the reference never demonstrated the
+declared outcome, and the only reason they score CLASS-DIFF rather than UNKNOWN
+is the declared-expectation rule above.
 
 ## Sanity checks (non-vacuity)
 
