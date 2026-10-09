@@ -83,6 +83,10 @@
         <Filename Value="src/Http2.Encoding.pas"/>
         <UnitName Value="Http2.Encoding"/>
       </Item15>
+      <Item16>
+        <Filename Value="src/Http2.Sse.pas"/>
+        <UnitName Value="Http2.Sse"/>
+      </Item16>
     </Files>
     <RequiredPkgs Count="1">
       <Item1>

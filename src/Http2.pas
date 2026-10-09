@@ -13,7 +13,7 @@ uses
   Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack,
   Http2.FlowControl, Http2.Tls, Http2.Messages, Http2.Http1,
   Http2.Connection, Http2.Stream, Http2.Observer, Http2.Client,
-  Http2.Encoding;
+  Http2.Encoding, Http2.Sse;
 
 implementation
 

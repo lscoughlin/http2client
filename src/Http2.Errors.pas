@@ -61,6 +61,8 @@ type
   EHttpConnectionClosed = class(EHttpError);
   /// the redirect chain exceeded MaxRedirects
   EHttpTooManyRedirects = class(EHttpError);
+  /// the SSE reconnect loop exceeded its retry bound
+  EHttpTooManySseRetries = class(EHttpError);
   /// a non-replayable body cannot be re-sent on a 307/308 redirect
   EHttpNotReplayable = class(EHttpError);
 

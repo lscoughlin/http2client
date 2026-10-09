@@ -35,6 +35,8 @@ const
   HeaderLocation      = 'location';
   HeaderHost          = 'host';
   HeaderTe            = 'te';
+  /// Server-Sent Events resume header (WHATWG "last event ID string")
+  HeaderLastEventId   = 'last-event-id';
 
 type
   /// case-insensitive, multi-valued HTTP/2 header map
