@@ -12,7 +12,7 @@ related:
   - "[[client-api]]"
   - "[[protocol]]"
   - "[[open-questions]]"
-updated: 2026-10-08
+updated: 2026-10-09
 ---
 
 # Messages
@@ -160,6 +160,7 @@ type
     function WithAcceptEncoding(const AValue: string): THttpRequest;
     function WithBody(const ABody: THttpBody): THttpRequest;
     function WithBodyWriter(const AWriter: IBodyWriter): THttpRequest;
+    function Clone: THttpRequest;
     function Url: string;
     function Method: THttpMethod;
     function Headers: IHttpHeaders;
@@ -174,8 +175,13 @@ type
 - `FBody` and `FBodyWriter` are mutually exclusive: `FBodyWriter` wins and
   `FBody.IsSet=False` is required; setting both raises.
 - `FHeaders` is an interface, so copying a `THttpRequest` shares the header
-  map. This is deliberate shared behaviour, not a hidden copy
-  ([[messages]]).
+  map. That is deliberate, but it makes `WithHeader` on a copy mutate the
+  original as well — so any code that adds a header to a request it did not
+  build itself must call `Clone` first. `Clone` copies the record and deep
+  copies the header map (every repeated value preserved). This was found
+  live: `TSseReconnectLoop` echoed `last-event-id` onto its caller's request
+  through a plain copy, so a later reconnect would resume from a stale id
+  ([[server-sent-events]]).
 - Pseudo-header mapping happens at encode time (`THttpRequest.ToStreamRequest`):
   `:method` ← method token, `:scheme` ← the URL scheme (`'http'` or
   `'https'`), `:path` ← path+query (`'/'` when empty), `:authority` ←
@@ -334,7 +340,7 @@ hand-rolled loop.
 
 **Optional readers (`Http2.Readers`).**
 
-This unit is *outside* the 13-unit core. It is the only unit with an
+This unit is *outside* the 14-unit core. It is the only unit with an
 `fcl-json`/`fcl-xml` dependency, so it is linked only when a caller names it
 in their `uses` clause.
 

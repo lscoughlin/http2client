@@ -5,7 +5,7 @@
 //   and defaults `content-type: application/json`; ReadJsonObject parses the
 //   response body straight into a TJSONObject. The reader returns a
 //   CALLER-OWNED object, so it is freed in a `finally`.
-// - Http2.Readers is an OPTIONAL unit: the 13-unit core library has no JSON or
+// - Http2.Readers is an OPTIONAL unit: the 14-unit core library has no JSON or
 //   XML dependency. Add it to your uses clause only when you need it.
 program example_json;
 

@@ -7,7 +7,7 @@ tags:
   - design
   - moc
 status: done
-updated: 2026-10-08
+updated: 2026-10-09
 ---
 
 # HTTP/2 Client
@@ -51,6 +51,7 @@ flowchart TB
 | [[transport]] | threading and queues, connection lifecycle, TLS/ALPN |
 | [[fallback]] | cleartext h2c (prior knowledge and upgrade) and HTTP/1.1 fallback |
 | [[errors-redirects]] | exception hierarchy, timeouts, cancellation, redirects |
+| [[server-sent-events]] | Server-Sent Events: event-stream parser, SSE source, reconnect/resume, body-read timeout |
 | [[testing-observability]] | test seams, `fpcunit`, `IHttp2Observer` |
 | [[open-questions]] | single source of truth for unresolved decisions |
 

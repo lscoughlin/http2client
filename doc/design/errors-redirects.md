@@ -12,8 +12,9 @@ related:
   - "[[messages]]"
   - "[[transport]]"
   - "[[fallback]]"
+  - "[[server-sent-events]]"
   - "[[open-questions]]"
-updated: 2026-10-08
+updated: 2026-10-09
 ---
 
 # Errors, Timeouts & Redirects
@@ -65,6 +66,7 @@ type
   EHttpTimeout          = class(EHttpError);
   EHttpConnectionClosed = class(EHttpError);
   EHttpTooManyRedirects = class(EHttpError);
+  EHttpTooManySseRetries = class(EHttpError);   // SSE reconnect bound
   EHttpNotReplayable    = class(EHttpError);
 ```
 
@@ -77,10 +79,17 @@ type
   `ICancellationToken` (`THttpRequest.WithCancelToken`); cancelling it resets
   the stream in flight.
 - **Timeouts:** the factory sets three defaults — `WithConnectTimeout`,
-  `WithHeaderTimeout`, `WithIdleTimeout` (milliseconds). Only the header
-  timeout is overridable per request, through `THttpRequest.WithTimeout(ms)`
+  `WithHeaderTimeout`, `WithIdleTimeout` (milliseconds). The header timeout is
+  overridable per request, through `THttpRequest.WithTimeout(ms)`
   (`0` means "use the factory default"). A timeout cancels the stream — it
   does not orphan it.
+- **Body-read timeouts:** a response body read inherits the header timeout by
+  default, which is wrong for a stream that is idle between messages. A
+  request may set its own body-read deadline with
+  `THttpRequest.WithSseReadTimeout(ms)`, where `0` means "wait indefinitely";
+  the lease polls an `ICancellationToken` every 20 ms, and a cancelled or
+  expired body read resets the stream with `RST_STREAM(CANCEL)`. See
+  [[server-sent-events]].
 - **Uniform reporting:** errors are raised as the exception types above;
   partial records are never left half-owned because ownership is by
   interface (refcount cleans up on unwind).
@@ -96,6 +105,7 @@ flowchart TB
   E -->|"connect / header / idle deadline"| T["EHttpTimeout<br/>stream is reset, not orphaned"]
   E -->|"queue shutdown, Close called"| X["EHttpConnectionClosed<br/>waiters are released"]
   E -->|"redirect bound exceeded"| R["EHttpTooManyRedirects"]
+  E -->|"SSE reconnect bound exceeded"| SS["EHttpTooManySseRetries"]
   E -->|"IBodyWriter cannot replay"| N["EHttpNotReplayable"]
 ```
 

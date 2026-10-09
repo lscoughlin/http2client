@@ -15,7 +15,7 @@ related:
   - "[[transport]]"
   - "[[fallback]]"
   - "[[errors-redirects]]"
-updated: 2026-10-08
+updated: 2026-10-09
 ---
 
 # Open Questions
@@ -45,5 +45,10 @@ Recorded in the owning note; listed here only as a lookup index.
 | `ftPriority` is parsed but never sent | [[protocol]] |
 | Reader is a generic class `TResponseReader<T>` on FPC 3.2.4 | [[messages]], [[fpc-runtime]] |
 | `THttpRequest.Headers` is shared (an interface), not copy-on-write | [[messages]] |
+| `THttpRequest.Clone` deep-copies the header map; `WithHeader` on a fork mutates the original | [[messages]], [[server-sent-events]] |
 | `THttpBody` vs `IBodyWriter` precedence and redirect replayability | [[messages]], [[errors-redirects]] |
 | An HTTP/1.1 connection is **not** later upgraded to `h2` | [[fallback]] |
+| SSE reconnect: wrapper, not transport; clean end or transient failure reconnects, a protocol error is terminal | [[server-sent-events]] |
+| SSE emits no observer event per message (frame/stream-level observer only); push support is caller-owned | [[server-sent-events]] |
+| SSE over the HTTP/1.1 fallback is best-effort: liveness bounded by the socket read timeout, no cancel path | [[server-sent-events]], [[fallback]] |
+| SSE sends `accept-encoding: identity` and rejects any other `content-encoding` | [[server-sent-events]] |

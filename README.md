@@ -22,6 +22,10 @@ One request uses one stream. The pool keeps many TCP connections.
   prior knowledge and upgrade.
 - Falls back to HTTP/1.1 when the peer does not offer `h2`. The caller must
   enable the fallback.
+- Reads Server-Sent Events (`text/event-stream`) incrementally, with a
+  per-request body read timeout, read-side cancellation, and an optional
+  reconnect-and-resume loop. See
+  [`doc/design/server-sent-events.md`](doc/design/server-sent-events.md).
 
 The default is strict. The client uses `h2` over TLS only.
 
@@ -69,13 +73,13 @@ start with `task validate`.
 task build
 ```
 
-The `build` task compiles all 14 library units into `bin/`. The output is the
+The `build` task compiles all 15 library units into `bin/`. The output is the
 `.ppu` and `.o` files for each unit. The task does not create a linked binary,
 because the library has no program of its own. To use the units in your own
 program, add `-Fu` for the `src` and `bin` directories. See the `FPCFLAGS`
 value in `Taskfile.yaml`.
 
-Thirteen units make up the core library. The fourteenth, `Http2.Readers.pas`,
+Fourteen units make up the core library. The fifteenth, `Http2.Readers.pas`,
 is optional: it adds JSON and XML helpers and is the only unit that depends on
 `fcl-json` or `fcl-xml`. Name it in your `uses` clause only when you need it.
 See [Examples](#examples).
@@ -87,7 +91,8 @@ task test
 ```
 
 The `test` task compiles the library and the unit suite. Then it runs the
-suite. The suite has 317 tests.
+suite. The suite has 409 tests (the SSE live case skips unless
+`SSE_TEST_URL` is set; run it with `task validate:sse`).
 
 The suite uses `fpcunit` and a mock socket. It needs no network and no server.
 
@@ -95,7 +100,8 @@ Every test must pass. The task returns a non-zero exit code when a test fails.
 
 ## Validate
 
-The validation suite has four levels. Each level has its own task.
+The validation suite has four levels, plus an opt-in live gate. Each level
+has its own task.
 
 | Task | What it checks | Time |
 |---|---|---|
@@ -103,6 +109,7 @@ The validation suite has four levels. Each level has its own task.
 | `task validate:sanity` | The probe classifies outcomes correctly. | Seconds |
 | `task validate:interop` | A real TLS peer, `nghttpd`. Cases A.1 to A.13. | About 1 minute |
 | `task validate:harness` | The RFC conformance harness. 146 case ids. | About 30 minutes |
+| `task validate:sse` | The opt-in live SSE case against `tools/validate/sse_server.py`. | Seconds |
 
 Run the full suite with one command:
 
@@ -291,7 +298,7 @@ descendant (arrays, numbers, strings). A body that does not parse raises
 
 ## Examples
 
-The `examples/` directory has five small programs. Build them all with:
+The `examples/` directory has six small programs. Build them all with:
 
 ```sh
 make examples      # or: task examples
@@ -307,6 +314,7 @@ bin/post_text      https://nghttp2.org/httpbin/post
 bin/json_request   https://nghttp2.org/httpbin/post
 bin/xml_request    https://nghttp2.org/httpbin/xml
 bin/threaded_get   https://nghttp2.org/ 8 25
+bin/sse_stream     http://127.0.0.1:8091/events   # tools/validate/sse_server.py
 ```
 
 | Program | Shows |
@@ -316,13 +324,14 @@ bin/threaded_get   https://nghttp2.org/ 8 25
 | `json_request.pas` | `WithJsonBody` + `ReadJsonObject` (`TJSONObject`). |
 | `xml_request.pas` | `WithXmlBody` + `ReadXmlDocument` (`TXMLDocument`). |
 | `threaded_get.pas` | Many threads sharing one client and its pool. |
+| `sse_stream.pas` | `SseRequest` + `TSseReconnectLoop` over an event stream. |
 
 ## Project layout
 
 | Path | Content |
 |---|---|
 | `src/` | The library units. |
-| `examples/` | Five small, runnable programs. See [Examples](#examples). |
+| `examples/` | Six small, runnable programs. See [Examples](#examples). |
 | `test/` | The unit suite, the mock socket, and the `h2probe` CLI. |
 | `tools/validate/` | The interop, sanity, and harness scripts. |
 | `bin/` | The build output. |
@@ -336,6 +345,8 @@ bin/threaded_get   https://nghttp2.org/ 8 25
 - `doc/http2client.md` gives the document map.
 - `doc/design/client-api.md` gives the full factory surface.
 - `doc/design/messages.md` gives the request and response types.
+- `doc/design/server-sent-events.md` gives the SSE parser, source, and
+  reconnect/resume loop.
 - `doc/design/errors-redirects.md` gives the exceptions and the timeouts.
 - `doc/verification/validation.md` gives the validation results and the reasons.
 - `doc/verification/toolchain.md` gives the exact tool versions and revisions.
@@ -353,6 +364,10 @@ and to the raw sweep log at `[[harness-log]]`.
 - The cleartext warning is not wired to the observer: `IHttp2Observer` has
   no cleartext event, so a cleartext request is currently silent. Tracked in
   `doc/design/open-questions.md` and `doc/design/fallback.md`.
+- Server-Sent Events are full-featured over HTTP/2. Over the HTTP/1.1
+  fallback they are best-effort: an idle stream is bounded by the socket
+  read timeout and a blocked read cannot be cancelled. See
+  `doc/design/server-sent-events.md`.
 
 ## License
 

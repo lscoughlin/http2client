@@ -1,6 +1,6 @@
 /// Structured-format readers and senders for http2client: JSON and XML.
 // - this unit is part of the http2client project (see doc/design/messages.md).
-// - the 13-unit core library deliberately keeps no fpjson/fcl-xml dependency.
+// - the 14-unit core library deliberately keeps no fpjson/fcl-xml dependency.
 //   The structured formats therefore live here, in one optional unit. Add
 //   `Http2.Readers` to your uses clause only when you need JSON or XML.
 // - fcl-json (fpjson/jsonparser) and fcl-xml (DOM/XMLRead/XMLWrite) are pure

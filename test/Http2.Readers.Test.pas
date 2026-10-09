@@ -1,5 +1,5 @@
 /// Structured-format reader/sender tests (src/Http2.Readers.pas).
-// - JSON and XML live in Http2.Readers, OUTSIDE the 13-unit core, so this unit
+// - JSON and XML live in Http2.Readers, OUTSIDE the 14-unit core, so this unit
 //   is the gate that the optional unit still compiles and works.
 // - non-vacuous: every Read helper is shown to actually parse (a member value
 //   is asserted), and every error path is shown to raise EHttpProtocolError.

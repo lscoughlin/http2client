@@ -7,7 +7,7 @@ tags:
   - verification
 status: done
 up: "[[http2client]]"
-updated: 2026-10-08
+updated: 2026-10-09
 ---
 
 # Toolchain and environment
@@ -106,8 +106,8 @@ IDE as a design-time package.
 | Fact | Value |
 |---|---|
 | Package name / type | `http2client`, `RunAndDesignTime`, `Version 0.16.0` |
-| Units | all 15 in `src/`, `Http2.pas` (umbrella) first; `Http2.Readers.pas` is the optional JSON/XML unit, and `Http2.Encoding.pas` holds the content codings |
-| Test suite | 350 tests, 0 errors, 0 failures (registration list: `test/Http2.TestRunner.pas`); see [[testing-observability]] |
+| Units | all 16 in `src/`, `Http2.pas` (umbrella) first; `Http2.Readers.pas` is the optional JSON/XML unit, and `Http2.Encoding.pas` holds the content codings, `Http2.Sse.pas` the Server-Sent Events reader |
+| Test suite | 409 tests, 0 errors, 0 failures (registration list: `test/Http2.TestRunner.pas`); see [[testing-observability]] |
 | `OtherUnitFiles` | `src` + the four vendored mormot dirs (`core`, `lib`, `net`, `crypt`) |
 | `RequiredPkgs` | `FCL` **only** — deliberately **not** the IDE `mormot2` package (see below) |
 | Unit output | `lib/$(TargetCPU)-$(TargetOS)` (gitignored) |
@@ -154,14 +154,19 @@ lazbuild --opt=-Fu/tmp/lpkintf \
 
 Verified: `83049 lines compiled`, all 13 units produced `.ppu`/`.o` in
 `lib/aarch64-darwin/`. A stock Lazarus matched to its FPC would not need the
-`--opt` workaround. (`Http2.Readers.pas` was added after that build, so the
-current count is 14 and a fresh `lazbuild` compiles one more unit than the
-`83049 lines` figure above.)
+`--opt` workaround. (`Http2.Readers.pas` was added after that build and
+`Http2.Sse.pas` after that, so the packages now list 16 units and a fresh
+`lazbuild` compiles three more units than the `83049 lines` figure above.)
+
+When the note last counted: `make test` reports **409 tests, 0 errors, 0
+failures** (350 before [[server-sent-events]]) and `make examples` builds
+six programs.
 
 ## Example programs
 
-`examples/` holds five programs (`basic_get`, `post_text`, `json_request`,
-`xml_request`, `threaded_get`) — see `examples/README.md`. Build and run:
+`examples/` holds six programs (`basic_get`, `post_text`, `json_request`,
+`xml_request`, `threaded_get`, `sse_stream`) — see `examples/README.md`.
+Build and run:
 
 ```sh
 make examples          # or: task examples  ->  bin/<source-stem>

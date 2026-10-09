@@ -12,7 +12,7 @@ related:
   - "[[client-api]]"
   - "[[transport]]"
   - "[[fpc-runtime]]"
-updated: 2026-10-08
+updated: 2026-10-09
 ---
 
 # Architecture
@@ -85,7 +85,7 @@ Layering, top down:
 
 ## Unit layout and naming
 
-Fourteen units in `src/`, listed in dependency order:
+Fifteen units in `src/`, listed in dependency order:
 
 ```pascal
 unit Http2.Errors;      // EHttpError hierarchy, THttp2ErrorCode
@@ -108,10 +108,11 @@ unit Http2.Client;      // THttpClientFactory, IHttpClient, THttpRequest,
                         // IHttp2SocketFactory, TResponseReader<T>,
                         // WithTextBody / ReadText
 unit Http2.Readers;     // optional: JSON/XML readers + send helpers (fcl-json/fcl-xml)
+unit Http2.Sse;         // TSseEventParser, TSseSource, TSseReconnectLoop, SseRequest
 unit Http2;             // umbrella: re-exports every unit above EXCEPT Http2.Readers
 ```
 
-`Http2.Readers` is deliberately **outside** the umbrella and the 13-unit
+`Http2.Readers` is deliberately **outside** the umbrella and the 14-unit
 core: it is the only unit that depends on `fcl-json`/`fcl-xml`, so a caller
 links it only by naming it in their own `uses` clause. See [[messages]].
 
