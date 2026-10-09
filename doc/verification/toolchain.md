@@ -105,7 +105,7 @@ IDE as a design-time package.
 
 | Fact | Value |
 |---|---|
-| Package name / type | `http2client`, `RunAndDesignTime`, `Version 0.16.0` |
+| Package name / type | `http2client`, `RunAndDesignTime`, `Version 0.17.0` |
 | Units | all 16 in `src/`, `Http2.pas` (umbrella) first; `Http2.Readers.pas` is the optional JSON/XML unit, and `Http2.Encoding.pas` holds the content codings, `Http2.Sse.pas` the Server-Sent Events reader |
 | Test suite | 409 tests, 0 errors, 0 failures (registration list: `test/Http2.TestRunner.pas`); see [[testing-observability]] |
 | `OtherUnitFiles` | `src` + the four vendored mormot dirs (`core`, `lib`, `net`, `crypt`) |
@@ -155,8 +155,9 @@ lazbuild --opt=-Fu/tmp/lpkintf \
 Verified: `83049 lines compiled`, all 13 units produced `.ppu`/`.o` in
 `lib/aarch64-darwin/`. A stock Lazarus matched to its FPC would not need the
 `--opt` workaround. (`Http2.Readers.pas` was added after that build and
-`Http2.Sse.pas` after that, so the packages now list 16 units and a fresh
-`lazbuild` compiles three more units than the `83049 lines` figure above.)
+`Http2.Sse.pas` after that; re-running the recipe at 0.17.0 gives
+`85387 lines compiled` and 16 `Http2` units plus the auto-created
+`http2client` registration unit in `lib/aarch64-darwin/`.)
 
 When the note last counted: `make test` reports **409 tests, 0 errors, 0
 failures** (350 before [[server-sent-events]]) and `make examples` builds
