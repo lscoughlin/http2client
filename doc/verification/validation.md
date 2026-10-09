@@ -226,8 +226,8 @@ when A and B are green.
 | `third_party/h2-client-test-harness` | git `0bc075c` |
 | Container runtime | Rancher Desktop `docker` (`~/.rd/bin/docker`) |
 | Unit suite (2026-10-05, at that revision) | 292 tests, 0 errors, 0 failures |
-| Unit suite (current) | 317 tests, 0 errors, 0 failures |
-| Library units | 14 in `src/` (13 core + optional `Http2.Readers`) |
+| Unit suite (current) | 350 tests, 0 errors, 0 failures |
+| Library units | 15 in `src/` (14 core + optional `Http2.Readers`) |
 | Example programs | 5 in `examples/` (`make examples`) |
 
 Skips, each with its reason: **A.8** (no nghttpd GOAWAY trigger; covered by

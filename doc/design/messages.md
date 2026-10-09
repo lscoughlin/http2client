@@ -157,6 +157,7 @@ type
     function WithMethod(const AMethod: THttpMethod): THttpRequest;
     function WithMethodToken(const AToken: string): THttpRequest;  // escape hatch
     function WithHeader(const AName, AValue: string): THttpRequest;
+    function WithAcceptEncoding(const AValue: string): THttpRequest;
     function WithBody(const ABody: THttpBody): THttpRequest;
     function WithBodyWriter(const AWriter: IBodyWriter): THttpRequest;
     function Url: string;
