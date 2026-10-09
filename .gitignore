@@ -22,7 +22,7 @@ third_party/**/*.ppu
 third_party/mORMot2/
 third_party/h2-client-test-harness/
 
-# --- Pi harness scratch state -------------------------------------------------
+# Pi harness scratch state
 .pi/
 plan/
 

@@ -22,7 +22,7 @@
         </SyntaxOptions>
       </Parsing>
     </CompilerOptions>
-    <Files Count="14">
+    <Files Count="15">
       <Item1>
         <Filename Value="src/Http2.pas"/>
         <UnitName Value="Http2"/>
@@ -79,6 +79,10 @@
         <Filename Value="src/Http2.Readers.pas"/>
         <UnitName Value="Http2.Readers"/>
       </Item14>
+      <Item15>
+        <Filename Value="src/Http2.Encoding.pas"/>
+        <UnitName Value="Http2.Encoding"/>
+      </Item15>
     </Files>
     <RequiredPkgs Count="1">
       <Item1>

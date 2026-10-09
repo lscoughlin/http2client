@@ -282,6 +282,34 @@ flowchart TB
   `IResponseReader<T>` reads to EOF then decodes; an incremental one decodes
   per chunk.
 
+## Content coding
+
+`src/Http2.Encoding.pas` holds the content codings the client understands:
+gzip (RFC 1952) and deflate (RFC 1950, or a bare deflate stream). The codecs
+use the zlib bindings that Free Pascal ships with the compiler
+(`paszlib`/`zstream`), so the unit adds no dependency.
+
+The client offers no coding by default. A caller opts in with
+`THttpRequest.WithAcceptEncoding('gzip, deflate')`, which sets the
+`accept-encoding` header. When the response names a coding the client
+understands, the body is decoded transparently: the response is wrapped so
+that `Body` yields plain bytes, and the `content-encoding` header (with a
+`content-length` that no longer counts) is removed. Every reader therefore
+sees plain bytes, whether it is `ReadText`, `ReadAllBodyBytes`, or a typed
+reader.
+
+`ReadText` only copies bytes verbatim; the decode happens below it, in the
+body stream, so it needs no special case.
+
+Two problems in the field shape the code:
+
+- A server may send a bare deflate stream under the name `deflate`. The
+decoder detects the container from the first two bytes (RFC 1950 section
+2.2) and falls back to a bare stream when the header is absent.
+- A response body is not seekable, so the gzip decoder cannot seek to the
+footer to check the CRC. FPC's `TGZipDecompressionStream` skips that check
+when the seek fails, which is what the body adapter arranges.
+
 ## Text, JSON, and XML helpers
 
 Three convenience layers sit on top of the streaming API. They exist so the

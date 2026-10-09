@@ -34,5 +34,12 @@ They are not covered by the Apache License, Version 2.0.
    License: the MIT License.
    This project uses these programs as external test tools only.
 
+5. The Free Pascal zlib bindings (paszlib, zstream)
+   License: part of the Free Pascal Runtime Library, which the Free Pascal
+   project distributes under the modified GNU Lesser General Public License,
+   version 2.1, with the linking exception. This project compiles against
+   the bindings that ship with the compiler; it includes no Free Pascal
+   source. No extra dependency is added.
+
 Test-only files under test/certs/ are self-signed certificates that the test
 scripts generate. They carry no rights and they are not for production use.

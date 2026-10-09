@@ -20,7 +20,8 @@ uses
   Http2.Redirects.Test, Http2.Timeouts.Test,
   Http2.Readers.Test,
   Http2.MockSocket, Http2.HpackProps.Test, Http2.Concurrency.Test,
-  Http2.ProbeOutcome.Test, Http2.ClearText.Test, Http2.Http1.Test;
+  Http2.ProbeOutcome.Test, Http2.ClearText.Test, Http2.Http1.Test,
+  Http2.Encoding.Test;
 
 type
   TTestProbe = class(TTestCase)

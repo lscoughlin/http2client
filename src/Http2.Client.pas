@@ -23,7 +23,7 @@ uses
   Sockets,
   Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack,
   Http2.Tls, Http2.Connection, Http2.Stream, Http2.Observer, Http2.Messages,
-  Http2.Http1;
+  Http2.Http1, Http2.Encoding;
 
 const
   /// documented factory defaults (doc/design/client-api.md "HttpClientFactory")
@@ -145,6 +145,13 @@ type
     /// escape hatch for extension verbs; the token is validated and uppercased
     function WithMethodToken(const AToken: string): THttpRequest;
     function WithHeader(const AName, AValue: string): THttpRequest;
+    /// offer a content coding for the response body
+    /// - the header `accept-encoding` carries AValue (for example
+    ///  'gzip, deflate'). A response that answers with one of those codings
+    ///  is decoded transparently, so a reader sees plain bytes either way.
+    ///  The client offers nothing by default, which keeps a response body
+    ///  byte-for-byte what the peer sent.
+    function WithAcceptEncoding(const AValue: string): THttpRequest;
     function WithBody(const ABody: THttpBody): THttpRequest;
     function WithBodyWriter(const AWriter: IBodyWriter): THttpRequest;
     /// attach a cancellation token; cancelling it resets the stream in flight
@@ -1176,6 +1183,11 @@ begin
   Result.FHeaders.Add(AName, AValue);
 end;
 
+function THttpRequest.WithAcceptEncoding(const AValue: string): THttpRequest;
+begin
+  Result := WithHeader(HeaderAcceptEncoding, AValue);
+end;
+
 function THttpRequest.WithBody(const ABody: THttpBody): THttpRequest;
 begin
   if FBodyWriter <> nil then
@@ -1623,7 +1635,9 @@ begin
           ecCancel);
       raise EHttpTimeout.Create('timed out waiting for response headers');
     end;
-    Result := THttpResponse.Create(Lease, Keep, Self);
+    // a body coded by the peer is decoded here, at the one place every
+    // response is built, so ReadText and every typed reader inherit it
+    Result := WrapDecodingResponse(THttpResponse.Create(Lease, Keep, Self));
   finally
     FLock.Release;
   end;
@@ -1715,7 +1729,8 @@ begin
       Lease.ReleaseLease;
       raise EHttpTimeout.Create('timed out waiting for response headers');
     end;
-    Result := THttpResponse.Create(Lease, Keep, Self);
+    // a body coded by the peer is decoded here (mirrors AcquireCancellable)
+    Result := WrapDecodingResponse(THttpResponse.Create(Lease, Keep, Self));
   finally
     FLock.Release;
   end;

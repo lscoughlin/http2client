@@ -18,7 +18,8 @@ interface
 uses
   SysUtils, Classes, SyncObjs, Generics.Collections, fpcunit, testregistry,
   Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack,
-  Http2.Tls, Http2.Connection, Http2.Stream, Http2.Messages, Http2.Client, Http2.Observer;
+  Http2.Tls, Http2.Connection, Http2.Stream, Http2.Messages, Http2.Client,
+  Http2.Observer, Http2.Encoding;
 
 type
   /// a scripted in-memory HTTP/2 server: parses every frame the client writes
@@ -34,6 +35,7 @@ type
     FStatus: string;
     FBody: TBytes;
     FEndStream: Boolean;
+    FRespHeaders: THeaderBlock;
     FCodec: THpackCodec;
     FConnected: Boolean;
     FConnectTimeoutMs, FReadTimeoutMs, FWriteTimeoutMs: Integer;
@@ -46,6 +48,8 @@ type
     destructor Destroy; override;
     procedure SetResponse(const AStatus: string; const ABody: TBytes;
       const AEndStream: Boolean);
+    /// add a response header field to every response this socket answers
+    procedure AddResponseHeader(const AName, AValue: string);
     function Read(var ABuffer; ACount: Integer): Integer;
     function Write(const ABuffer; ACount: Integer): Integer;
     procedure Close;
@@ -68,6 +72,7 @@ type
     FResponseBody: TBytes;
     FResponseEndStream: Boolean;
     FResponseStatus: string;
+    FResponseHeaders: THeaderBlock;
   public
     constructor Create;
     destructor Destroy; override;
@@ -76,6 +81,8 @@ type
     function Dials: Integer;
     procedure SetResponse(const AStatus: string; const ABody: TBytes;
       const AEndStream: Boolean);
+    /// add a response header field that every dialled socket will answer
+    procedure AddResponseHeader(const AName, AValue: string);
   end;
 
   /// a fake IConnectionStream used only to raise a connection's stream count
@@ -167,6 +174,9 @@ type
     procedure TestDocumentedFluentChainBuilds;
     // 09.2
     procedure TestSendReturnsStatusHeadersAndBody;
+    procedure TestSendDecodesAGzipBody;
+    procedure TestSendLeavesAnUncodedBodyAlone;
+    procedure TestSendKeepsAnUnknownCodingRaw;
     // 09.3
     procedure TestResponseReaderDecodesBytes;
     procedure TestResponseReaderDecodesString;
@@ -209,6 +219,7 @@ begin
   FStatus := '200';
   FBody := nil;
   FEndStream := True;
+  FRespHeaders := nil;
   FConnected := True;
   FConnectTimeoutMs := 1000;
   FReadTimeoutMs := 1000;
@@ -239,6 +250,22 @@ begin
   end;
 end;
 
+procedure TFakeServerSocket.AddResponseHeader(const AName, AValue: string);
+var
+  N: Integer;
+begin
+  FLock.Acquire;
+  try
+    N := Length(FRespHeaders);
+    SetLength(FRespHeaders, N + 1);
+    FRespHeaders[N].Name := AName;
+    FRespHeaders[N].Value := AValue;
+    FRespHeaders[N].Sensitive := False;
+  finally
+    FLock.Release;
+  end;
+end;
+
 function TFakeServerSocket.FrameBytes(const AF: TFrame): TBytes;
 var
   MS: TMemoryStream;
@@ -260,11 +287,16 @@ var
   Block: THeaderBlock;
   Enc: TBytes;
   F: TFrame;
+  I, N: Integer;
 begin
-  SetLength(Block, 1);
+  // ':status' is first, then every header this socket was told to add
+  N := Length(FRespHeaders);
+  SetLength(Block, N + 1);
   Block[0].Name := ':status';
   Block[0].Value := FStatus;
   Block[0].Sensitive := False;
+  for I := 0 to N - 1 do
+    Block[I + 1] := FRespHeaders[I];
   Enc := FCodec.Encode(Block);
   if Length(FBody) = 0 then
   begin
@@ -411,6 +443,7 @@ begin
   FResponseStatus := '200';
   FResponseBody := nil;
   FResponseEndStream := True;
+  FResponseHeaders := nil;
 end;
 
 destructor TFakeSocketFactory.Destroy;
@@ -436,16 +469,36 @@ function TFakeSocketFactory.Dial(const AHost: string; const APort: Word;
   const ATimeoutMs: Integer): IHttp2Socket;
 var
   S: TFakeServerSocket;
+  I: Integer;
 begin
   S := TFakeServerSocket.Create;
   FLock.Acquire;
   try
     Inc(FDials);
     S.SetResponse(FResponseStatus, FResponseBody, FResponseEndStream);
+    for I := 0 to High(FResponseHeaders) do
+      S.AddResponseHeader(FResponseHeaders[I].Name,
+        FResponseHeaders[I].Value);
   finally
     FLock.Release;
   end;
   Result := S;
+end;
+
+procedure TFakeSocketFactory.AddResponseHeader(const AName, AValue: string);
+var
+  N: Integer;
+begin
+  FLock.Acquire;
+  try
+    N := Length(FResponseHeaders);
+    SetLength(FResponseHeaders, N + 1);
+    FResponseHeaders[N].Name := AName;
+    FResponseHeaders[N].Value := AValue;
+    FResponseHeaders[N].Sensitive := False;
+  finally
+    FLock.Release;
+  end;
 end;
 
 function TFakeSocketFactory.Dials: Integer;
@@ -772,6 +825,67 @@ begin
   AssertEquals('status decoded from the wire', 200, R.StatusCode);
   AssertEquals('body streamed', '', ReadWholeBody(R.Body));
   AssertEquals('exactly one connection dialled', 1, Factory.Dials);
+  Client.Close;
+end;
+
+procedure TClientTest.TestSendDecodesAGzipBody;
+var
+  Factory: TFakeSocketFactory;
+  Client: IHttpClient;
+  R: IHttpResponse;
+begin
+  Factory := TFakeSocketFactory.Create;
+  Factory.SetResponse('200', GzipCompress(BytesOf('a gzipped body')), True);
+  Factory.AddResponseHeader('content-encoding', 'gzip');
+  Client := THttpClientFactory.Create
+    .WithSocketFactory(Factory)
+    .Build;
+  R := Client.Send(THttpRequest.Create(hmGet, 'https://api.example/thing')
+    .WithAcceptEncoding('gzip'));
+  AssertEquals('status decoded from the wire', 200, R.StatusCode);
+  // the decode happens below ReadText, so a plain read yields plain bytes
+  AssertEquals('the gzip body is decoded transparently', 'a gzipped body',
+    ReadText(R));
+  AssertEquals('the coding header is removed', '',
+    R.Headers.GetFirst('content-encoding'));
+  Client.Close;
+end;
+
+procedure TClientTest.TestSendLeavesAnUncodedBodyAlone;
+var
+  Factory: TFakeSocketFactory;
+  Client: IHttpClient;
+  R: IHttpResponse;
+begin
+  Factory := TFakeSocketFactory.Create;
+  Factory.SetResponse('200', BytesOf('plain text'), True);
+  Client := THttpClientFactory.Create
+    .WithSocketFactory(Factory)
+    .Build;
+  R := Client.Send(THttpRequest.Create(hmGet, 'https://api.example/thing'));
+  AssertEquals('an uncoded body is returned as it arrived', 'plain text',
+    ReadText(R));
+  Client.Close;
+end;
+
+procedure TClientTest.TestSendKeepsAnUnknownCodingRaw;
+var
+  Factory: TFakeSocketFactory;
+  Client: IHttpClient;
+  R: IHttpResponse;
+begin
+  Factory := TFakeSocketFactory.Create;
+  Factory.SetResponse('200', BytesOf('brotli bytes'), True);
+  Factory.AddResponseHeader('content-encoding', 'br');
+  Client := THttpClientFactory.Create
+    .WithSocketFactory(Factory)
+    .Build;
+  R := Client.Send(THttpRequest.Create(hmGet, 'https://api.example/thing'));
+  // an unsupported coding is not decoded, and the header still names it
+  AssertEquals('an unknown coding reaches the caller raw', 'brotli bytes',
+    ReadText(R));
+  AssertEquals('the unknown coding header is kept', 'br',
+    R.Headers.GetFirst('content-encoding'));
   Client.Close;
 end;
 
