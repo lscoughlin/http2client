@@ -35,6 +35,8 @@ type
     procedure TestDefaultPortOmittedFromAuthority;
     procedure TestNonDefaultPortKeptInAuthority;
     procedure TestEmptyPathBecomesSlash;
+    procedure TestForkedRequestSharesTheHeaderMap;
+    procedure TestCloneBreaksHeaderSharing;
     procedure TestEncodedPseudoHeadersMatchRequest;
   end;
 
@@ -166,6 +168,48 @@ begin
   AssertEquals('query-only URL keeps the query', '?x=1', R.Path);
   R := THttpRequest.Create(hmGet, 'https://api.example/search?q=2');
   AssertEquals('path + query preserved', '/search?q=2', R.Path);
+end;
+
+procedure TRequestTest.TestForkedRequestSharesTheHeaderMap;
+var
+  Base, Fork: THttpRequest;
+begin
+  // DOCUMENTED HAZARD (doc/design/messages.md): THttpRequest is a value
+  // record but Headers is an INTERFACE, so a plain record copy still shares
+  // one mutable header map. Forking and adding a header therefore leaks that
+  // header into the original. This is deliberate library behaviour; the test
+  // pins it so the hazard cannot change silently, and the next test shows the
+  // escape hatch. (Found live: TSseReconnectLoop echoed last-event-id back
+  // onto its caller's request this way.)
+  Base := THttpRequest.Create(hmGet, 'https://api.example/x');
+  Fork := Base.WithHeader('x-fork', '1');
+  AssertTrue('the fork sees its new header', Fork.Headers.Contains('x-fork'));
+  AssertTrue('and the original sees it too (shared map)',
+    Base.Headers.Contains('x-fork'));
+  AssertSame('both requests share one header instance',
+    Pointer(Base.Headers), Pointer(Fork.Headers));
+end;
+
+procedure TRequestTest.TestCloneBreaksHeaderSharing;
+var
+  Base, Copy: THttpRequest;
+begin
+  Base := THttpRequest.Create(hmGet, 'https://api.example/x')
+    .WithHeader('accept', 'text/event-stream');
+  Copy := Base.Clone.WithHeader('last-event-id', '7');
+  AssertEquals('the clone keeps the original headers', 'text/event-stream',
+    Copy.Headers.GetFirst('accept'));
+  AssertEquals('and carries the new one', '7',
+    Copy.Headers.GetFirst('last-event-id'));
+  AssertFalse('the original does not gain the new header',
+    Base.Headers.Contains('last-event-id'));
+  AssertFalse('the two requests have distinct header maps',
+    Pointer(Base.Headers) = Pointer(Copy.Headers));
+  // repeated headers survive the copy
+  Base := Base.WithHeader('accept', 'application/json');
+  Copy := Base.Clone;
+  AssertEquals('a repeated header keeps both values', 2,
+    Length(Copy.Headers.GetValues('accept')));
 end;
 
 procedure TRequestTest.TestEncodedPseudoHeadersMatchRequest;
