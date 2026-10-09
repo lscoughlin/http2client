@@ -5,6 +5,7 @@
 #   make          build the library units
 #   make test     build + run the fpcunit suite
 #   make examples compile the example programs into bin/
+#   make validate-sse  opt-in live SSE case against tools/validate/sse_server.py
 #   make clean    remove build outputs
 
 FPC        ?= fpc
@@ -22,7 +23,7 @@ TESTSRC    = $(wildcard test/*.pas)
 EXAMPLESRC = $(wildcard examples/*.pas)
 BIN        = bin
 
-.PHONY: all test examples clean validate-interop validate-harness validate
+.PHONY: all test examples clean validate-interop validate-harness validate-sse validate
 
 all: $(BIN)/libhttp2.a
 
@@ -51,5 +52,12 @@ validate-interop:
 
 validate-harness:
 	bash tools/validate/harness.sh
+
+# Opt-in live SSE gate: tools/validate/sse-live.sh starts the reference
+# event-stream server on a private port, runs the live case, then stops the
+# server again. The default suite skips that case (SSE_TEST_URL unset), so
+# this target is the only way it executes.
+validate-sse: all | $(BIN)
+	bash tools/validate/sse-live.sh
 
 validate: validate-interop validate-harness

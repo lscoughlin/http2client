@@ -90,7 +90,7 @@ tasks:
       - '{{.DOCKER}} build -t {{.HARNESS_IMAGE}} {{.HARNESS_REPO}}'
 
   build:
-    desc: Compile the library units into bin/ (all 14 Http2 units)
+    desc: Compile the library units into bin/ (all 15 Http2 units)
     cmds:
       - mkdir -p {{.BIN}}
       - '{{.FPC}} {{.FPCFLAGS}} -Cn -FE{{.BIN}} src/Http2.pas'
@@ -108,6 +108,7 @@ tasks:
       - '{{.FPC}} {{.FPCFLAGS}} -FE{{.BIN}} examples/json_request.pas'
       - '{{.FPC}} {{.FPCFLAGS}} -FE{{.BIN}} examples/xml_request.pas'
       - '{{.FPC}} {{.FPCFLAGS}} -FE{{.BIN}} examples/threaded_get.pas'
+      - '{{.FPC}} {{.FPCFLAGS}} -FE{{.BIN}} examples/sse_stream.pas'
     sources:
       - src/*.pas
       - examples/*.pas
@@ -131,6 +132,11 @@ tasks:
     desc: 'S12 non-vacuity checks — h2probe classification proof'
     cmds:
       - bash tools/validate/h2probe-sanity.sh
+
+  validate:sse:
+    desc: 'S14 live SSE gate — run the opt-in case against tools/validate/sse_server.py'
+    cmds:
+      - bash tools/validate/sse-live.sh
 
   validate:harness:
     desc: 'S12 gate B — 146-id h2-client-test-harness sweep (~30 min, Docker)'
