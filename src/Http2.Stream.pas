@@ -24,11 +24,39 @@ uses
   SysUtils, Classes, SyncObjs, Generics.Collections,
   Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack, Http2.Connection;
 
+const
+  /// polls as often as this many milliseconds while waiting for a cancel
+  /// (mirrors cCancelPollSliceMs in Http2.Client.pas: the lease cannot see
+  /// that constant, and a body read needs the same cadence)
+  cReadCancelPollSliceMs = 20;
+
 type
   /// the HTTP methods this client sends. The token is uppercased on the
   /// wire; THttpMethodToken exposes the token for a pseudo-header.
   THttpMethod = (hmGet, hmHead, hmPost, hmPut, hmDelete, hmConnect,
     hmOptions, hmTrace, hmPatch);
+
+  /// cooperative cancellation for an in-flight request or body read
+  // - declared here (not in Http2.Client.pas, which uses this unit) so a
+  //   TStreamLease can poll it on a blocked body read: a request carries one
+  //   through TStreamRequest.CancelToken and the lease resets the stream with
+  //   RST_STREAM(CANCEL) when it flips.
+  ICancellationToken = interface
+    ['{6B1C2D3E-4F50-4A61-9C72-0000000000C1}']
+    function IsCancelled: Boolean;
+  end;
+
+  /// the default thread-safe token: Cancel() may be called from any thread
+  TCancellationToken = class(TInterfacedObject, ICancellationToken)
+  private
+    FLock: TCriticalSection;
+    FCancelled: Boolean;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Cancel;
+    function IsCancelled: Boolean;
+  end;
 
   /// a pulled request body: NextChunk is called until it returns False, at
   /// which point the last emitted DATA frame carries END_STREAM
@@ -59,6 +87,15 @@ type
     Headers: IHttpHeaders;  // regular headers
     Body: THttpBody;        // fixed body; IsSet=False when absent
     BodyWriter: IBodyWriter;
+    /// the request's cancellation token (nil when none was supplied). The
+    /// lease polls it in WaitForResponseHeader and in ReadBody.
+    CancelToken: ICancellationToken;
+    /// response-body read deadline in ms. BodyReadTimeoutSet distinguishes
+    /// "use the header timeout" (False, the historic behaviour) from an
+    /// explicit value (True); when set, 0 means "wait indefinitely", which
+    /// a Server-Sent Events source relies on.
+    BodyReadTimeoutMs: Integer;
+    BodyReadTimeoutSet: Boolean;
     /// build a request with default scheme 'https', path '/', empty headers
     class function Create(const AMethod, AAuthority: string): TStreamRequest; static;
     class function WithMethod(const AMethod: THttpMethod;
@@ -68,6 +105,9 @@ type
     function WithHeader(const AName, AValue: string): TStreamRequest;
     function WithBody(const ABody: THttpBody): TStreamRequest;
     function WithBodyWriter(const AWriter: IBodyWriter): TStreamRequest;
+    function WithCancelToken(const AToken: ICancellationToken): TStreamRequest;
+    /// set the body read deadline explicitly (0 = wait indefinitely)
+    function WithBodyReadTimeout(const AMs: Integer): TStreamRequest;
   end;
 
   /// a response body stream (matches doc/design/messages.md IHttpBodyStream)
@@ -187,6 +227,11 @@ type
     procedure EmitHeaderBlock(const ABlock: TBytes; const AEndStream: Boolean);
     procedure EmitData(const AData: TBytes; const AEndStream: Boolean);
     function PopInbound(out AFrame: TFrame; const ATimeoutMs: Integer): Boolean;
+    /// wait for an inbound frame on the body read path, honouring the
+    /// request's own body-read deadline and polling its cancel token. Returns
+    /// False on shutdown, on the deadline, or when the token is cancelled;
+    /// the caller distinguishes the three.
+    function WaitForBodyFrame(out AFrame: TFrame): Boolean;
     procedure HandleInboundFrame(const AFrame: TFrame);
     procedure HandleHeaderFrame(const AFrame: TFrame);
     procedure HandleDataFrame(const AFrame: TFrame);
@@ -338,6 +383,9 @@ begin
   Result.Body.FIsSet := False;
   Result.Body.FData := nil;
   Result.BodyWriter := nil;
+  Result.CancelToken := nil;
+  Result.BodyReadTimeoutMs := 0;
+  Result.BodyReadTimeoutSet := False;
 end;
 
 function TStreamRequest.WithScheme(const AScheme: string): TStreamRequest;
@@ -379,6 +427,20 @@ begin
   Result.Body.FData := nil;
 end;
 
+function TStreamRequest.WithCancelToken(
+  const AToken: ICancellationToken): TStreamRequest;
+begin
+  Result := Self;
+  Result.CancelToken := AToken;
+end;
+
+function TStreamRequest.WithBodyReadTimeout(const AMs: Integer): TStreamRequest;
+begin
+  Result := Self;
+  Result.BodyReadTimeoutMs := AMs;
+  Result.BodyReadTimeoutSet := True;
+end;
+
 { TIStreamBody }
 
 constructor TIStreamBody.Create(const ALease: TStreamLease);
@@ -395,6 +457,41 @@ end;
 function TIStreamBody.Eof: Boolean;
 begin
   Result := FLease.BodyEof;
+end;
+
+{ TCancellationToken }
+
+constructor TCancellationToken.Create;
+begin
+  inherited Create;
+  FLock := TCriticalSection.Create;
+  FCancelled := False;
+end;
+
+destructor TCancellationToken.Destroy;
+begin
+  FLock.Free;
+  inherited Destroy;
+end;
+
+procedure TCancellationToken.Cancel;
+begin
+  FLock.Acquire;
+  try
+    FCancelled := True;
+  finally
+    FLock.Release;
+  end;
+end;
+
+function TCancellationToken.IsCancelled: Boolean;
+begin
+  FLock.Acquire;
+  try
+    Result := FCancelled;
+  finally
+    FLock.Release;
+  end;
 end;
 
 { TStreamIdAllocator }
@@ -781,6 +878,63 @@ begin
   end;
 end;
 
+function TStreamLease.WaitForBodyFrame(out AFrame: TFrame): Boolean;
+var
+  Deadline: QWord;
+  EffectiveMs: Integer;
+  HasDeadline: Boolean;
+  Slice: Integer;
+  Token: ICancellationToken;
+  Waiting: Boolean;
+begin
+  if FInbound.TryPop(AFrame) then
+    Exit(True);
+  Token := FRequest.CancelToken;
+  // an explicit body-read deadline (0 = wait indefinitely) overrides the
+  // historic header-timeout default; an unset request keeps FTimeoutMs so
+  // every existing caller behaves byte-for-byte as before
+  if FRequest.BodyReadTimeoutSet then
+    EffectiveMs := FRequest.BodyReadTimeoutMs
+  else
+    EffectiveMs := FTimeoutMs;
+  HasDeadline := EffectiveMs > 0;
+  if HasDeadline then
+    Deadline := GetTickCount64 + QWord(EffectiveMs);
+  while True do
+  begin
+    if FInbound.IsShutdown then
+      Exit(False);
+    if HasDeadline and (GetTickCount64 >= Deadline) then
+      Exit(False);
+    // poll the token every slice so a Cancel unblocks the read promptly;
+    // without a token this is one blocking wait (remaining deadline or,
+    // for an SSE stream, indefinitely)
+    if Token <> nil then
+      Slice := cReadCancelPollSliceMs
+    else if HasDeadline then
+      Slice := Integer(Deadline - GetTickCount64)
+    else
+      Slice := MaxInt;
+    if (Token <> nil) and Token.IsCancelled then
+      Exit(False);
+    Waiting := FInbound.WaitForItem(Slice);
+    if FInbound.TryPop(AFrame) then
+      Exit(True);
+    if not Waiting then
+    begin
+      // no item within the slice: either the queue shut down, the deadline
+      // expired, or a poll slice elapsed and the token may have flipped
+      if FInbound.IsShutdown then
+        Exit(False);
+      if (Token <> nil) and Token.IsCancelled then
+        Exit(False);
+      if HasDeadline and (GetTickCount64 >= Deadline) then
+        Exit(False);
+      Continue;
+    end;
+  end;
+end;
+
 procedure TStreamLease.HandleInboundFrame(const AFrame: TFrame);
 var
   Code: THttp2ErrorCode;
@@ -1065,7 +1219,13 @@ begin
       FBodyEofObserved := True;
       Exit(0);
     end;
-    if not PopInbound(Frame, FTimeoutMs) then
+    // A body read waits with its OWN deadline when the request set one
+    // (TStreamRequest.BodyReadTimeoutSet): 0 there means "wait
+    // indefinitely", which a Server-Sent Events stream needs because it is
+    // idle between events and must not be aborted by the header timeout.
+    // An unset request keeps the historic behaviour byte-for-byte: the
+    // existing FTimeoutMs deadline applies.
+    if not WaitForBodyFrame(Frame) then
     begin
       // the queue can shut down because the stream failed (RST_STREAM,
       // GOAWAY, connection loss) rather than because the deadline expired;
@@ -1074,6 +1234,16 @@ begin
       // WaitForResponseHeader)
       if FFailed then
         raise MakeStreamError;
+      if (FRequest.CancelToken <> nil) and
+         FRequest.CancelToken.IsCancelled then
+      begin
+        // abandon the stream the same way a cancelled Send does: reset it,
+        // never orphan it (doc/design/errors-redirects.md "Cancellation")
+        FConnection.PostFrame(BuildRstStreamFrame(FStreamId, ecCancel));
+        ReleaseLease;
+        raise EHttpStreamError.Create('body read cancelled', FStreamId,
+          ecCancel);
+      end;
       raise EHttpTimeout.Create('timed out reading response body');
     end;
     HandleInboundFrame(Frame);
