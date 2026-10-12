@@ -153,6 +153,11 @@ tasks:
     cmds:
       - bash tools/validate/websocket-live.sh autobahn
 
+  validate:cleartext:
+    desc: 'Live cleartext gate — a request is sent once under ctUpgrade (declined) and ctHttp1'
+    cmds:
+      - bash tools/validate/cleartext-live.sh
+
   validate:harness:
     desc: 'S12 gate B — 146-id h2-client-test-harness sweep (~30 min, Docker)'
     deps:

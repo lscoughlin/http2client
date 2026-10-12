@@ -75,7 +75,7 @@ is `test/Http2.RunTests.pas`. One test unit per source area:
 | `Http2.Readers.Test` | JSON/XML readers and send helpers |
 | `Http2.Concurrency.Test` | caps and backpressure under load |
 | `Http2.ProbeOutcome.Test` | `TProbeOutcome` classification |
-| `Http2.ClearText.Test` / `Http2.Http1.Test` | h2c and HTTP/1.1 fallback |
+| `Http2.ClearText.Test` / `Http2.Http1.Test` | h2c and HTTP/1.1 fallback; a declined upgrade and `ctHttp1` send each request once (the scripted peer counts the copies it received) |
 
 Property-style checks (HPACK `Decode(Encode(H)) = H`, window arithmetic,
 frame serialization) run alongside the example-based cases. Run with
@@ -141,7 +141,10 @@ runs `Http2.WebSocketLive.Test` over `ws` and `wss`, directly and through an
 HTTP `CONNECT` proxy, an `https://` proxy and a SOCKS5 proxy, and then reads
 the servers' logs: every client frame carried the mask bit, the handshake
 headers were as required, the close codes and the route were as expected.
-`task validate:websocket:autobahn` runs the Autobahn|Testsuite fuzzing server
+`task validate:cleartext` runs a bodyless `GET`, `POST`, `DELETE` and `HEAD`
+under `ctUpgrade` and `ctHttp1` against `tools/validate/h1_counter_server.py`,
+an HTTP/1.1-only server that logs each request, and checks that each arrived
+once. `task validate:websocket:autobahn` runs the Autobahn|Testsuite fuzzing server
 (Docker) against `tools/validate/autobahn_client.pas` and summarises its
 report; cases 12 and 13 (`permessage-deflate`) are excluded because the client
 offers no extension.

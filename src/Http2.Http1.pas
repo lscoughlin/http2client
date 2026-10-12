@@ -159,6 +159,12 @@ type
     /// parse the header fields and body framing that follow the status line
     /// already read by BeginResponse, and return the response
     function FinishResponse: IHttpResponse;
+    /// the request ARequest was already written on this socket by someone else
+    /// (the h2c upgrade probe) and AStatusLine is the status line it drew:
+    /// take that exchange over and return its response, without writing the
+    /// request again
+    function ResumeResponse(const ARequest: TStreamRequest;
+      const AStatusLine: string): IHttpResponse;
     /// hand the raw socket back to the caller without closing it, so it can
     /// be reused for another protocol.  PendingBytes must be 0 first.
     function Detach: IHttp2Socket;
@@ -1048,6 +1054,16 @@ begin
 
   Result := THttp1Response.Create(FVersion, FStatusCode, FReason, Headers,
     Body);
+end;
+
+function THttp1Connection.ResumeResponse(const ARequest: TStreamRequest;
+  const AStatusLine: string): IHttpResponse;
+begin
+  Inc(FRequestCount);
+  FSendRequest := ARequest;
+  ParseStatusLine(AStatusLine, FVersion, FStatusCode, FReason);
+  FBeginDone := True;
+  Result := FinishResponse;
 end;
 
 function THttp1Connection.Send(const ARequest: TStreamRequest): IHttpResponse;

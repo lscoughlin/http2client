@@ -226,7 +226,7 @@ when A and B are green.
 | `third_party/h2-client-test-harness` | git `0bc075c` |
 | Container runtime | Rancher Desktop `docker` (`~/.rd/bin/docker`) |
 | Unit suite (2026-10-05, at that revision) | 292 tests, 0 errors, 0 failures |
-| Unit suite (current) | 638 tests, 0 errors, 0 failures |
+| Unit suite (current) | 648 tests, 0 errors, 0 failures |
 | Library units | 20 in `src/` (19 core + optional `Http2.Readers`) |
 | Example programs | 8 in `examples/` (`make examples`) |
 
@@ -239,7 +239,18 @@ echoed `1001`, `1007` for invalid UTF-8) and the subprotocol list were as
 sent, `wss` negotiated `http/1.1` alone and a server without ALPN was accepted, and the proxy logs show the name sent unresolved over SOCKS5 and TLS
 inside TLS for `wss` behind an `https://` proxy. The Autobahn|Testsuite client
 run (`make validate-websocket-autobahn`) needs Docker; when the daemon is not
-running the script prints a SKIP, and no Autobahn result is recorded here.
+running the script prints a SKIP. Run against the `crossbario/autobahn-testsuite`
+fuzzing server (cases 12 and 13, which cover `permessage-deflate`, excluded),
+it covers 301 cases: 296 OK, 2 NON-STRICT (6.4.3 and 6.4.4, invalid UTF-8
+split across fragments, which the client rejects with the next fragment) and
+3 INFORMATIONAL (7.1.6, 7.13.1, 7.13.2), with no FAILED and no UNIMPLEMENTED.
+
+The opt-in cleartext gate (`make validate-cleartext`) runs a bodyless `GET`,
+`POST`, `DELETE` and `HEAD` under `ctUpgrade` and `ctHttp1` against
+`tools/validate/h1_counter_server.py` and counts the requests in the server's
+log. Each request arrives once; under `ctHttp1` none carries an `Upgrade`
+header. A client that redials after a declined upgrade logs each request
+twice and fails this gate.
 
 Skips, each with its reason: **A.8** (no nghttpd GOAWAY trigger; covered by
 unit tests), **C.6** (draft-09 plaintext `h2c`; client is TLS-only), **D**

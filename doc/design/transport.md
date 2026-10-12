@@ -198,7 +198,7 @@ idempotent methods (no body writer), and only on `ecRefusedStream` or a
   raises `EHttpProtocolError` by default. It does not fall back to HTTP/1.1
   without the caller's consent. `NPN` is not required.
 - **In scope since 2026-10-06:** cleartext `h2c` (prior knowledge and
-  upgrade) and HTTP/1.1 fallback. Both are available when the caller enables
+  upgrade), cleartext HTTP/1.1 without a probe, and HTTP/1.1 fallback. Both are available when the caller enables
   them. The default stays strict. See [[fallback]].
 - Certificate validation/trust configuration is a factory concern (hostname
   verification on by default).

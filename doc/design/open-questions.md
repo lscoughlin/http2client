@@ -51,6 +51,7 @@ Recorded in the owning note; listed here only as a lookup index.
 | `THttpRequest.Clone` deep-copies the header map; `WithHeader` on a fork mutates the original | [[messages]], [[server-sent-events]] |
 | `THttpBody` vs `IBodyWriter` precedence and redirect replayability | [[messages]], [[errors-redirects]] |
 | An HTTP/1.1 connection is **not** later upgraded to `h2` | [[fallback]] |
+| The client does not remember that an origin declined the h2c upgrade; each new connection sends the probe again, and the request is still sent once. `ctHttp1` avoids the probe | [[fallback]] |
 | SSE reconnect: wrapper, not transport; clean end or transient failure reconnects, a protocol error is terminal | [[server-sent-events]] |
 | WebSocket: RFC 6455 over HTTP/1.1 only (RFC 8441 and `permessage-deflate` are not implemented); demand-driven delivery; a dedicated unpooled connection per socket; the observer sees nothing of it | [[websocket]] |
 | SSE emits no observer event per message (frame/stream-level observer only); push support is caller-owned | [[server-sent-events]] |

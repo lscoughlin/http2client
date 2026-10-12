@@ -351,8 +351,11 @@ for `ws` as well.
   ([[transport]]).
 - Cleartext origins (`http://`, h2c and HTTP/1.1) tunnel the same way, which
   keeps one mechanism for every scheme.
-- The h2c upgrade's non-`101` redial and every other redial reuse the route of
-  the request that triggered them.
+- A declined h2c upgrade keeps the connection that carried it, so it opens no
+  second route. Any redial the client makes (a refused stream sent again, a
+  redirect) reuses the route of the request that triggered it. A cleartext
+  origin behind a proxy follows the same cleartext policy, and a request is
+  sent once.
 - A TLS layer carried over another byte stream (an `https` origin behind an
   `https://` proxy) runs OpenSSL on a pair of memory BIOs; the bytes are moved
   between OpenSSL and the lower stream by the TLS socket itself. A socket

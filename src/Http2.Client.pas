@@ -298,7 +298,8 @@ type
     function WithHttp1Fallback(const AEnable: Boolean = True): THttpClientFactory;
     /// select the cleartext policy for "http" origins.  The default ctReject
     /// raises EHttpProtocolError; ctPriorKnowledge speaks HTTP/2 at once;
-    /// ctUpgrade tries the HTTP/1.1 Upgrade dance first (doc/design/fallback.md).
+    /// ctUpgrade tries the HTTP/1.1 Upgrade dance first (doc/design/fallback.md);
+    /// ctHttp1 speaks cleartext HTTP/1.1 with no Upgrade probe.
     function WithClearText(const APolicy: TClearTextPolicy): THttpClientFactory;
     /// observability seam: every connection opened by Build reports its
     /// connection/stream/frame events to AObserver (doc/design/
@@ -504,6 +505,11 @@ type
     /// on a fresh connection (UnsupportedOperation is the honest answer)
     function AcquireUpgraded(const ARequest: TStreamRequest;
       const ATimeoutMs: Integer): IHttpResponse;
+    /// finish the response of a request already written on this socket (the
+    /// declined h2c upgrade probe) and mark the connection busy until its body
+    /// is drained
+    function Resume(const ARequest: TStreamRequest;
+      const AStatusLine: string): IHttpResponse;
     function Closed: Boolean;
     procedure Drain;
     procedure ReleaseIfIdle;
@@ -559,17 +565,22 @@ type
     /// Upgrade when the policy asks for it, and register the result under
     /// AOrigin.  AUpgraded is True when the connection is an unstarted HTTP/2
     /// connection on which the caller must adopt stream 1 via AcquireUpgraded.
+    /// AFirst is the response of a declined upgrade, already drawn from the
+    /// pooled HTTP/1.1 connection by the request the probe carried.
     function OpenForTxn(const AOrigin, AHost: string; const APort: Word;
       const ARequest: TStreamRequest; const AHeaderTimeoutMs: Integer;
       const AScheme: string; const AProxy: IProxy;
-      out AConn: IPooledConnection; out AUpgraded: Boolean): Boolean;
+      out AConn: IPooledConnection; out AUpgraded: Boolean;
+      out AFirst: IHttpResponse): Boolean;
     /// write the h2c Upgrade request on Sock and read the whole response head
     /// byte by byte.  True => 101 and the socket sits exactly at the HTTP/2
-    /// boundary; False => the peer declined and Sock must be discarded (its
-    /// exchange is half-read), so the pool re-dials for plain HTTP/1.1.
+    /// boundary; False => the peer declined, AStatusLine is the status line it
+    /// answered with and the socket sits right after it, so the pool carries
+    /// on with the HTTP/1.1 codec on the same socket (the request is never
+    /// written twice).
     // (RFC 7540 section 3.2 / doc/design/fallback.md "h2c upgrade procedure")
     function TryH2cUpgrade(const Sock: IHttp2Socket;
-      const ARequest: TStreamRequest): Boolean;
+      const ARequest: TStreamRequest; out AStatusLine: string): Boolean;
     procedure ReapClosed;
     procedure ReapIdleLocked;
     procedure MarkUsed(const C: IPooledConnection);
@@ -2121,6 +2132,25 @@ begin
   end;
 end;
 
+function THttp1PooledConnection.Resume(const ARequest: TStreamRequest;
+  const AStatusLine: string): IHttpResponse;
+begin
+  FLock.Acquire;
+  try
+    try
+      Result := FH1.ResumeResponse(ARequest, AStatusLine);
+      FLastBody := Result.Body;
+    except
+      // a half-read response leaves the stream unusable
+      FClosing := True;
+      FH1.Close;
+      raise;
+    end;
+  finally
+    FLock.Release;
+  end;
+end;
+
 function THttp1PooledConnection.AcquireUpgraded(const ARequest: TStreamRequest;
   const ATimeoutMs: Integer): IHttpResponse;
 begin
@@ -2333,7 +2363,7 @@ begin
   // factory predates per-request routing and is never given a proxy
   if AScheme = 'http' then
   begin
-    if FClearTextPolicy = ctUpgrade then
+    if FClearTextPolicy in [ctUpgrade, ctHttp1] then
       AProtocol := npHttp1Cleartext
     else
       AProtocol := npHttp2Cleartext;
@@ -2417,7 +2447,7 @@ begin
 end;
 
 function TConnectionPool.TryH2cUpgrade(const Sock: IHttp2Socket;
-  const ARequest: TStreamRequest): Boolean;
+  const ARequest: TStreamRequest; out AStatusLine: string): Boolean;
 var
   Raw: TBytes;
   Ofs, N: Integer;
@@ -2430,6 +2460,7 @@ begin
   // TStreamRequest.Headers (the shared map forbids connection-specific
   // fields), so the wire bytes are built here (doc/design/fallback.md
   // "h2c upgrade procedure").
+  AStatusLine := '';
   Raw := BuildH2cUpgradeRequest(ARequest);
   Ofs := 0;
   while Ofs < Length(Raw) do
@@ -2445,7 +2476,10 @@ begin
   ParseStatusLine(Line, Version, Status, Reason);
   Result := Status = 101;
   if not Result then
+  begin
+    AStatusLine := Line;
     Exit;
+  end;
   // the 101 head continues with Upgrade/Connection fields and the mandatory
   // empty line; consume them all before the socket becomes an HTTP/2
   // transport, else the connection thread frames those bytes as HTTP/2
@@ -2468,14 +2502,17 @@ function TConnectionPool.OpenForTxn(const AOrigin, AHost: string;
   const APort: Word; const ARequest: TStreamRequest;
   const AHeaderTimeoutMs: Integer; const AScheme: string;
   const AProxy: IProxy;
-  out AConn: IPooledConnection; out AUpgraded: Boolean): Boolean;
+  out AConn: IPooledConnection; out AUpgraded: Boolean;
+  out AFirst: IHttpResponse): Boolean;
 var
   Sock: IHttp2Socket;
   Protocol: TNegotiatedProtocol;
+  StatusLine: string;
 begin
   Result := False;
   AConn := nil;
   AUpgraded := False;
+  AFirst := nil;
   Sock := DialFor(AHost, APort, AScheme, FConnectTimeoutMs, AProxy, Protocol);
   try
     case Protocol of
@@ -2487,12 +2524,14 @@ begin
         AConn := WrapHttp1(Sock, AOrigin);
       npHttp1Cleartext:
         begin
-          // the caller chose ctUpgrade.  A bodyless request is eligible for
-          // the upgrade; a request with a body is NOT, because that would
-          // transmit the body twice (once in the probe, once over HTTP/2).
-          if ARequest.Body.IsSet or (ARequest.BodyWriter <> nil) then
+          // ctUpgrade probes; ctHttp1 never does.  A bodyless request is
+          // eligible for the probe; a request with a body is NOT, because
+          // that would transmit the body twice (once in the probe, once over
+          // HTTP/2).
+          if (FClearTextPolicy <> ctUpgrade) or ARequest.Body.IsSet or
+            (ARequest.BodyWriter <> nil) then
             AConn := WrapHttp1(Sock, AOrigin)
-          else if TryH2cUpgrade(Sock, ARequest) then
+          else if TryH2cUpgrade(Sock, ARequest, StatusLine) then
           begin
             // 101: the peer already answered the upgrade request and will
             // send its response on stream 1, so the socket is now an HTTP/2
@@ -2504,16 +2543,14 @@ begin
           end
           else
           begin
-            // non-101: the peer answered over HTTP/1.1 and the response head
-            // is already partly read, so this socket can no longer be handed
-            // to a fresh HTTP/1.1 codec.  Close it and speak plain HTTP/1.1 on
-            // a NEW connection (dialled through the same factory, so the
-            // codec/policy selection is unchanged), which then gets pooled
-            // (doc/design/fallback.md: "keep the HTTP/1.1 connection").
-            Sock.Close;
-            Sock := DialFor(AHost, APort, AScheme, FConnectTimeoutMs, AProxy,
-              Protocol);
+            // non-101: the probe is a complete HTTP/1.1 request, so the
+            // status line the peer answered with belongs to it.  Keep the
+            // socket as the pooled HTTP/1.1 connection and finish that
+            // response instead of sending the request again
+            // (doc/design/fallback.md "h2c upgrade procedure").
             AConn := WrapHttp1(Sock, AOrigin);
+            AFirst := (AConn as THttp1PooledConnection).Resume(ARequest,
+              StatusLine);
           end;
         end;
     end;
@@ -2536,6 +2573,7 @@ var
   Conn: IPooledConnection;
   Acquired, Upgraded: Boolean;
   Sliced: Integer;
+  First: IHttpResponse;
 begin
   Deadline := GetTickCount64 + QWord(AHeaderTimeoutMs);
   while True do
@@ -2543,6 +2581,7 @@ begin
     if (AToken <> nil) and AToken.IsCancelled then
       raise EHttpStreamError.Create('request cancelled', 0, ecCancel);
     Upgraded := False;
+    First := nil;
     FLock.Acquire;
     try
       ReapClosed;
@@ -2553,10 +2592,18 @@ begin
         // the one transport-selection point: TLS vs cleartext and the HTTP/2
         // vs HTTP/1.1 codec (doc/design/fallback.md "Negotiation")
         OpenForTxn(AOrigin, AHost, APort, ARequest, AHeaderTimeoutMs,
-          ARequest.Scheme, AProxy, Conn, Upgraded);
+          ARequest.Scheme, AProxy, Conn, Upgraded, First);
       end;
     finally
       FLock.Release;
+    end;
+
+    if First <> nil then
+    begin
+      // a declined h2c upgrade: the probe carried the request, so its
+      // response is the answer and the request is not written again
+      Result := First;
+      Exit;
     end;
 
     if Upgraded then
@@ -2838,7 +2885,8 @@ begin
   if (SchemeOfUrl(ARequest.Url) = 'http') and (FClearTextPolicy = ctReject) then
     raise EHttpProtocolError.Create(
       'cleartext origin rejected (set WithClearText(ctPriorKnowledge) or ' +
-      'WithClearText(ctUpgrade) to enable it)', ecProtocolError);
+      'WithClearText(ctUpgrade) or WithClearText(ctHttp1) to enable it)',
+      ecProtocolError);
   // the route is chosen per hop (a redirect re-enters here), on this thread
   // and outside the pool lock; a selector exception reaches the caller of Send
   Proxy := nil;

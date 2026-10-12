@@ -20,7 +20,7 @@ unit Http2.ClearText.Test;
 interface
 
 uses
-  SysUtils, Classes, SyncObjs, Generics.Collections, fpcunit, testregistry,
+  SysUtils, StrUtils, Classes, SyncObjs, Generics.Collections, fpcunit, testregistry,
   Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack,
   Http2.Tls, Http2.Connection, Http2.Stream, Http2.Messages, Http2.Client,
   Http2.Http1;
@@ -206,9 +206,64 @@ type
     procedure TestHttp1PooledConnectionReportsStreamLimitOne;
     // upgrade must not double-send a body
     procedure TestUpgradeWithBodyUsesPlainHttp1;
+    // a declined upgrade answers the request on the same socket: sent once
+    procedure TestDeclinedUpgradeSendsEachMethodOnce;
+    procedure TestDeclinedUpgradeConnectionServesTheNextRequest;
+    procedure TestDeclinedUpgradeConnectionCloseDialsAgain;
+    procedure TestDeclinedUpgradeChunkedBody;
+    procedure TestDeclinedUpgradeHeadResponseHasNoBody;
+    procedure TestDeclinedUpgradePeerClosesBeforeHeadDoesNotResend;
+    procedure TestDeclinedUpgradeReadToCloseBody;
+    // ctHttp1: cleartext HTTP/1.1 with no probe
+    procedure TestHttp1PolicyNeverProbes;
+    procedure TestHttp1PolicyFactoryFork;
+    procedure TestHttp1PolicyHttpsIsUnaffected;
   end;
 
 implementation
+
+function CountOccurrences(const AText, ANeedle: string): Integer;
+var
+  P: Integer;
+begin
+  Result := 0;
+  P := Pos(ANeedle, AText);
+  while P > 0 do
+  begin
+    Inc(Result);
+    P := PosEx(ANeedle, AText, P + Length(ANeedle));
+  end;
+end;
+
+/// how many times ANeedle was written across EVERY socket the factory handed
+/// out: the number of copies of a request the peer received
+function CountWritten(const AFactory: TScriptProtocolFactory;
+  const ANeedle: string): Integer;
+var
+  I: Integer;
+begin
+  Result := 0;
+  I := 0;
+  while AFactory.SocketAt(I) <> nil do
+  begin
+    Inc(Result, CountOccurrences(AFactory.SocketAt(I).WrittenText, ANeedle));
+    Inc(I);
+  end;
+end;
+
+/// drain the body and return its length
+function DrainBody(const R: IHttpResponse): Integer;
+var
+  Buf: array[0..63] of Byte;
+  N: LongInt;
+begin
+  Result := 0;
+  repeat
+    N := R.Body.Read(Buf, SizeOf(Buf));
+    if N > 0 then
+      Inc(Result, N);
+  until N <= 0;
+end;
 
 function TextBytes(const S: string): TBytes;
 begin
@@ -1023,9 +1078,8 @@ var
   N: LongInt;
   Total: Integer;
 begin
-  // the peer declines the upgrade: it answers 200 over HTTP/1.1.  The pool
-  // discards the half-read socket and dials a fresh one (same factory), so
-  // the second script must carry the 200 response
+  // the peer declines the upgrade: it answers 200 over HTTP/1.1 on the same
+  // socket, and that answer is the response to the request
   Factory := TScriptProtocolFactory.Create(npHttp1Cleartext,
     'HTTP/1.1 200 OK'#13#10'Content-Length: 5'#13#10#13#10'hello');
   Client := THttpClientFactory.Create
@@ -1041,10 +1095,11 @@ begin
     Inc(Total, N);
   until N <= 0;
   AssertEquals('the HTTP/1.1 body is returned', 5, Total);
-  // two dials: the upgrade probe, then the fresh HTTP/1.1 connection the
-  // declined exchange is re-issued on (the half-read socket is unusable)
-  AssertEquals('the upgrade was attempted and then re-dialled', 2,
-    Factory.Dials);
+  // one dial: the probe is a complete HTTP/1.1 request, so the connection it
+  // went out on carries the answer and the request is not sent again
+  AssertEquals('the declined upgrade keeps its connection', 1, Factory.Dials);
+  AssertEquals('the request went out once', 1,
+    CountWritten(Factory, 'GET /x HTTP/1.1'));
   Client.Close;
 end;
 
@@ -1134,6 +1189,230 @@ begin
     Pos('Content-Length: 7', Written) > 0);
   AssertTrue('no Upgrade header was sent for a body request',
     Pos('Upgrade: h2c', Written) = 0);
+  Client.Close;
+end;
+
+function NewUpgradeClient(const AFactory: TScriptProtocolFactory;
+  const APolicy: TClearTextPolicy): IHttpClient;
+begin
+  Result := THttpClientFactory.Create
+    .WithSocketFactory(AFactory)
+    .WithClearText(APolicy)
+    .WithConnectTimeout(200).WithHeaderTimeout(200)
+    .Build;
+end;
+
+procedure TClearTextTest.TestDeclinedUpgradeSendsEachMethodOnce;
+const
+  Names: array[0..2] of string = ('GET', 'POST', 'DELETE');
+var
+  Methods: array[0..2] of THttpMethod;
+  I: Integer;
+  Factory: TScriptProtocolFactory;
+  Client: IHttpClient;
+  R: IHttpResponse;
+begin
+  Methods[0] := hmGet;
+  Methods[1] := hmPost;
+  Methods[2] := hmDelete;
+  for I := 0 to 2 do
+  begin
+    Factory := TScriptProtocolFactory.Create(npHttp1Cleartext,
+      'HTTP/1.1 200 OK'#13#10'Content-Length: 2'#13#10#13#10'ok');
+    Client := NewUpgradeClient(Factory, ctUpgrade);
+    R := Client.Send(THttpRequest.Create(Methods[I],
+      'http://127.0.0.1:28082/x'));
+    AssertEquals(Names[I] + ' status', 200, R.StatusCode);
+    AssertEquals(Names[I] + ' body', 2, DrainBody(R));
+    AssertEquals(Names[I] + ' dials', 1, Factory.Dials);
+    AssertEquals(Names[I] + ' request copies the peer received', 1,
+      CountWritten(Factory, Names[I] + ' /x HTTP/1.1'));
+    Client.Close;
+  end;
+end;
+
+procedure TClearTextTest.TestDeclinedUpgradeConnectionServesTheNextRequest;
+var
+  Factory: TScriptProtocolFactory;
+  Client: IHttpClient;
+  R: IHttpResponse;
+begin
+  // two responses queued on one socket: the declined exchange leaves a pooled
+  // keep-alive HTTP/1.1 connection that answers the next request
+  Factory := TScriptProtocolFactory.Create(npHttp1Cleartext,
+    'HTTP/1.1 200 OK'#13#10'Content-Length: 1'#13#10#13#10'a' +
+    'HTTP/1.1 200 OK'#13#10'Content-Length: 1'#13#10#13#10'b');
+  Client := NewUpgradeClient(Factory, ctUpgrade);
+  R := Client.Send(THttpRequest.Create(hmGet, 'http://127.0.0.1:28082/x'));
+  AssertEquals('first body', 1, DrainBody(R));
+  R := Client.Send(THttpRequest.Create(hmGet, 'http://127.0.0.1:28082/y'));
+  AssertEquals('second status', 200, R.StatusCode);
+  AssertEquals('second body', 1, DrainBody(R));
+  AssertEquals('one connection served both', 1, Factory.Dials);
+  AssertEquals('the first request carried the probe once', 1,
+    CountWritten(Factory, 'Upgrade: h2c'));
+  AssertEquals('the second request is plain HTTP/1.1', 1,
+    CountWritten(Factory, 'GET /y HTTP/1.1'));
+  Client.Close;
+end;
+
+procedure TClearTextTest.TestDeclinedUpgradeConnectionCloseDialsAgain;
+var
+  Factory: TScriptProtocolFactory;
+  Client: IHttpClient;
+  R: IHttpResponse;
+begin
+  Factory := TScriptProtocolFactory.Create(npHttp1Cleartext,
+    'HTTP/1.1 200 OK'#13#10'Connection: close'#13#10 +
+    'Content-Length: 2'#13#10#13#10'ok');
+  Client := NewUpgradeClient(Factory, ctUpgrade);
+  R := Client.Send(THttpRequest.Create(hmGet, 'http://127.0.0.1:28082/x'));
+  AssertEquals('body', 2, DrainBody(R));
+  R := Client.Send(THttpRequest.Create(hmGet, 'http://127.0.0.1:28082/x'));
+  AssertEquals('body 2', 2, DrainBody(R));
+  AssertEquals('Connection: close retires the connection', 2, Factory.Dials);
+  AssertEquals('each request went out once on its own connection', 2,
+    CountWritten(Factory, 'GET /x HTTP/1.1'));
+  Client.Close;
+end;
+
+procedure TClearTextTest.TestDeclinedUpgradeChunkedBody;
+var
+  Factory: TScriptProtocolFactory;
+  Client: IHttpClient;
+  R: IHttpResponse;
+begin
+  Factory := TScriptProtocolFactory.Create(npHttp1Cleartext,
+    'HTTP/1.1 200 OK'#13#10'Transfer-Encoding: chunked'#13#10#13#10 +
+    '3'#13#10'abc'#13#10'2'#13#10'de'#13#10'0'#13#10#13#10);
+  Client := NewUpgradeClient(Factory, ctUpgrade);
+  R := Client.Send(THttpRequest.Create(hmPost, 'http://127.0.0.1:28082/x'));
+  AssertEquals('chunked body length', 5, DrainBody(R));
+  AssertEquals('dials', 1, Factory.Dials);
+  AssertEquals('sent once', 1, CountWritten(Factory, 'POST /x HTTP/1.1'));
+  Client.Close;
+end;
+
+procedure TClearTextTest.TestDeclinedUpgradeHeadResponseHasNoBody;
+var
+  Factory: TScriptProtocolFactory;
+  Client: IHttpClient;
+  R: IHttpResponse;
+begin
+  // a HEAD response advertises a length but carries no body
+  Factory := TScriptProtocolFactory.Create(npHttp1Cleartext,
+    'HTTP/1.1 200 OK'#13#10'Content-Length: 99'#13#10#13#10);
+  Client := NewUpgradeClient(Factory, ctUpgrade);
+  R := Client.Send(THttpRequest.Create(hmHead, 'http://127.0.0.1:28082/x'));
+  AssertEquals('status', 200, R.StatusCode);
+  AssertEquals('no body', 0, DrainBody(R));
+  AssertEquals('sent once', 1, CountWritten(Factory, 'HEAD /x HTTP/1.1'));
+  Client.Close;
+end;
+
+procedure TClearTextTest.TestDeclinedUpgradePeerClosesBeforeHeadDoesNotResend;
+var
+  Factory: TScriptProtocolFactory;
+  Client: IHttpClient;
+  Raised: Boolean;
+begin
+  Factory := TScriptProtocolFactory.Create(npHttp1Cleartext, '');
+  Client := NewUpgradeClient(Factory, ctUpgrade);
+  Raised := False;
+  try
+    Client.Send(THttpRequest.Create(hmPost, 'http://127.0.0.1:28082/x'));
+  except
+    on EHttpError do
+      Raised := True;
+  end;
+  AssertTrue('the failure reaches the caller', Raised);
+  AssertEquals('one dial', 1, Factory.Dials);
+  AssertEquals('the request is not sent again', 1,
+    CountWritten(Factory, 'POST /x HTTP/1.1'));
+  Client.Close;
+end;
+
+procedure TClearTextTest.TestDeclinedUpgradeReadToCloseBody;
+var
+  Factory: TScriptProtocolFactory;
+  Client: IHttpClient;
+  R: IHttpResponse;
+begin
+  Factory := TScriptProtocolFactory.Create(npHttp1Cleartext,
+    'HTTP/1.1 200 OK'#13#10#13#10'until-close');
+  Client := NewUpgradeClient(Factory, ctUpgrade);
+  R := Client.Send(THttpRequest.Create(hmGet, 'http://127.0.0.1:28082/x'));
+  AssertEquals('body runs to the end of the stream', 11, DrainBody(R));
+  AssertEquals('sent once', 1, CountWritten(Factory, 'GET /x HTTP/1.1'));
+  Client.Close;
+end;
+
+procedure TClearTextTest.TestHttp1PolicyNeverProbes;
+const
+  Names: array[0..1] of string = ('GET', 'POST');
+var
+  Methods: array[0..1] of THttpMethod;
+  I: Integer;
+  Factory: TScriptProtocolFactory;
+  Client: IHttpClient;
+  R: IHttpResponse;
+  Written: string;
+begin
+  Methods[0] := hmGet;
+  Methods[1] := hmPost;
+  for I := 0 to 1 do
+  begin
+    Factory := TScriptProtocolFactory.Create(npHttp1Cleartext,
+      'HTTP/1.1 200 OK'#13#10'Content-Length: 2'#13#10#13#10'ok');
+    Client := NewUpgradeClient(Factory, ctHttp1);
+    R := Client.Send(THttpRequest.Create(Methods[I],
+      'http://127.0.0.1:28082/x'));
+    AssertEquals(Names[I] + ' status', 200, R.StatusCode);
+    AssertEquals(Names[I] + ' body', 2, DrainBody(R));
+    Written := Factory.SocketAt(0).WrittenText;
+    AssertEquals(Names[I] + ' no Upgrade header', 0, Pos('Upgrade', Written));
+    AssertEquals(Names[I] + ' no HTTP2-Settings header', 0,
+      Pos('HTTP2-Settings', Written));
+    AssertEquals(Names[I] + ' sent once', 1,
+      CountWritten(Factory, Names[I] + ' /x HTTP/1.1'));
+    AssertTrue(Names[I] + ' policy reached the dial',
+      Factory.LastPolicy = ctHttp1);
+    Client.Close;
+  end;
+end;
+
+procedure TClearTextTest.TestHttp1PolicyFactoryFork;
+var
+  A, B: THttpClientFactory;
+begin
+  A := THttpClientFactory.Create;
+  B := A.WithClearText(ctHttp1);
+  AssertTrue('the fork carries ctHttp1', B.ClearTextPolicy = ctHttp1);
+  AssertTrue('the original is untouched', A.ClearTextPolicy = ctReject);
+end;
+
+procedure TClearTextTest.TestHttp1PolicyHttpsIsUnaffected;
+var
+  Factory: TNeverDialFactory;
+  Client: IHttpClient;
+  Raised: Boolean;
+begin
+  // ctHttp1 changes cleartext origins only: an https origin still dials TLS
+  // (the never-dial factory refuses, proving the dial happened)
+  Factory := TNeverDialFactory.Create;
+  Client := THttpClientFactory.Create
+    .WithSocketFactory(Factory)
+    .WithClearText(ctHttp1)
+    .WithConnectTimeout(200).WithHeaderTimeout(200)
+    .Build;
+  Raised := False;
+  try
+    Client.Send(THttpRequest.Create(hmGet, 'https://127.0.0.1:28083/x'));
+  except
+    on E: Exception do
+      Raised := True;
+  end;
+  AssertTrue('the https origin still takes the TLS dial', Raised);
   Client.Close;
 end;
 

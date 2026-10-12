@@ -40,11 +40,13 @@ type
   /// how the client treats a cleartext ("http") origin (doc/design/
   /// fallback.md "Factory surface").  ctReject is the default: a cleartext
   /// request raises instead of silently sending bytes in the clear.
+  /// ctHttp1 speaks cleartext HTTP/1.1 from the first byte, with no Upgrade
+  /// probe.
   // Declared here, not in Http2.Messages.pas: the transport layer acts on the
   // policy, and Http2.Messages already uses this unit for IHttp2Socket, so a
   // declaration there would be a circular unit reference.  Http2.Messages
   // re-exports these as aliases for callers that only use that unit.
-  TClearTextPolicy = (ctReject, ctPriorKnowledge, ctUpgrade);
+  TClearTextPolicy = (ctReject, ctPriorKnowledge, ctUpgrade, ctHttp1);
 
   /// the transport selected for one origin (doc/design/fallback.md)
   TNegotiatedProtocol = (npHttp2Tls, npHttp2Cleartext, npHttp1Tls,
@@ -1524,9 +1526,9 @@ begin
         raise EHttpProtocolError.Create(
           'cleartext origin rejected (set WithClearText to enable it)',
           ecProtocolError);
-      ctUpgrade:
-        // task 13.3 layers the HTTP/1.1 Upgrade dance on the cleartext socket;
-        // until then the caller drives HTTP/1.1 directly on this transport
+      ctUpgrade, ctHttp1:
+        // the cleartext socket speaks HTTP/1.1; under ctUpgrade the pool
+        // layers the Upgrade probe on it, under ctHttp1 it sends no probe
         begin
           AProtocol := npHttp1Cleartext;
           Result := TTlsSocket.DialCleartextVia(AHost, APort, ATimeoutMs, AProxy,

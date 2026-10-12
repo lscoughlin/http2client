@@ -97,7 +97,7 @@ Defaults:
 | `HeaderTimeoutMs` | `30000` | response-header deadline once headers are expected |
 | `IdleTimeoutMs` | `60000` | idle connection reap time |
 | `Http1Fallback` | `False` | allow HTTP/1.1 when the peer does not offer `h2`; see [[fallback]] |
-| `ClearTextPolicy` | `ctReject` | reject `http` origins; see [[fallback]] |
+| `ClearTextPolicy` | `ctReject` | reject `http` origins; `ctPriorKnowledge`, `ctUpgrade` and `ctHttp1` accept them (`ctHttp1` speaks HTTP/1.1 with no upgrade probe); see [[fallback]] |
 
 Two connection caps apply, because a pool has two different budgets: a
 **per-authority** one (how many TCP connections may serve one `host:port`, a

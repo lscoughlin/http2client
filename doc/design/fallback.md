@@ -15,7 +15,7 @@ related:
   - "[[client-api]]"
   - "[[errors-redirects]]"
   - "[[open-questions]]"
-updated: 2026-10-08
+updated: 2026-10-12
 ---
 
 # Cleartext h2c and HTTP/1.1 Fallback
@@ -25,7 +25,7 @@ It replaces the earlier decision in [[transport]] that both are out of scope.
 
 ## Scope
 
-The client supports four protocol modes. The client selects one mode for
+The client supports five protocol modes. The client selects one mode for
 each origin.
 
 | Mode | URL scheme | Transport | How the client selects it |
@@ -34,12 +34,13 @@ each origin.
 | `h2c` prior knowledge | `http` | TCP, cleartext | The caller sets the policy |
 | `h2c` upgrade | `http` | TCP, cleartext | The client sends an `Upgrade: h2c` request |
 | HTTP/1.1 | `https` or `http` | TLS or cleartext | ALPN selects `http/1.1`, or the upgrade fails |
+| HTTP/1.1, no probe | `http` | TCP, cleartext | The caller sets the policy |
 
 The default stays strict. The client uses `h2` over TLS only. Cleartext and
 HTTP/1.1 fallback are off until the caller enables them. See "Factory
 surface".
 
-All four modes are implemented and covered by tests and interop cases
+All five modes are implemented and covered by tests and interop cases
 A.10–A.13; see "Implementation status".
 
 WebSocket connections ([[websocket]]) sit outside these modes. They always
@@ -55,6 +56,10 @@ cleartext switches: a `ws://` URL connects under the default cleartext policy.
   `h2`.
 - **h2c prior knowledge.** The client sends the HTTP/2 connection preface at
   once on a cleartext TCP connection. The client does no negotiation.
+- **HTTP/1.1 without a probe.** The client speaks HTTP/1.1 on a cleartext
+  connection from the first byte. It sends no `Upgrade` header and never tries
+  HTTP/2 on that connection. This suits a server that only speaks HTTP/1.1,
+  where an upgrade can never succeed.
 - **h2c upgrade.** The client sends one HTTP/1.1 request. That request
   carries an `Upgrade: h2c` header. The peer answers with `101 Switching
   Protocols`. Then both peers use HTTP/2 on the same connection.
@@ -90,6 +95,8 @@ result for the origin. See [[client-api]] for lease acquisition.
    preface. Use HTTP/2. Send no `Upgrade` header.
 5. If the policy is **upgrade**, send the h2c upgrade procedure. See the
    next section.
+6. If the policy is **HTTP/1.1**, use the HTTP/1.1 codec on the connection.
+   Send no `Upgrade` header.
 
 ```mermaid
 flowchart TB
@@ -99,6 +106,7 @@ flowchart TB
   P -->|"ctReject"| REJ["raise EHttpProtocolError"]
   P -->|"ctPriorKnowledge"| PK["write HTTP/2 preface at once"]
   P -->|"ctUpgrade"| UP["HTTP/1.1 request with Upgrade: h2c"]
+  P -->|"ctHttp1"| H1P["HTTP/1.1 request, no Upgrade"]
   T --> A{"ALPN result"}
   A -->|"h2"| H2["HTTP/2 · write preface"]
   A -->|"http/1.1 or empty"| FB{"Http1Fallback?"}
@@ -107,7 +115,7 @@ flowchart TB
   FB -->|"off"| REJ
   UP --> R{"response code"}
   R -->|"101"| HU["switch to HTTP/2 on the same socket<br/>response to the request is the 101 body"]
-  R -->|"other"| H1U["stay HTTP/1.1 · use that response"]
+  R -->|"other"| H1U["stay HTTP/1.1 on the same socket · that response answers the request"]
 ```
 
 ## h2c upgrade procedure
@@ -124,10 +132,34 @@ The client does these steps one time for each connection:
    preface. The `101` response is the response to the request.
 7. If the upgrade fails, keep the HTTP/1.1 connection. Use the received
    response as the response to the request. The HTTP/1.1 codec then handles
-   all later requests.
+   all later requests on that connection.
 
 The upgrade adds one round trip. Prior knowledge does not. The client uses
 prior knowledge only when the caller sets that policy.
+
+### The request is sent once
+
+The upgrade request is a complete HTTP/1.1 request. It carries the caller's
+method, target, headers, and three extra headers: `Upgrade`, `Connection`, and
+`HTTP2-Settings`. A server that does not upgrade processes it like any other
+request and answers it. That answer is the response to the caller's request.
+The client reads it from the same socket and does not send the request again.
+
+The rule exists because sending a request twice repeats its effects. A bodyless
+`POST`, `PUT`, or `DELETE` can change state on the server, and a retry would
+change it twice. The same rule explains why a request with a body does not use
+the upgrade at all: the client would have to send the body in the probe and
+again over HTTP/2. A request with a body goes over plain HTTP/1.1.
+
+The connection that carried a declined upgrade stays in the pool. It serves
+later requests to the same origin as an ordinary HTTP/1.1 connection, until
+the server closes it or a response carries `Connection: close`. The next
+connection to that origin starts with a new upgrade request.
+
+The client re-sends a request in one other case: the peer refused the stream
+or sent `GOAWAY` for it, so the request was never processed, and the method is
+idempotent (see [[transport]]).
+
 
 Rule: the client must not send a later SETTINGS frame that conflicts with
 the `HTTP2-Settings` value. The client must apply the `HTTP2-Settings`
@@ -175,7 +207,8 @@ type
   TClearTextPolicy = (
     ctReject,           // default: raise EHttpProtocolError
     ctPriorKnowledge,   // send the HTTP/2 preface at once
-    ctUpgrade           // send an HTTP/1.1 Upgrade: h2c request
+    ctUpgrade,          // send an HTTP/1.1 Upgrade: h2c request
+    ctHttp1             // speak HTTP/1.1 with no Upgrade request
   );
 
   THttpClientFactory = record
@@ -200,6 +233,11 @@ Defaults:
 | --- | --- | --- |
 | `Http1Fallback` | `False` | the client requires `h2` |
 | `ClearTextPolicy` | `ctReject` | the client rejects `http` origins |
+
+`ctHttp1` is the policy for a cleartext server that only speaks HTTP/1.1, such
+as a local development server or a model runtime. `ctUpgrade` suits a server
+that may or may not accept `h2c`. `ctPriorKnowledge` suits a server known to
+speak `h2c`.
 
 ## Pool keys
 
@@ -239,6 +277,9 @@ Rules:
 4. The client must not fall back from `h2` to HTTP/1.1 without the caller's
    consent. A silent fallback can hide a downgrade attack.
 
+`ctHttp1` is a cleartext policy like the other two. It gives no
+confidentiality and no integrity, and the caller opts in to it on purpose.
+
 ## Implementation status
 
 All of the above is implemented:
@@ -247,7 +288,9 @@ All of the above is implemented:
 | --- | --- | --- |
 | `TClearTextPolicy` + factory methods | `src/Http2.Tls.pas`, `src/Http2.Client.pas` | defaults stay strict (`ctReject`, `Http1Fallback=False`) |
 | h2c prior knowledge | `src/Http2.Client.pas` (`TConnectionPool.TryH2cUpgrade` path, preface at once) | a GET against `nghttpd --no-tls` succeeds (A.10) |
-| h2c upgrade | `src/Http2.Client.pas:2107` (`AcquireUpgraded`, `BuildH2cUpgradeRequest`, `Http2SettingsBase64Url`) | a GET returns `101` then uses HTTP/2 (A.11) |
+| h2c upgrade | `src/Http2.Client.pas` (`AcquireUpgraded`, `BuildH2cUpgradeRequest`, `Http2SettingsBase64Url`) | a GET returns `101` then uses HTTP/2 (A.11) |
+| declined upgrade | `src/Http2.Client.pas` (`TConnectionPool.OpenForTxn`, `THttp1PooledConnection.Resume`), `src/Http2.Http1.pas` (`ResumeResponse`) | the request reaches the server once and the connection serves the next request (`Http2.ClearText.Test`, `make validate-cleartext`) |
+| HTTP/1.1 without a probe | `src/Http2.Tls.pas` (`ctHttp1`), `src/Http2.Client.pas` | no `Upgrade` or `HTTP2-Settings` byte on the wire (`Http2.ClearText.Test`, `make validate-cleartext`) |
 | HTTP/1.1 codec | `src/Http2.Http1.pas` (`THttp1Connection`) | GET and POST against a plain HTTP/1.1 server succeed (A.12) |
 | ALPN fallback | `src/Http2.Http1.pas` + transport selection in `Http2.Client` | an `http/1.1`-only TLS server responds when fallback is on |
 | pool keys and limits | `TConnectionPool` selection | stream limit is 1 for HTTP/1.1; origins keep scheme apart |
@@ -267,6 +310,13 @@ Four interop cases live in the probe (`test/h2probe.pas`) and
 | A.11 | h2c upgrade | `Upgrade: h2c` → `101`, then the response body arrives over HTTP/2 |
 | A.12 | HTTP/1.1 fallback | a GET against an HTTP/1.1 server returns `200` |
 | A.13 | strict mode | a cleartext request raises `EHttpProtocolError` |
+
+The live cleartext gate (`make validate-cleartext`) is separate from the
+interop table. It runs `GET`, `POST`, `DELETE` and `HEAD` without a body under
+`ctUpgrade` and `ctHttp1` against `tools/validate/h1_counter_server.py`, an
+HTTP/1.1-only server that logs each request it receives. Every request appears
+in the log once. Under `ctHttp1` none carries an `Upgrade` header; under
+`ctUpgrade` each carries the probe once.
 
 Current result: `interop: PASS=13 FAIL=0 SKIP=1` → `interop gate GREEN`
 (see [[validation]]).

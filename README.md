@@ -18,8 +18,10 @@ One request uses one stream. The pool keeps many TCP connections.
 - Applies connect, header, and idle timeouts. A caller can cancel a request.
 - Reports errors through an exception hierarchy. It reports events through an
   observer interface.
-- Speaks cleartext `h2c` when the caller enables it. Cleartext has two modes:
-  prior knowledge and upgrade.
+- Speaks cleartext `h2c` when the caller enables it. Cleartext has three modes:
+  prior knowledge, upgrade, and HTTP/1.1 with no probe. A server that declines
+  the upgrade answers the request on the same connection, so the client sends
+  the request once.
 - Falls back to HTTP/1.1 when the peer does not offer `h2`. The caller must
   enable the fallback.
 - Reads Server-Sent Events (`text/event-stream`) incrementally, with a
@@ -95,7 +97,7 @@ task test
 ```
 
 The `test` task compiles the library and the unit suite. Then it runs the
-suite. The suite has 638 tests (the SSE live case skips unless
+suite. The suite has 648 tests (the SSE live case skips unless
 `SSE_TEST_URL` is set; run it with `task validate:sse`).
 
 The suite uses `fpcunit` and a mock socket. It needs no network and no server.
@@ -115,6 +117,7 @@ has its own task.
 | `task validate:harness` | The RFC conformance harness. 146 case ids. | About 30 minutes |
 | `task validate:sse` | The opt-in live SSE case against `tools/validate/sse_server.py`. | Seconds |
 | `task validate:websocket` | The opt-in live WebSocket case: `ws` and `wss`, directly and through an HTTP `CONNECT`, https and SOCKS5 proxy, against `tools/validate/ws_servers.py`, plus a check of the servers' logs (mask bit on every client frame, close codes, route). `task validate:websocket:autobahn` runs the Autobahn|Testsuite client cases (Docker). | Seconds |
+| `task validate:cleartext` | The opt-in live cleartext case: a bodyless `GET`, `POST`, `DELETE` and `HEAD` under `ctUpgrade` and `ctHttp1` against `tools/validate/h1_counter_server.py`, an HTTP/1.1-only server that logs each request; every request arrives once. | Seconds |
 | `task validate:proxy` | The opt-in live proxy case: HTTP `CONNECT`, https and SOCKS5 proxies from `tools/validate/proxy_servers.py`, with and without credentials, HTTP/2 through each proxy kind when `nghttpd` is installed, plus a check of the proxy logs. | Seconds |
 
 Run the full suite with one command:
@@ -253,6 +256,11 @@ Client := THttpClientFactory.Create
   .WithClearText(ctPriorKnowledge)
   .Build;
 
+// Speak plain HTTP/1.1 to a cleartext server, with no Upgrade request.
+Client := THttpClientFactory.Create
+  .WithClearText(ctHttp1)
+  .Build;
+
 // Accept an HTTP/1.1 peer when the peer does not offer h2.
 Client := THttpClientFactory.Create
   .WithHttp1Fallback(True)
@@ -260,7 +268,7 @@ Client := THttpClientFactory.Create
 ```
 
 `TClearTextPolicy` lives in `Http2.Tls`. You must name that unit in your
-`uses` clause to write the value `ctPriorKnowledge` or `ctUpgrade`.
+`uses` clause to write the value `ctPriorKnowledge`, `ctUpgrade` or `ctHttp1`.
 
 A client reaches each origin directly or through an HTTP proxy, chosen per
 request:

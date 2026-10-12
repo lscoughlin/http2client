@@ -9,6 +9,7 @@
 #   make validate-proxy  opt-in live proxy gate against tools/validate/proxy_servers.py
 #   make validate-websocket  opt-in live WebSocket gate against tools/validate/ws_servers.py
 #   make validate-websocket-autobahn  Autobahn|Testsuite client run (needs Docker)
+#   make validate-cleartext  opt-in live gate: cleartext requests are sent once
 #   make clean    remove build outputs
 
 FPC        ?= fpc
@@ -26,7 +27,7 @@ TESTSRC    = $(wildcard test/*.pas)
 EXAMPLESRC = $(wildcard examples/*.pas)
 BIN        = bin
 
-.PHONY: all test examples clean validate-interop validate-harness validate-sse validate-proxy validate-websocket validate-websocket-autobahn validate
+.PHONY: all test examples clean validate-interop validate-harness validate-sse validate-proxy validate-websocket validate-websocket-autobahn validate-cleartext validate
 
 all: $(BIN)/libhttp2.a
 
@@ -80,5 +81,10 @@ validate-websocket: all | $(BIN)
 # The Autobahn|Testsuite fuzzing server (Docker) against the client.
 validate-websocket-autobahn: all | $(BIN)
 	bash tools/validate/websocket-live.sh autobahn
+
+# Opt-in live cleartext gate: an HTTP/1.1-only server that logs each request
+# proves a request is sent once under ctUpgrade (declined) and ctHttp1.
+validate-cleartext: all | $(BIN)
+	bash tools/validate/cleartext-live.sh
 
 validate: validate-interop validate-harness

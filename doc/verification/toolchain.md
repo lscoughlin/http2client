@@ -109,7 +109,7 @@ IDE as a design-time package.
 |---|---|
 | Package name / type | `http2client`, `RunAndDesignTime`, `Version 0.18.0` |
 | Units | all 20 in `src/`, `Http2.pas` (umbrella) first; `Http2.Readers.pas` is the optional JSON/XML unit, and `Http2.Encoding.pas` holds the content codings, `Http2.Sse.pas` the Server-Sent Events reader, `Http2.Proxy.pas` and `Http2.Socks.pas` proxy routing, `Http2.WebSocket.pas` and `Http2.WebSocketClient.pas` the WebSocket client |
-| Test suite | 638 tests, 0 errors, 0 failures (registration list: `test/Http2.TestRunner.pas`); see [[testing-observability]] |
+| Test suite | 648 tests, 0 errors, 0 failures (registration list: `test/Http2.TestRunner.pas`); see [[testing-observability]] |
 | `OtherUnitFiles` | `src` + the four vendored mormot dirs (`core`, `lib`, `net`, `crypt`) |
 | `RequiredPkgs` | `FCL` **only** — deliberately **not** the IDE `mormot2` package (see below) |
 | Unit output | `lib/$(TargetCPU)-$(TargetOS)` (gitignored) |
@@ -161,7 +161,7 @@ Verified: `83049 lines compiled`, all 13 units produced `.ppu`/`.o` in
 `85387 lines compiled` and 16 `Http2` units plus the auto-created
 `http2client` registration unit in `lib/aarch64-darwin/`.)
 
-When the note last counted: `make test` reports **638 tests, 0 errors, 0
+When the note last counted: `make test` reports **648 tests, 0 errors, 0
 failures** (550 before [[websocket]]) and `make examples` builds
 eight programs.
 
