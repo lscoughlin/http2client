@@ -10,7 +10,7 @@ unit Http2.Errors;
 interface
 
 uses
-  SysUtils;
+  SysUtils, Classes;
 
 type
   /// RFC 7540 section 7 error codes; the low 32 bits of GOAWAY/RST_STREAM
@@ -69,6 +69,41 @@ type
   /// (doc/design/proxy.md "Errors"); never carries a password in its message
   EHttpProxyConfigError = class(EHttpError);
 
+  /// a WebSocket API was misused (unusable argument, restricted header, ...)
+  /// (doc/design/websocket.md "Errors")
+  EHttpWebSocketError = class(EHttpError);
+  /// a send was attempted after the output side of the WebSocket was closed
+  EHttpWebSocketClosedError = class(EHttpWebSocketError);
+  /// the peer broke RFC 6455; CloseCode is the status the client answers with
+  EHttpWebSocketProtocolError = class(EHttpWebSocketError)
+  private
+    FCloseCode: Integer;
+  public
+    constructor Create(const AMessage: string;
+      const ACloseCode: Integer); overload;
+    constructor CreateFmt(const AFormat: string; const AArgs: array of const;
+      const ACloseCode: Integer); overload;
+    property CloseCode: Integer read FCloseCode;
+  end;
+  /// the server did not accept the upgrade; carries what it answered
+  EHttpWebSocketHandshakeError = class(EHttpWebSocketError)
+  private
+    FStatusCode: Integer;
+    FHeaderLines: string;
+    FBody: string;
+  public
+    constructor Create(const AMessage: string; const AStatusCode: Integer;
+      const AHeaderLines, ABody: string);
+    /// the response status (0 when the response was not a valid HTTP reply)
+    property StatusCode: Integer read FStatusCode;
+    /// the response header lines, one 'Name: value' per line
+    property HeaderLines: string read FHeaderLines;
+    /// the first bytes of the response body (at most 4 KiB)
+    property Body: string read FBody;
+    /// the value of the first header called AName (case-insensitive), or ''
+    function Header(const AName: string): string;
+  end;
+
 /// stable, human-readable name for a wire error code
 function Http2ErrorCodeName(const ACode: THttp2ErrorCode): string;
 
@@ -113,6 +148,55 @@ begin
     ecHttp11Required:     Result := 'HTTP_1_1_REQUIRED';
   else
     Result := 'UNKNOWN_' + IntToStr(Ord(ACode));
+  end;
+end;
+
+{ EHttpWebSocketProtocolError }
+
+constructor EHttpWebSocketProtocolError.Create(const AMessage: string;
+  const ACloseCode: Integer);
+begin
+  inherited Create(AMessage);
+  FCloseCode := ACloseCode;
+end;
+
+constructor EHttpWebSocketProtocolError.CreateFmt(const AFormat: string;
+  const AArgs: array of const; const ACloseCode: Integer);
+begin
+  inherited Create(Format(AFormat, AArgs));
+  FCloseCode := ACloseCode;
+end;
+
+{ EHttpWebSocketHandshakeError }
+
+constructor EHttpWebSocketHandshakeError.Create(const AMessage: string;
+  const AStatusCode: Integer; const AHeaderLines, ABody: string);
+begin
+  inherited Create(AMessage);
+  FStatusCode := AStatusCode;
+  FHeaderLines := AHeaderLines;
+  FBody := ABody;
+end;
+
+function EHttpWebSocketHandshakeError.Header(const AName: string): string;
+var
+  Lines: TStringList;
+  I, P: Integer;
+  Prefix: string;
+begin
+  Result := '';
+  Prefix := LowerCase(AName);
+  Lines := TStringList.Create;
+  try
+    Lines.Text := FHeaderLines;
+    for I := 0 to Lines.Count - 1 do
+    begin
+      P := Pos(':', Lines[I]);
+      if (P > 0) and (LowerCase(Trim(Copy(Lines[I], 1, P - 1))) = Prefix) then
+        Exit(Trim(Copy(Lines[I], P + 1, MaxInt)));
+    end;
+  finally
+    Lines.Free;
   end;
 end;
 

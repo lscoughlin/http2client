@@ -39,6 +39,7 @@ reproduce commands.
 | FPC 3.2.4 bundled `openssl` / `opensslsockets` | **No ALPN symbols** (grep of `opensslsockets.ppu` empty) → cannot negotiate `h2`. |
 | mormot2 `src/lib/mormot.lib.openssl11.pas` | **Exports ALPN**: `SSL_CTX_set_alpn_protos` (line 2164), `SSL_get0_alpn_selected` (line 2192); dynamically loads OpenSSL 1.1/3.x. |
 | mormot checkout | `third_party/mORMot2` @ `2ccea1a0e5d7be85bd3cf68e1fd70e9e603d09cc` (2026-10-05, "net: minor hardening of TTunnelLocal.SendFrame"). Unit dirs: `core`, `lib`, `net`, `crypt`. |
+| mormot2 WebSocket references | read as design references, not linked: `src/net/mormot.net.ws.core.pas` (`TWebSocketFrameOpCode`, `FRAME_LEN_MASK`, `ProcessMask`, `ComputeChallenge`, `FrameSendEncode` and its use of `NetRandom32`), `src/net/mormot.net.ws.client.pas` (`THttpClientWebSockets` and its handshake). The linked pieces are unchanged: `Http2.WebSocketClient` takes its random masking key from `RAND_bytes` in `mormot.lib.openssl11`. See `doc/design/websocket.md`. |
 | mormot2 proxy-routing references | read as design references, not linked: `src/net/mormot.net.sock.pas` (`TUri`, `TIp4SubNet`, `NetIsIP4`, `NetIsIP6`, `TCrtSocket.DoOpenTunnel`), `src/core/mormot.core.os.pas` (`IsLocalHost`, `GetSystemEnv`). Linked by `Http2.Tls`: `src/lib/mormot.lib.openssl11.pas` (`BIO_s_mem`, `BIO_read`, `BIO_write`, `BIO_ctrl`, `SSL_set_bio`). Absent from the OpenSSL binding: `BIO_meth_new`, `BIO_set_data`, `BIO_set_retry_*`, `BIO_new_bio_pair`. No SOCKS client exists in the checkout. See `doc/design/proxy.md`. |
 | `OPENSSL_LIBPATH` | **Required on this machine.** Without it `OpenSslIsAvailable=FALSE` and `OpenSslVersionText=''`. With `OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib`: `OpenSslIsAvailable=TRUE`, `OpenSslVersionText='OpenSSL 3.6.5 29 Sep 2026'`. Probed from `/tmp/mormotprobe/probe_tls.pas`. |
 | Backend library | OpenSSL `3.6.5` — `/opt/homebrew/opt/openssl@3` (kegs 3.4/3.5/3.6 also present). |
@@ -107,8 +108,8 @@ IDE as a design-time package.
 | Fact | Value |
 |---|---|
 | Package name / type | `http2client`, `RunAndDesignTime`, `Version 0.18.0` |
-| Units | all 18 in `src/`, `Http2.pas` (umbrella) first; `Http2.Readers.pas` is the optional JSON/XML unit, and `Http2.Encoding.pas` holds the content codings, `Http2.Sse.pas` the Server-Sent Events reader, `Http2.Proxy.pas` and `Http2.Socks.pas` proxy routing |
-| Test suite | 550 tests, 0 errors, 0 failures (registration list: `test/Http2.TestRunner.pas`); see [[testing-observability]] |
+| Units | all 20 in `src/`, `Http2.pas` (umbrella) first; `Http2.Readers.pas` is the optional JSON/XML unit, and `Http2.Encoding.pas` holds the content codings, `Http2.Sse.pas` the Server-Sent Events reader, `Http2.Proxy.pas` and `Http2.Socks.pas` proxy routing, `Http2.WebSocket.pas` and `Http2.WebSocketClient.pas` the WebSocket client |
+| Test suite | 638 tests, 0 errors, 0 failures (registration list: `test/Http2.TestRunner.pas`); see [[testing-observability]] |
 | `OtherUnitFiles` | `src` + the four vendored mormot dirs (`core`, `lib`, `net`, `crypt`) |
 | `RequiredPkgs` | `FCL` **only** — deliberately **not** the IDE `mormot2` package (see below) |
 | Unit output | `lib/$(TargetCPU)-$(TargetOS)` (gitignored) |
@@ -160,9 +161,9 @@ Verified: `83049 lines compiled`, all 13 units produced `.ppu`/`.o` in
 `85387 lines compiled` and 16 `Http2` units plus the auto-created
 `http2client` registration unit in `lib/aarch64-darwin/`.)
 
-When the note last counted: `make test` reports **550 tests, 0 errors, 0
-failures** (409 before [[proxy]]) and `make examples` builds
-seven programs.
+When the note last counted: `make test` reports **638 tests, 0 errors, 0
+failures** (550 before [[websocket]]) and `make examples` builds
+eight programs.
 
 ## Example programs
 

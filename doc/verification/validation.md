@@ -226,9 +226,20 @@ when A and B are green.
 | `third_party/h2-client-test-harness` | git `0bc075c` |
 | Container runtime | Rancher Desktop `docker` (`~/.rd/bin/docker`) |
 | Unit suite (2026-10-05, at that revision) | 292 tests, 0 errors, 0 failures |
-| Unit suite (current) | 550 tests, 0 errors, 0 failures |
-| Library units | 18 in `src/` (17 core + optional `Http2.Readers`) |
-| Example programs | 7 in `examples/` (`make examples`) |
+| Unit suite (current) | 638 tests, 0 errors, 0 failures |
+| Library units | 20 in `src/` (19 core + optional `Http2.Readers`) |
+| Example programs | 8 in `examples/` (`make examples`) |
+
+The opt-in WebSocket gate (`make validate-websocket`) runs the real client
+against `tools/validate/ws_servers.py` over `ws` and `wss` and through an HTTP
+`CONNECT` proxy, an `https://` proxy and a SOCKS5 proxy, and reads the
+servers' logs. It passes: every client frame carried the mask bit, the
+handshake headers were as RFC 6455 requires, the close codes (client `1000`,
+echoed `1001`, `1007` for invalid UTF-8) and the subprotocol list were as
+sent, `wss` negotiated `http/1.1` alone and a server without ALPN was accepted, and the proxy logs show the name sent unresolved over SOCKS5 and TLS
+inside TLS for `wss` behind an `https://` proxy. The Autobahn|Testsuite client
+run (`make validate-websocket-autobahn`) needs Docker; when the daemon is not
+running the script prints a SKIP, and no Autobahn result is recorded here.
 
 Skips, each with its reason: **A.8** (no nghttpd GOAWAY trigger; covered by
 unit tests), **C.6** (draft-09 plaintext `h2c`; client is TLS-only), **D**

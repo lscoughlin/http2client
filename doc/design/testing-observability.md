@@ -118,6 +118,34 @@ An observer is passive and must not block: callbacks fire on the connection
 thread. Observers are attached per connection as it is opened, so a single
 observer instance sees every connection the client creates.
 
+## WebSocket tests
+
+`Http2.WebSocket.Test` covers the pure unit: the RFC 6455 section 5.7 frames
+byte for byte, the frame parser fed one byte at a time, in random chunks and
+whole, every protocol-error rule with its close code, the UTF-8 and close-code
+tables, message assembly across fragments, the handshake accept and reject
+matrix, request bytes, and the immutable request values.
+
+`Http2.WebSocketClient.Test` runs the client against a scripted loopback
+server on a raw socket that checks the handshake bytes, reads masked client
+frames and sends unmasked server frames: echo, demand, ping answered before
+the callback, both close directions, protocol violations, handshake refusal,
+bytes after the upgrade head, concurrent sends, fragmented sends, a large
+message, abort, the close and ping timeouts, a raising listener, and a fresh
+masking key per frame. Tests wait on events with a bounded timeout and never
+sleep to wait for another thread.
+
+The opt-in live gate (`task validate:websocket`) starts
+`tools/validate/ws_servers.py` and the proxy servers of `proxy_servers.py`,
+runs `Http2.WebSocketLive.Test` over `ws` and `wss`, directly and through an
+HTTP `CONNECT` proxy, an `https://` proxy and a SOCKS5 proxy, and then reads
+the servers' logs: every client frame carried the mask bit, the handshake
+headers were as required, the close codes and the route were as expected.
+`task validate:websocket:autobahn` runs the Autobahn|Testsuite fuzzing server
+(Docker) against `tools/validate/autobahn_client.pas` and summarises its
+report; cases 12 and 13 (`permessage-deflate`) are excluded because the client
+offers no extension.
+
 ## Concurrency tests
 
 `Http2.Concurrency.Test` drives many threads calling `Send` against a slow

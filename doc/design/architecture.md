@@ -85,7 +85,9 @@ Layering, top down:
 
 ## Unit layout and naming
 
-Fifteen units in `src/`, listed in dependency order:
+Twenty units in `src/`, listed roughly in dependency order (`Http2.Client`
+depends on the units after it that it re-exports, such as `Http2.Proxy` and
+`Http2.WebSocket`):
 
 ```pascal
 unit Http2.Errors;      // EHttpError hierarchy, THttp2ErrorCode
@@ -109,11 +111,18 @@ unit Http2.Client;      // THttpClientFactory, IHttpClient, THttpRequest,
                         // WithTextBody / ReadText
 unit Http2.Readers;     // optional: JSON/XML readers + send helpers (fcl-json/fcl-xml)
 unit Http2.Sse;         // TSseEventParser, TSseSource, TSseReconnectLoop, SseRequest
+unit Http2.Encoding;    // content codings (gzip, deflate)
+unit Http2.Proxy;       // IProxy, IProxySelector, proxy URLs, no-proxy list,
+                        // environment snapshot (RTL + Http2.Errors only)
+unit Http2.Socks;       // SOCKS5 client messages and tunnel (RFC 1928, 1929)
+unit Http2.WebSocket;   // frame codec, message assembly, handshake rules,
+                        // IWebSocket / IWebSocketListener / IWebSocketRequest
+                        // (RTL + Http2.Errors only)
+unit Http2.WebSocketClient; // TWebSocketConnection, OpenWebSocket
 unit Http2;             // umbrella: re-exports every unit above EXCEPT Http2.Readers
 ```
 
-`Http2.Readers` is deliberately **outside** the umbrella and the 14-unit
-core: it is the only unit that depends on `fcl-json`/`fcl-xml`, so a caller
+`Http2.Readers` is deliberately **outside** the umbrella and the core: it is the only unit that depends on `fcl-json`/`fcl-xml`, so a caller
 links it only by naming it in their own `uses` clause. See [[messages]].
 
 **Dependency direction.** `Http2.Client` and `Http2.Connection` are the

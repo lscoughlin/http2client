@@ -26,6 +26,10 @@ One request uses one stream. The pool keeps many TCP connections.
   per-request body read timeout, read-side cancellation, and an optional
   reconnect-and-resume loop. See
   [`doc/design/server-sent-events.md`](doc/design/server-sent-events.md).
+- Opens WebSocket connections (`ws://`, `wss://`; RFC 6455) with a listener,
+  demand-driven delivery, fragment-aware sends and the closing handshake,
+  directly or through any of the proxy kinds. See
+  [`doc/design/websocket.md`](doc/design/websocket.md).
 
 The default is strict. The client uses `h2` over TLS only.
 
@@ -73,14 +77,14 @@ start with `task validate`.
 task build
 ```
 
-The `build` task compiles all 15 library units into `bin/`. The output is the
+The `build` task compiles every library unit into `bin/`. The output is the
 `.ppu` and `.o` files for each unit. The task does not create a linked binary,
 because the library has no program of its own. To use the units in your own
 program, add `-Fu` for the `src` and `bin` directories. See the `FPCFLAGS`
 value in `Taskfile.yaml`.
 
-Fourteen units make up the core library. The fifteenth, `Http2.Readers.pas`,
-is optional: it adds JSON and XML helpers and is the only unit that depends on
+The umbrella unit `Http2` re-exports the core library. `Http2.Readers.pas`
+is not part of it and is optional: it adds JSON and XML helpers and is the only unit that depends on
 `fcl-json` or `fcl-xml`. Name it in your `uses` clause only when you need it.
 See [Examples](#examples).
 
@@ -91,7 +95,7 @@ task test
 ```
 
 The `test` task compiles the library and the unit suite. Then it runs the
-suite. The suite has 550 tests (the SSE live case skips unless
+suite. The suite has 638 tests (the SSE live case skips unless
 `SSE_TEST_URL` is set; run it with `task validate:sse`).
 
 The suite uses `fpcunit` and a mock socket. It needs no network and no server.
@@ -110,6 +114,7 @@ has its own task.
 | `task validate:interop` | A real TLS peer, `nghttpd`. Cases A.1 to A.13. | About 1 minute |
 | `task validate:harness` | The RFC conformance harness. 146 case ids. | About 30 minutes |
 | `task validate:sse` | The opt-in live SSE case against `tools/validate/sse_server.py`. | Seconds |
+| `task validate:websocket` | The opt-in live WebSocket case: `ws` and `wss`, directly and through an HTTP `CONNECT`, https and SOCKS5 proxy, against `tools/validate/ws_servers.py`, plus a check of the servers' logs (mask bit on every client frame, close codes, route). `task validate:websocket:autobahn` runs the Autobahn|Testsuite client cases (Docker). | Seconds |
 | `task validate:proxy` | The opt-in live proxy case: HTTP `CONNECT`, https and SOCKS5 proxies from `tools/validate/proxy_servers.py`, with and without credentials, HTTP/2 through each proxy kind when `nghttpd` is installed, plus a check of the proxy logs. | Seconds |
 
 Run the full suite with one command:
@@ -352,6 +357,7 @@ bin/xml_request    https://nghttp2.org/httpbin/xml
 bin/threaded_get   https://nghttp2.org/ 8 25
 bin/sse_stream     http://127.0.0.1:8091/events   # tools/validate/sse_server.py
 https_proxy=http://proxy.corp:3128 bin/proxy_env https://nghttp2.org/
+bin/websocket_echo ws://127.0.0.1:8601/echo hello   # tools/validate/ws_servers.py
 ```
 
 | Program | Shows |
@@ -363,6 +369,7 @@ https_proxy=http://proxy.corp:3128 bin/proxy_env https://nghttp2.org/
 | `threaded_get.pas` | Many threads sharing one client and its pool. |
 | `sse_stream.pas` | `SseRequest` + `TSseReconnectLoop` over an event stream. |
 | `proxy_env.pas` | A GET routed by the proxy environment variables. |
+| `websocket_echo.pas` | Open a WebSocket, send a message, print the echo, close. |
 
 ## Project layout
 
@@ -378,12 +385,51 @@ https_proxy=http://proxy.corp:3128 bin/proxy_env https://nghttp2.org/
 | `LICENSE` | The Apache License, Version 2.0. |
 | `NOTICE` | The copyright and the third-party components. |
 
+### WebSocket
+
+```pascal
+type
+  TChat = class(TWebSocketListener)
+  public
+    procedure OnOpen(const ASocket: IWebSocket); override;
+    procedure OnText(const ASocket: IWebSocket; const AText: string;
+      const ALast: Boolean); override;
+  end;
+
+procedure TChat.OnOpen(const ASocket: IWebSocket);
+begin
+  ASocket.Request(1);          // nothing is delivered until requested
+end;
+
+procedure TChat.OnText(const ASocket: IWebSocket; const AText: string;
+  const ALast: Boolean);
+begin
+  WriteLn(AText);
+  ASocket.Request(1);
+end;
+
+var
+  Socket: IWebSocket;
+begin
+  Socket := Client.Send(
+    TWebSocketRequest.Create('wss://example.com/chat', TChat.Create)
+      .WithSubprotocol('chat'));
+  Socket.SendText('hello');
+  Socket.Close(1000, 'bye');
+end;
+```
+
+The connection speaks HTTP/1.1 (RFC 6455); a WebSocket is not pooled. See
+`doc/design/websocket.md`.
+
 ## Where to read more
 
 - `doc/http2client.md` gives the document map.
 - `doc/design/client-api.md` gives the full factory surface.
 - `doc/design/proxy.md` gives the proxy routing: environment variables,
   the no-proxy list, and `IProxySelector`.
+- `doc/design/websocket.md` gives the WebSocket client: handshake, framing,
+  delivery and demand, closing, and the reference implementations.
 - `doc/design/messages.md` gives the request and response types.
 - `doc/design/server-sent-events.md` gives the SSE parser, source, and
   reconnect/resume loop.
@@ -408,6 +454,10 @@ and to the raw sweep log at `[[harness-log]]`.
   fallback they are best-effort: an idle stream is bounded by the socket
   read timeout and a blocked read cannot be cancelled. See
   `doc/design/server-sent-events.md`.
+
+- WebSockets are RFC 6455 over HTTP/1.1 only: no RFC 8441, no
+  `permessage-deflate`, no automatic reconnection. See
+  `doc/design/websocket.md`.
 
 - Proxies are reached by `CONNECT` tunnel only. An `http_proxy` for an
   `http://` origin tunnels instead of forwarding, and many proxies refuse

@@ -244,6 +244,9 @@ def main():
     ap.add_argument("--external-tls-origin", action="store_true",
                     help="do not start the TLS origin: --origin-tls-port names "
                          "an HTTP/2 server (nghttpd) started elsewhere")
+    ap.add_argument("--external-plain-origin", action="store_true",
+                    help="do not start the plain origin: --origin-plain-port "
+                         "names a server (a WebSocket echo) started elsewhere")
     args = ap.parse_args()
     LOG_PATH = args.log
     open(LOG_PATH, "w").close()
@@ -258,7 +261,10 @@ def main():
     proxy_ctx.load_cert_chain(f"{args.certs}/localhost.crt",
                               f"{args.certs}/localhost.key")
 
-    servers = [make_origin("plain", "origin-plain", args.origin_plain_port, None)]
+    servers = []
+    if not args.external_plain_origin:
+        servers.append(make_origin("plain", "origin-plain",
+                                   args.origin_plain_port, None))
     if not args.external_tls_origin:
         servers.insert(0, make_origin("tls", "origin-tls",
                                       args.origin_tls_port, origin_ctx))

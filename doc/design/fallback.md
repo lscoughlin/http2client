@@ -42,6 +42,10 @@ surface".
 All four modes are implemented and covered by tests and interop cases
 A.10–A.13; see "Implementation status".
 
+WebSocket connections ([[websocket]]) sit outside these modes. They always
+speak HTTP/1.1 for the opening handshake and take no part in the fallback and
+cleartext switches: a `ws://` URL connects under the default cleartext policy.
+
 ## Terms
 
 - **Origin.** The form `scheme://host:port`. The default port follows the

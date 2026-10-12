@@ -50,6 +50,7 @@ flowchart TB
 | [[protocol]] | frame layer, HPACK, flow control |
 | [[transport]] | threading and queues, connection lifecycle, TLS/ALPN |
 | [[proxy]] | proxy routing per request: fixed proxy, `http_proxy` / `https_proxy` / `no_proxy`, `WithNoProxy`, `IProxySelector` |
+| [[websocket]] | WebSocket client (RFC 6455): `IWebSocketRequest`, `IWebSocketListener`, `IWebSocket`, demand-driven delivery, close handshake, `ws`/`wss` through every proxy kind |
 | [[fallback]] | cleartext h2c (prior knowledge and upgrade) and HTTP/1.1 fallback |
 | [[errors-redirects]] | exception hierarchy, timeouts, cancellation, redirects |
 | [[server-sent-events]] | Server-Sent Events: event-stream parser, SSE source, reconnect/resume, body-read timeout |
@@ -96,7 +97,7 @@ OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib ./myprogram
 
 ## Examples
 
-`examples/` holds seven small programs — see `examples/README.md`:
+`examples/` holds eight small programs — see `examples/README.md`:
 
 | Program | Shows |
 |---|---|
@@ -105,6 +106,7 @@ OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib ./myprogram
 | `json_request` | `Http2.Readers` JSON send + read |
 | `xml_request` | `Http2.Readers` XML send + read |
 | `sse_stream` | `Http2.Sse` event-stream reader |
+| `websocket_echo` | `TWebSocketRequest` + a listener: open, request demand, send, close |
 | `proxy_env` | `WithProxyEnvironmentVars` + `WithNoProxy`: routing by `http_proxy` / `https_proxy` / `all_proxy` / `no_proxy` |
 | `threaded_get` | one shared `IHttpClient` driven by many threads |
 

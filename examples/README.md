@@ -1,6 +1,6 @@
 # Examples
 
-Seven small programs showing how to use `http2client`. They are smoke builds:
+Eight small programs showing how to use `http2client`. They are smoke builds:
 the build compiles them, it does not run them.
 
 ## Build
@@ -31,6 +31,7 @@ bin/xml_request    https://nghttp2.org/httpbin/xml
 https_proxy=http://proxy.corp:3128 bin/proxy_env https://nghttp2.org/
 bin/threaded_get   https://nghttp2.org/ 8 25
 bin/sse_stream     https://example.com/events
+bin/websocket_echo wss://echo.example/ hello
 # or against the reference event-stream server (cleartext; an http:// URL
 # enables the h2c-upgrade policy automatically):
 #   python3 tools/validate/sse_server.py --port 8091 &
@@ -45,6 +46,7 @@ bin/sse_stream     https://example.com/events
 | `xml_request.pas` | `WithXmlBody` / `ReadXmlDocument` for XML. |
 | `threaded_get.pas` | Eight threads sharing one client and its connection pool. |
 | `sse_stream.pas` | `SseRequest` + `TSseReconnectLoop`: read an event stream and resume from `last-event-id`. |
+| `websocket_echo.pas` | `TWebSocketRequest` + a `TWebSocketListener` descendant: open a WebSocket, `Request` demand, send a message, close. |
 | `proxy_env.pas` | `WithProxyEnvironmentVars` + `WithNoProxy`: route a GET by `http_proxy` / `https_proxy` / `all_proxy` / `no_proxy`. |
 
 ## Notes

@@ -211,3 +211,15 @@ idempotent methods (no body writer), and only on `ecRefusedStream` or a
   the origin host and the h2c/HTTP/1.1 paths tunnel identically. A non-2xx
   `CONNECT` response raises `EHttpConnectionError` (`proxy CONNECT failed`);
   the client never silently falls back to a direct connection.
+
+## WebSocket connections
+
+A WebSocket ([[websocket]]) uses a connection of its own rather than a pooled
+one. The dial speaks HTTP/1.1 only: for `https` the ALPN offer is `http/1.1`
+alone (`IHttp1SocketFactory.DialHttp1`), a server that selects `h2` is
+refused, and a server that answers with no ALPN is accepted. The proxy tunnels
+of [[proxy]] apply unchanged. After the `Upgrade` handshake one reader thread
+owns every read of the socket; sends from other threads are serialised by a
+lock, and on a connection whose reads and writes share one TLS state the
+socket itself is guarded by a second lock that the reader takes only for short
+polls.

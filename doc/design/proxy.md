@@ -337,6 +337,12 @@ once, so an implementation is invoked concurrently. An exception raised by the s
 propagates unchanged out of `Send`. A returned `IProxy` with an empty host or
 a zero port raises `EHttpProxyConfigError`.
 
+A WebSocket ([[websocket]]) is routed by the same selector. It is called once
+with the URL's `http` or `https` form (`ws` maps to `http`, `wss` to `https`),
+so `http_proxy`, `https_proxy`, `all_proxy` and `no_proxy` apply as for the
+equivalent HTTP request, and the tunnel is a `CONNECT` or SOCKS5 connection
+for `ws` as well.
+
 ## Interaction with the transport
 
 - The tunnel (HTTP `CONNECT` or SOCKS5) is negotiated on the proxy

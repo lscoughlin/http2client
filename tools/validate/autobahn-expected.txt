@@ -1,0 +1,2 @@
+# Autobahn case ids whose non-pass is understood (one per line).
+# None are known; a case is added here only with a recorded reason.

@@ -114,6 +114,16 @@ flowchart TB
   E -->|"IBodyWriter cannot replay"| N["EHttpNotReplayable"]
 ```
 
+WebSocket failures ([[websocket]]) have their own classes, all deriving from
+`EHttpError`: `EHttpWebSocketError` for misuse (an unusable URL, header,
+subprotocol or argument), `EHttpWebSocketClosedError` for a send after the
+output side closed, `EHttpWebSocketHandshakeError` when the server does not
+accept the upgrade (it carries the status, the header lines and the first
+4 KiB of the body), and `EHttpWebSocketProtocolError` when the peer breaks
+RFC 6455 (it carries the close code). A WebSocket handshake never follows a
+redirect. Failures after the handshake reach the listener's `OnError` instead
+of being raised.
+
 A connection-level failure **takes precedence over** a queued stream error:
 if the transport dies while a retryable stream error is pending, the caller
 sees `EHttpConnectionError` so the request is not silently masked as

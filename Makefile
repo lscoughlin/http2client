@@ -7,6 +7,8 @@
 #   make examples compile the example programs into bin/
 #   make validate-sse  opt-in live SSE case against tools/validate/sse_server.py
 #   make validate-proxy  opt-in live proxy gate against tools/validate/proxy_servers.py
+#   make validate-websocket  opt-in live WebSocket gate against tools/validate/ws_servers.py
+#   make validate-websocket-autobahn  Autobahn|Testsuite client run (needs Docker)
 #   make clean    remove build outputs
 
 FPC        ?= fpc
@@ -24,7 +26,7 @@ TESTSRC    = $(wildcard test/*.pas)
 EXAMPLESRC = $(wildcard examples/*.pas)
 BIN        = bin
 
-.PHONY: all test examples clean validate-interop validate-harness validate-sse validate-proxy validate
+.PHONY: all test examples clean validate-interop validate-harness validate-sse validate-proxy validate-websocket validate-websocket-autobahn validate
 
 all: $(BIN)/libhttp2.a
 
@@ -67,5 +69,16 @@ validate-sse: all | $(BIN)
 # route each request took.
 validate-proxy: all | $(BIN)
 	bash tools/validate/proxy-live.sh
+
+# Opt-in live WebSocket gate: tools/validate/websocket-live.sh starts a
+# reference RFC 6455 server (ws and wss) and the proxy servers on loopback,
+# runs TWebSocketLiveTest through the real client, and checks the servers' logs
+# for what each connection did on the wire.
+validate-websocket: all | $(BIN)
+	bash tools/validate/websocket-live.sh
+
+# The Autobahn|Testsuite fuzzing server (Docker) against the client.
+validate-websocket-autobahn: all | $(BIN)
+	bash tools/validate/websocket-live.sh autobahn
 
 validate: validate-interop validate-harness

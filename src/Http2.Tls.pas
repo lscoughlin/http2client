@@ -106,6 +106,10 @@ procedure RequireH2Alpn(const AData: PByte; const ALen: Cardinal);
 // (doc/design/fallback.md "Negotiation")
 function AlpnOfferFor(const AHttp1Fallback: Boolean): TBytes;
 
+/// a 32-bit value from the OpenSSL CSPRNG.  A failing generator raises
+/// EHttpConnectionError; there is no fallback to a non-secure source.
+function SecureRandomCardinal: Cardinal;
+
 /// normalise a selected ALPN name to one of "h2", "http/1.1" or "" (nothing
 // selected, or a protocol this client does not know) so the caller can choose
 // a codec (doc/design/fallback.md "Negotiation")
@@ -149,13 +153,24 @@ type
       out AProtocol: TNegotiatedProtocol): IHttp2Socket;
   end;
 
+  /// implemented by a socket factory that can dial a connection which will
+  /// speak HTTP/1.1 only, as a WebSocket needs (doc/design/websocket.md).  TLS
+  /// offers "http/1.1" alone in ALPN; a peer answering "h2" is refused, a peer
+  /// without ALPN support is accepted.  AProxy nil dials directly.
+  IHttp1SocketFactory = interface
+    ['{7B1D5E02-9F6A-4C57-8A31-5D2E0C4A9B23}']
+    function DialHttp1(const AHost: string; const APort: Word;
+      const AScheme: string; const ATimeoutMs: Integer;
+      const AProxy: IProxy): IHttp2Socket;
+  end;
+
   /// the production transport selector (plan S13): picks TLS or cleartext and
   /// reports the wire protocol it committed to.  Https offers "h2", or
   /// "h2"+"http/1.1" when fallback is on; an empty ALPN result with fallback
   /// on means HTTP/1.1 (RFC 7301).  A cleartext origin honours the policy
   /// (doc/design/fallback.md "Negotiation").
   TProtocolSocketFactory = class(TInterfacedObject, ICleartextSocketFactory,
-    IProxySocketFactory)
+    IProxySocketFactory, IHttp1SocketFactory)
   private
     FCACertFile: string;
     FInsecure: Boolean;
@@ -174,6 +189,9 @@ type
       const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
       const AProxy: IProxy;
       out AProtocol: TNegotiatedProtocol): IHttp2Socket;
+    function DialHttp1(const AHost: string; const APort: Word;
+      const AScheme: string; const ATimeoutMs: Integer;
+      const AProxy: IProxy): IHttp2Socket;
   end;
 
   /// a plain (cleartext) TCP socket over fcl-net's TInetSocket. When a proxy
@@ -1549,6 +1567,45 @@ begin
       [cHttp2AlpnProtocol, Name]);
   end;
   Result := Sock;
+end;
+
+function SecureRandomCardinal: Cardinal;
+begin
+  if not OpenSslIsAvailable then
+    raise EHttpConnectionError.Create('OpenSSL is not available');
+  if RAND_bytes(@Result, SizeOf(Result)) <> 1 then
+    raise EHttpConnectionError.Create('the secure random generator failed');
+end;
+
+function TProtocolSocketFactory.DialHttp1(const AHost: string;
+  const APort: Word; const AScheme: string; const ATimeoutMs: Integer;
+  const AProxy: IProxy): IHttp2Socket;
+var
+  Proxy: IProxy;
+  TlsObj: TObject;
+  Name: string;
+begin
+  Proxy := AProxy;
+  if (Proxy = nil) and (FProxyHost <> '') then
+    Proxy := TProxy.Create(FProxyHost, FProxyPort);
+  if AScheme = 'http' then
+    Exit(TTlsSocket.DialCleartextVia(AHost, APort, ATimeoutMs, Proxy,
+      FInsecure, FCACertFile));
+  Result := TTlsSocket.DialWithAlpnVia(AHost, APort,
+    AlpnProtocolList([cHttp11AlpnProtocol]), FInsecure, ATimeoutMs,
+    FCACertFile, Proxy);
+  Name := '';
+  if Supports(Result, TTlsSocket, TlsObj) then
+    Name := TTlsSocket(TlsObj).SelectedProtocol;
+  // a server without ALPN support answers nothing and speaks HTTP/1.1; one
+  // that picked h2 anyway cannot carry an Upgrade
+  if (Name <> '') and (Name <> cHttp11AlpnProtocol) then
+  begin
+    Result.Close;
+    raise EHttpProtocolError.Create(Format(
+      'peer selected ALPN "%s" for a connection that needs HTTP/1.1', [Name]),
+      ecProtocolError);
+  end;
 end;
 
 end.

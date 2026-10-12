@@ -23,7 +23,7 @@ uses
   Sockets,
   Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack,
   Http2.Tls, Http2.Connection, Http2.Stream, Http2.Observer, Http2.Messages,
-  Http2.Http1, Http2.Encoding, Http2.Proxy;
+  Http2.Http1, Http2.Encoding, Http2.Proxy, Http2.WebSocket;
 
 const
   /// documented factory defaults (doc/design/client-api.md "HttpClientFactory")
@@ -71,6 +71,14 @@ type
   TProxyKind = Http2.Proxy.TProxyKind;
   TEnvLookup = Http2.Proxy.TEnvLookup;
 
+  // the WebSocket types live in Http2.WebSocket; re-exported so a caller that
+  // only uses Http2.Client can name them and descend from TWebSocketListener
+  IWebSocket = Http2.WebSocket.IWebSocket;
+  IWebSocketListener = Http2.WebSocket.IWebSocketListener;
+  IWebSocketRequest = Http2.WebSocket.IWebSocketRequest;
+  TWebSocketListener = Http2.WebSocket.TWebSocketListener;
+  TWebSocketRequest = Http2.WebSocket.TWebSocketRequest;
+
   THttpResponse = class;
 
   /// dials the transport for one origin. Injected so pool tests need no real
@@ -93,7 +101,7 @@ type
   /// behaviour byte-for-byte: an injected test factory that only knows
   /// IHttp2SocketFactory still works unchanged on the https path.
   TDefaultSocketFactory = class(TInterfacedObject, IHttp2SocketFactory,
-    ICleartextSocketFactory, IProxySocketFactory)
+    ICleartextSocketFactory, IProxySocketFactory, IHttp1SocketFactory)
   private
     FCACertFile: string;
     FInsecure: Boolean;
@@ -117,6 +125,10 @@ type
       const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
       const AProxy: IProxy;
       out AProtocol: TNegotiatedProtocol): IHttp2Socket;
+    /// an HTTP/1.1-only connection, for WebSocket
+    function DialHttp1(const AHost: string; const APort: Word;
+      const AScheme: string; const ATimeoutMs: Integer;
+      const AProxy: IProxy): IHttp2Socket;
   end;
 
   /// an HTTP/2 response. Pseudo-headers
@@ -203,7 +215,10 @@ type
   /// the public client: Send blocks until status + headers; Close drains
   IHttpClient = interface
     ['{6B1C2D3E-4F50-4A61-9C72-000000000001}']
-    function Send(const ARequest: THttpRequest): IHttpResponse;
+    function Send(const ARequest: THttpRequest): IHttpResponse; overload;
+    /// open a WebSocket (doc/design/websocket.md); the connection is not
+    /// pooled and outlives Close of this client until it is closed itself
+    function Send(const ARequest: IWebSocketRequest): IWebSocket; overload;
     procedure Close;
   end;
 
@@ -611,6 +626,8 @@ type
     FClearTextPolicy: TClearTextPolicy;
     /// nil = every route is direct (doc/design/proxy.md)
     FProxySelector: IProxySelector;
+    FFactory: IHttp2SocketFactory;
+    FConnectTimeoutMs: Integer;
     function SendOnce(const ARequest: THttpRequest): IHttpResponse;
   public
     constructor Create(const AFactory: IHttp2SocketFactory;
@@ -623,7 +640,8 @@ type
       const AClearTextPolicy: TClearTextPolicy = ctReject;
       const AProxySelector: IProxySelector = nil);
     destructor Destroy; override;
-    function Send(const ARequest: THttpRequest): IHttpResponse;
+    function Send(const ARequest: THttpRequest): IHttpResponse; overload;
+    function Send(const ARequest: IWebSocketRequest): IWebSocket; overload;
     procedure Close;
     /// the pool (test seam)
     property Pool: TConnectionPool read FPool;
@@ -713,6 +731,9 @@ function ReadHeadLineBytewise(const ASock: IHttp2Socket;
 { ---- implementation ---- }
 
 implementation
+
+uses
+  Http2.WebSocketClient;
 
 const
   cTokenChars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz' +
@@ -1144,6 +1165,13 @@ function TDefaultSocketFactory.DialProtocol(const AHost: string;
 begin
   Result := DialProtocolVia(AHost, APort, AScheme, AHttp1Fallback, APolicy,
     ATimeoutMs, nil, AProtocol);
+end;
+
+function TDefaultSocketFactory.DialHttp1(const AHost: string;
+  const APort: Word; const AScheme: string; const ATimeoutMs: Integer;
+  const AProxy: IProxy): IHttp2Socket;
+begin
+  Result := FProtocols.DialHttp1(AHost, APort, AScheme, ATimeoutMs, AProxy);
 end;
 
 function TDefaultSocketFactory.DialProtocolVia(const AHost: string;
@@ -2686,6 +2714,8 @@ constructor THttpClient.Create(const AFactory: IHttp2SocketFactory;
 begin
   inherited Create;
   FProxySelector := AProxySelector;
+  FFactory := AFactory;
+  FConnectTimeoutMs := AConnectTimeoutMs;
   FLock := TCriticalSection.Create;
   FPool := TConnectionPool.Create(AFactory, AMaxConnectionsPerHost,
     AMaxTotalConnections, AMaxStreamsPerConnection, AConnectTimeoutMs,
@@ -2825,6 +2855,42 @@ begin
     Timeout := ARequest.HeaderTimeoutMs;
   Result := FPool.Acquire(Origin, Host, Port, R, Timeout,
     ARequest.CancelToken, Proxy);
+end;
+
+function THttpClient.Send(const ARequest: IWebSocketRequest): IWebSocket;
+var
+  Secure: Boolean;
+  Host, Target, Authority, Mapped: string;
+  Port: Word;
+  Proxy: IProxy;
+  Dialer: IHttp1SocketFactory;
+  Closed: Boolean;
+begin
+  FLock.Acquire;
+  try
+    Closed := FClosed;
+  finally
+    FLock.Release;
+  end;
+  if Closed then
+    raise EHttpConnectionError.Create('the client is closed');
+  WsParseUrl(ARequest.Url, Secure, Host, Port, Target, Authority);
+  if not Supports(FFactory, IHttp1SocketFactory, Dialer) then
+    raise EHttpWebSocketError.Create(
+      'the socket factory cannot dial an HTTP/1.1 connection');
+  // the route is chosen on the equivalent http(s) URL, so http_proxy,
+  // https_proxy and no_proxy apply as they do for the same request
+  Proxy := nil;
+  if FProxySelector <> nil then
+  begin
+    if Secure then
+      Mapped := 'https://' + Authority + Target
+    else
+      Mapped := 'http://' + Authority + Target;
+    Proxy := FProxySelector.SelectProxy(Mapped);
+    ValidateProxy(Proxy);
+  end;
+  Result := OpenWebSocket(Dialer, ARequest, Proxy, FConnectTimeoutMs);
 end;
 
 procedure THttpClient.Close;

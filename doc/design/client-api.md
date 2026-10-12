@@ -180,7 +180,8 @@ end;
 type
   IHttpClient = interface
   ['{6B1C2D3E-4F50-4A61-9C72-000000000001}']
-    function Send(const ARequest: THttpRequest): IHttpResponse;
+    function Send(const ARequest: THttpRequest): IHttpResponse; overload;
+    function Send(const ARequest: IWebSocketRequest): IWebSocket; overload;
     procedure Close;
   end;
 ```
@@ -190,6 +191,12 @@ returns an `IHttpResponse` whose body can be streamed or drained (see
 [[messages]]). It does not block until the body is complete. `Send` is
 thread-safe and may be called concurrently from many threads; each call
 acquires its own stream lease.
+
+The second `Send` opens a WebSocket (see [[websocket]]): it dials a dedicated
+HTTP/1.1 connection, runs the upgrade handshake and returns an `IWebSocket`
+whose listener callbacks run on its own reader thread. That connection is not
+pooled. A class that implements `IHttpClient` itself has to provide both
+overloads.
 
 `Close` stops accepting new leases, gracefully closes open connections
 (GOAWAY, see [[transport]]), and releases the pool. Outstanding

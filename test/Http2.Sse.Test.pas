@@ -19,7 +19,7 @@ interface
 uses
   SysUtils, Classes, SyncObjs, Generics.Collections, fpcunit, testregistry,
   Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack, Http2.Tls,
-  Http2.Connection, Http2.Stream, Http2.Messages, Http2.Client,
+  Http2.Connection, Http2.Stream, Http2.Messages, Http2.Client, Http2.WebSocket,
   Http2.Sse, Http2.MockSocket;
 
 type
@@ -79,7 +79,8 @@ type
     /// every Send raises EHttpProtocolError (the response is not an event
     /// stream; reconnecting cannot fix it)
     procedure RejectResponse;
-    function Send(const ARequest: THttpRequest): IHttpResponse;
+    function Send(const ARequest: THttpRequest): IHttpResponse; overload;
+    function Send(const ARequest: IWebSocketRequest): IWebSocket; overload;
     procedure Close;
     function RequestCount: Integer;
     function RequestAt(const AIndex: Integer): THttpRequest;
@@ -400,6 +401,11 @@ end;
 procedure TScriptedClient.RejectResponse;
 begin
   FRejectResponse := True;
+end;
+
+function TScriptedClient.Send(const ARequest: IWebSocketRequest): IWebSocket;
+begin
+  raise EHttpWebSocketError.Create('a scripted client opens no WebSocket');
 end;
 
 function TScriptedClient.Send(const ARequest: THttpRequest): IHttpResponse;

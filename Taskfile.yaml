@@ -143,6 +143,16 @@ tasks:
     cmds:
       - bash tools/validate/proxy-live.sh
 
+  validate:websocket:
+    desc: 'Live WebSocket gate — ws/wss and every proxy kind via tools/validate/ws_servers.py'
+    cmds:
+      - bash tools/validate/websocket-live.sh
+
+  validate:websocket:autobahn:
+    desc: 'Autobahn|Testsuite fuzzing server (Docker) against the WebSocket client'
+    cmds:
+      - bash tools/validate/websocket-live.sh autobahn
+
   validate:harness:
     desc: 'S12 gate B — 146-id h2-client-test-harness sweep (~30 min, Docker)'
     deps:

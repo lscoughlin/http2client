@@ -52,6 +52,7 @@ Recorded in the owning note; listed here only as a lookup index.
 | `THttpBody` vs `IBodyWriter` precedence and redirect replayability | [[messages]], [[errors-redirects]] |
 | An HTTP/1.1 connection is **not** later upgraded to `h2` | [[fallback]] |
 | SSE reconnect: wrapper, not transport; clean end or transient failure reconnects, a protocol error is terminal | [[server-sent-events]] |
+| WebSocket: RFC 6455 over HTTP/1.1 only (RFC 8441 and `permessage-deflate` are not implemented); demand-driven delivery; a dedicated unpooled connection per socket; the observer sees nothing of it | [[websocket]] |
 | SSE emits no observer event per message (frame/stream-level observer only); push support is caller-owned | [[server-sent-events]] |
 | SSE over the HTTP/1.1 fallback is best-effort: liveness bounded by the socket read timeout, no cancel path | [[server-sent-events]], [[fallback]] |
 | SSE sends `accept-encoding: identity` and rejects any other `content-encoding` | [[server-sent-events]] |
