@@ -23,7 +23,7 @@ uses
   Sockets,
   Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack,
   Http2.Tls, Http2.Connection, Http2.Stream, Http2.Observer, Http2.Messages,
-  Http2.Http1, Http2.Encoding;
+  Http2.Http1, Http2.Encoding, Http2.Proxy;
 
 const
   /// documented factory defaults (doc/design/client-api.md "HttpClientFactory")
@@ -62,6 +62,15 @@ const
 type
   // TClearTextPolicy and TNegotiatedProtocol come from Http2.Messages.pas
 
+  // the proxy types live in Http2.Proxy; re-exported so a caller that only
+  // uses Http2.Client can name them (the TProxyKind VALUES need Http2.Proxy in
+  // the uses clause, as with TClearTextPolicy)
+  IProxy = Http2.Proxy.IProxy;
+  IProxySelector = Http2.Proxy.IProxySelector;
+  TProxy = Http2.Proxy.TProxy;
+  TProxyKind = Http2.Proxy.TProxyKind;
+  TEnvLookup = Http2.Proxy.TEnvLookup;
+
   THttpResponse = class;
 
   /// dials the transport for one origin. Injected so pool tests need no real
@@ -84,7 +93,7 @@ type
   /// behaviour byte-for-byte: an injected test factory that only knows
   /// IHttp2SocketFactory still works unchanged on the https path.
   TDefaultSocketFactory = class(TInterfacedObject, IHttp2SocketFactory,
-    ICleartextSocketFactory)
+    ICleartextSocketFactory, IProxySocketFactory)
   private
     FCACertFile: string;
     FInsecure: Boolean;
@@ -100,6 +109,13 @@ type
     function DialProtocol(const AHost: string; const APort: Word;
       const AScheme: string; const AHttp1Fallback: Boolean;
       const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
+      out AProtocol: TNegotiatedProtocol): IHttp2Socket;
+    /// the per-request-proxy entry point (doc/design/proxy.md); AProxy nil
+    /// dials directly.  DialProtocol is this with the constructor's fixed proxy
+    function DialProtocolVia(const AHost: string; const APort: Word;
+      const AScheme: string; const AHttp1Fallback: Boolean;
+      const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
+      const AProxy: IProxy;
       out AProtocol: TNegotiatedProtocol): IHttp2Socket;
   end;
 
@@ -212,6 +228,11 @@ type
     FObserver: IHttp2Observer;
     FHttp1Fallback: Boolean;
     FClearTextPolicy: TClearTextPolicy;
+    FProxySelector: IProxySelector;
+    FAllProxy: string;
+    FProxyEnvVars: Boolean;
+    FNoProxy: string;
+    FEnvLookup: TEnvLookup;
   public
     class function Create: THttpClientFactory; static;
     /// compatibility shim: sets BOTH the per-host and the total cap to AMax,
@@ -226,6 +247,23 @@ type
     function WithFollowRedirects(const AFollow: Boolean): THttpClientFactory;
     function WithMaxRedirects(const AMax: Integer): THttpClientFactory;
     function WithProxy(const AHost: string; const APort: Word): THttpClientFactory;
+    /// the proxy for the request is chosen by ASelector (nil = direct); it
+    /// overrides every other proxy setting (doc/design/proxy.md)
+    function WithProxySelector(const ASelector: IProxySelector): THttpClientFactory;
+    /// one proxy URL ('[scheme://][user[:password]@]host[:port]', schemes
+    /// http, https, socks5, socks5h) for every scheme without a more specific
+    /// proxy; the manual form of all_proxy.  '' clears it.
+    function WithAllProxy(const AUrl: string): THttpClientFactory;
+    /// read http_proxy, https_proxy, all_proxy and no_proxy from the process
+    /// environment when Build runs.  Off by default.
+    function WithProxyEnvironmentVars(const AEnable: Boolean = True): THttpClientFactory;
+    /// hosts that always connect directly: the no_proxy grammar (comma list;
+    /// '*', domain suffixes, host:port, IP literals, CIDR).  Repeated calls
+    /// append.
+    function WithNoProxy(const AList: string): THttpClientFactory;
+    /// test seam: read the proxy variables through ALookup instead of the
+    /// process environment (nil restores the process environment)
+    function WithProxyEnvironmentLookup(const ALookup: TEnvLookup): THttpClientFactory;
     /// the connect/header/idle deadlines are factory defaults
     function WithConnectTimeout(const AMs: Integer): THttpClientFactory;
     function WithHeaderTimeout(const AMs: Integer): THttpClientFactory;
@@ -265,6 +303,10 @@ type
     property IdleTimeoutMs: Integer read FIdleTimeoutMs;
     property ProxyHost: string read FProxyHost;
     property ProxyPort: Word read FProxyPort;
+    property ProxySelector: IProxySelector read FProxySelector;
+    property AllProxy: string read FAllProxy;
+    property ProxyEnvironmentVars: Boolean read FProxyEnvVars;
+    property NoProxy: string read FNoProxy;
     property CACertFile: string read FCACertFile;
     property InsecureTls: Boolean read FInsecure;
     property Observer: IHttp2Observer read FObserver;
@@ -400,7 +442,8 @@ type
   /// then waits: against an exact-count transport that Fill blocks until the
   /// read deadline expires.  Wrapping the cleartext transport for the HTTP/1.1
   /// path fixes that without touching the transport itself.  A transport with
-  /// no exposed raw handle (TLS) is used unchanged.
+  /// no exposed raw handle (TLS) is read through IPartialReader instead, which
+  /// returns what is available.
   TSingleReadSocket = class(TInterfacedObject, IHttp2Socket)
   private
     FInner: IHttp2Socket;
@@ -485,7 +528,7 @@ type
     /// supports it, else the legacy Dial (npHttp2Tls) so an injected test
     /// factory keeps working
     function DialFor(const AHost: string; const APort: Word;
-      const AScheme: string; const ATimeoutMs: Integer;
+      const AScheme: string; const ATimeoutMs: Integer; const AProxy: IProxy;
       out AProtocol: TNegotiatedProtocol): IHttp2Socket;
     /// wrap Sock as an HTTP/2 pooled connection.  AStart True runs the thread
     /// and waits for csOpen (preface + SETTINGS written by DoPreface); False
@@ -503,8 +546,8 @@ type
     /// connection on which the caller must adopt stream 1 via AcquireUpgraded.
     function OpenForTxn(const AOrigin, AHost: string; const APort: Word;
       const ARequest: TStreamRequest; const AHeaderTimeoutMs: Integer;
-      const AScheme: string; out AConn: IPooledConnection;
-      out AUpgraded: Boolean): Boolean;
+      const AScheme: string; const AProxy: IProxy;
+      out AConn: IPooledConnection; out AUpgraded: Boolean): Boolean;
     /// write the h2c Upgrade request on Sock and read the whole response head
     /// byte by byte.  True => 101 and the socket sits exactly at the HTTP/2
     /// boundary; False => the peer declined and Sock must be discarded (its
@@ -534,9 +577,12 @@ type
     /// one or waiting for a slot per doc/design/client-api.md. When AToken is
     /// non-nil the wait is cancellable (plan S10 task 10.8).  The request's
     /// scheme selects TLS vs cleartext and the HTTP/2 vs HTTP/1.1 codec.
+    /// AOrigin is the pool key (the plain origin when direct, origin plus the
+    /// proxy route otherwise); AProxy is the route to dial on a new connection
     function Acquire(const AOrigin, AHost: string; const APort: Word;
       const ARequest: TStreamRequest; const AHeaderTimeoutMs: Integer;
-      const AToken: ICancellationToken = nil): IHttpResponse;
+      const AToken: ICancellationToken = nil;
+      const AProxy: IProxy = nil): IHttpResponse;
     /// close and remove connections idle for longer than IdleTimeoutMs, so
     /// the pool stays within MaxTotalConnections (plan S10 task 10.7).
     procedure ReapIdle;
@@ -563,6 +609,8 @@ type
     FLock: TCriticalSection;
     FHttp1Fallback: Boolean;
     FClearTextPolicy: TClearTextPolicy;
+    /// nil = every route is direct (doc/design/proxy.md)
+    FProxySelector: IProxySelector;
     function SendOnce(const ARequest: THttpRequest): IHttpResponse;
   public
     constructor Create(const AFactory: IHttp2SocketFactory;
@@ -572,7 +620,8 @@ type
       AConnectTimeoutMs, AHeaderTimeoutMs, AIdleTimeoutMs: Integer;
       const AObserver: IHttp2Observer = nil;
       const AHttp1Fallback: Boolean = False;
-      const AClearTextPolicy: TClearTextPolicy = ctReject);
+      const AClearTextPolicy: TClearTextPolicy = ctReject;
+      const AProxySelector: IProxySelector = nil);
     destructor Destroy; override;
     function Send(const ARequest: THttpRequest): IHttpResponse;
     procedure Close;
@@ -615,6 +664,10 @@ function ReadText(const AResponse: IHttpResponse): string;
 /// split a URL into host, port and path+query; default port is 443 (TLS)
 procedure ParseHttpUrl(const AUrl: string; out AHost: string; out APort: Word;
   out APath: string);
+
+/// the host as written in a host[:port] string: an IPv6 literal (ParseHttpUrl
+/// returns it without brackets) gets its brackets back
+function BracketedHost(const AHost: string): string;
 
 /// origin key = host[:port] with the default port omitted (doc/design). A
 /// non-https URL is prefixed with its scheme so an http redirect target cannot
@@ -729,19 +782,53 @@ begin
   else
     AuthorityPart := Rest;
 
-  Colon := Pos(':', AuthorityPart);
-  if Colon > 0 then
+  // userinfo never reaches :authority or the dial: drop everything up to the
+  // last '@' (RFC 3986 section 3.2)
+  for P := Length(AuthorityPart) downto 1 do
+    if AuthorityPart[P] = '@' then
+    begin
+      AuthorityPart := Copy(AuthorityPart, P + 1, MaxInt);
+      Break;
+    end;
+
+  PortStr := '';
+  if Copy(AuthorityPart, 1, 1) = '[' then
   begin
-    AHost := Copy(AuthorityPart, 1, Colon - 1);
-    PortStr := Copy(AuthorityPart, Colon + 1, Length(AuthorityPart));
+    // bracketed IPv6 literal (RFC 3986): the host is returned WITHOUT the
+    // brackets, which are re-added wherever a host:port string is written
+    P := Pos(']', AuthorityPart);
+    if P = 0 then
+      raise EHttpProtocolError.Create('invalid URL host: unterminated "["',
+        ecProtocolError);
+    AHost := Copy(AuthorityPart, 2, P - 2);
+    Rest := Copy(AuthorityPart, P + 1, MaxInt);
+    if Rest <> '' then
+    begin
+      if Rest[1] <> ':' then
+        raise EHttpProtocolError.Create('invalid URL host: junk after "]"',
+          ecProtocolError);
+      PortStr := Copy(Rest, 2, MaxInt);
+    end;
+  end
+  else
+  begin
+    Colon := Pos(':', AuthorityPart);
+    if Colon > 0 then
+    begin
+      AHost := Copy(AuthorityPart, 1, Colon - 1);
+      PortStr := Copy(AuthorityPart, Colon + 1, Length(AuthorityPart));
+    end
+    else
+      AHost := AuthorityPart;
+  end;
+  if PortStr <> '' then
+  begin
     Port := StrToIntDef(PortStr, APort);
     if (Port <= 0) or (Port > 65535) then
       raise EHttpProtocolError.Create('invalid URL port: ' + PortStr,
         ecProtocolError);
     APort := Word(Port);
-  end
-  else
-    AHost := AuthorityPart;
+  end;
 
   if PathPart <> '' then
     APath := PathPart;
@@ -768,12 +855,21 @@ begin
     Result := cDefaultHttpsPort;
 end;
 
+function BracketedHost(const AHost: string): string;
+begin
+  if (Pos(':', AHost) > 0) and (Copy(AHost, 1, 1) <> '[') then
+    Result := '[' + AHost + ']'
+  else
+    Result := AHost;
+end;
+
 function OriginOfUrl(const AUrl: string): string;
 var
   Host, Path, Scheme: string;
   Port: Word;
 begin
   ParseHttpUrl(AUrl, Host, Port, Path);
+  Host := BracketedHost(Host);
   Scheme := SchemeOfUrl(AUrl);
   if Port = DefaultPortForScheme(Scheme) then
     Result := Host
@@ -1045,22 +1141,41 @@ function TDefaultSocketFactory.DialProtocol(const AHost: string;
   const APort: Word; const AScheme: string; const AHttp1Fallback: Boolean;
   const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
   out AProtocol: TNegotiatedProtocol): IHttp2Socket;
+begin
+  Result := DialProtocolVia(AHost, APort, AScheme, AHttp1Fallback, APolicy,
+    ATimeoutMs, nil, AProtocol);
+end;
+
+function TDefaultSocketFactory.DialProtocolVia(const AHost: string;
+  const APort: Word; const AScheme: string; const AHttp1Fallback: Boolean;
+  const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
+  const AProxy: IProxy;
+  out AProtocol: TNegotiatedProtocol): IHttp2Socket;
 var
   Sock: IHttp2Socket;
   TlsObj: TObject;
   Name: string;
+  Proxy: IProxy;
 begin
+  // a factory built with a fixed proxy (the constructor parameters) keeps
+  // tunnelling through it when the caller routes nothing per request, so an
+  // injected TDefaultSocketFactory.Create(..., host, port) never falls back
+  // to a direct connection
+  Proxy := AProxy;
+  if (Proxy = nil) and (FProxyHost <> '') then
+    Proxy := TProxy.Create(FProxyHost, FProxyPort);
+
   // cleartext never involves ALPN, so the shared selector is correct there
   if AScheme = 'http' then
-    Exit(FProtocols.DialProtocol(AHost, APort, AScheme, AHttp1Fallback,
-      APolicy, ATimeoutMs, AProtocol));
+    Exit(FProtocols.DialProtocolVia(AHost, APort, AScheme, AHttp1Fallback,
+      APolicy, ATimeoutMs, Proxy, AProtocol));
 
   // https: offer the ALPN list the fallback policy asks for, then map the
   // selected name to a codec.  DialWithAlpn reports the name instead of
   // enforcing "h2", so the mapping happens here
   // (doc/design/fallback.md "Negotiation").
-  Sock := TTlsSocket.DialWithAlpn(AHost, APort, AlpnOfferFor(AHttp1Fallback),
-    FInsecure, ATimeoutMs, FCACertFile, FProxyHost, FProxyPort);
+  Sock := TTlsSocket.DialWithAlpnVia(AHost, APort, AlpnOfferFor(AHttp1Fallback),
+    FInsecure, ATimeoutMs, FCACertFile, Proxy);
   // downcast with Supports, NOT a hard class cast: a hard cast reinterprets
   // the interface pointer (which is not the object base) and reads garbage
   Name := '';
@@ -1114,6 +1229,7 @@ var
   Port: Word;
 begin
   ParseHttpUrl(FUrl, Host, Port, Path);
+  Host := BracketedHost(Host);
   if Port = DefaultPortForScheme(SchemeOfUrl(FUrl)) then
     Result := Host
   else
@@ -1299,6 +1415,11 @@ begin
   Result.FIdleTimeoutMs := cDefaultIdleTimeoutMs;
   Result.FProxyHost := '';
   Result.FProxyPort := 0;
+  Result.FProxySelector := nil;
+  Result.FAllProxy := '';
+  Result.FProxyEnvVars := False;
+  Result.FNoProxy := '';
+  Result.FEnvLookup := nil;
   Result.FCACertFile := '';
   Result.FInsecure := False;
   Result.FObserver := nil;
@@ -1356,12 +1477,46 @@ begin
   Result := Self;
   Result.FProxyHost := AHost;
   Result.FProxyPort := APort;
-  // an explicitly injected factory still wins; otherwise carry the proxy on
-  // the default socket factory so every dial path tunnels through it
-  if not (Result.FSocketFactory is TDefaultSocketFactory) then
+  // the route is chosen per request at Build time (doc/design/proxy.md); the
+  // socket factory no longer carries a proxy of its own
+end;
+
+function THttpClientFactory.WithProxySelector(
+  const ASelector: IProxySelector): THttpClientFactory;
+begin
+  Result := Self;
+  Result.FProxySelector := ASelector;
+end;
+
+function THttpClientFactory.WithAllProxy(const AUrl: string): THttpClientFactory;
+begin
+  Result := Self;
+  Result.FAllProxy := Trim(AUrl);
+end;
+
+function THttpClientFactory.WithProxyEnvironmentVars(
+  const AEnable: Boolean): THttpClientFactory;
+begin
+  Result := Self;
+  Result.FProxyEnvVars := AEnable;
+end;
+
+function THttpClientFactory.WithNoProxy(const AList: string): THttpClientFactory;
+begin
+  Result := Self;
+  if Trim(AList) = '' then
     Exit;
-  Result.FSocketFactory := TDefaultSocketFactory.Create(Result.FCACertFile,
-    Result.FInsecure, AHost, APort);
+  if Result.FNoProxy = '' then
+    Result.FNoProxy := Trim(AList)
+  else
+    Result.FNoProxy := Result.FNoProxy + ',' + Trim(AList);
+end;
+
+function THttpClientFactory.WithProxyEnvironmentLookup(
+  const ALookup: TEnvLookup): THttpClientFactory;
+begin
+  Result := Self;
+  Result.FEnvLookup := ALookup;
 end;
 
 function THttpClientFactory.WithSocketFactory(
@@ -1379,8 +1534,8 @@ begin
   // an explicitly injected factory still wins; otherwise rebuild the default
   if not (Result.FSocketFactory is TDefaultSocketFactory) then
     Exit;
-  Result.FSocketFactory := TDefaultSocketFactory.Create(AFileName, Result.FInsecure,
-    Result.FProxyHost, Result.FProxyPort);
+  Result.FSocketFactory := TDefaultSocketFactory.Create(AFileName,
+    Result.FInsecure);
 end;
 
 function THttpClientFactory.WithInsecureTls(
@@ -1390,8 +1545,8 @@ begin
   Result.FInsecure := AInsecure;
   if not (Result.FSocketFactory is TDefaultSocketFactory) then
     Exit;
-  Result.FSocketFactory := TDefaultSocketFactory.Create(Result.FCACertFile, AInsecure,
-    Result.FProxyHost, Result.FProxyPort);
+  Result.FSocketFactory := TDefaultSocketFactory.Create(Result.FCACertFile,
+    AInsecure);
 end;
 
 function THttpClientFactory.WithConnectTimeout(
@@ -1437,11 +1592,28 @@ begin
 end;
 
 function THttpClientFactory.Build: IHttpClient;
+var
+  Fixed: IProxy;
+  Env: TProxyEnvironment;
+  Selector: IProxySelector;
 begin
+  // every proxy source collapses into one selector here (nil = all direct);
+  // an unusable proxy value raises EHttpProxyConfigError before any request
+  Fixed := nil;
+  if FProxyHost <> '' then
+    Fixed := TProxy.Create(FProxyHost, FProxyPort);
+  FillChar(Env, SizeOf(Env), 0);
+  if FProxyEnvVars then
+    if Assigned(FEnvLookup) then
+      Env := ReadProxyEnvironmentUsing(FEnvLookup)
+    else
+      Env := ReadProxyEnvironment;
+  Selector := BuildProxySelector(FProxySelector, Fixed, FAllProxy,
+    FProxyEnvVars, Env, FNoProxy);
   Result := THttpClient.Create(FSocketFactory, FMaxConnectionsPerHost,
     FMaxTotalConnections, FMaxStreamsPerConnection, FFollowRedirects,
     FMaxRedirects, FConnectTimeoutMs, FHeaderTimeoutMs, FIdleTimeoutMs,
-    FObserver, FHttp1Fallback, FClearTextPolicy);
+    FObserver, FHttp1Fallback, FClearTextPolicy, Selector);
 end;
 
 { TGuardedBody }
@@ -1771,12 +1943,19 @@ function TSingleReadSocket.Read(var ABuffer; ACount: Integer): Integer;
 var
   N: ssize_t;
   tv: TTimeVal;
+  PR: IPartialReader;
 begin
   if ACount <= 0 then
     Exit(0);
   if FFd < 0 then
-    // no raw handle: fall back to the wrapped transport unchanged
+  begin
+    // no raw handle (a TLS socket): take whatever the wrapped transport has
+    // available.  Its Read insists on the full count, which on a keep-alive
+    // connection would wait until the server gave up
+    if Supports(FInner, IPartialReader, PR) then
+      Exit(PR.ReadSome(ABuffer, ACount));
     Exit(FInner.Read(ABuffer, ACount));
+  end;
   tv.tv_sec := 0;
   if FReadTimeoutMs > 0 then
   begin
@@ -2103,11 +2282,18 @@ begin
 end;
 
 function TConnectionPool.DialFor(const AHost: string; const APort: Word;
-  const AScheme: string; const ATimeoutMs: Integer;
+  const AScheme: string; const ATimeoutMs: Integer; const AProxy: IProxy;
   out AProtocol: TNegotiatedProtocol): IHttp2Socket;
 var
   CF: ICleartextSocketFactory;
+  PF: IProxySocketFactory;
 begin
+  // a factory that takes the route per dial (the default factory) gets the
+  // proxy chosen for this request; nil dials directly
+  if Supports(FFactory, IProxySocketFactory, PF) then
+    Exit(PF.DialProtocolVia(AHost, APort, AScheme, FHttp1Fallback,
+      FClearTextPolicy, ATimeoutMs, AProxy, AProtocol));
+
   // the default factory (and any factory that opted into the extended
   // contract) selects TLS vs cleartext and the ALPN codec for us
   if Supports(FFactory, ICleartextSocketFactory, CF) then
@@ -2115,7 +2301,8 @@ begin
       FClearTextPolicy, ATimeoutMs, AProtocol));
 
   // legacy factory (the injected test seam): it only knows TLS + h2, so an
-  // https origin stays strict; a cleartext origin is dialled directly
+  // https origin stays strict; a cleartext origin is dialled directly.  Such a
+  // factory predates per-request routing and is never given a proxy
   if AScheme = 'http' then
   begin
     if FClearTextPolicy = ctUpgrade then
@@ -2252,6 +2439,7 @@ end;
 function TConnectionPool.OpenForTxn(const AOrigin, AHost: string;
   const APort: Word; const ARequest: TStreamRequest;
   const AHeaderTimeoutMs: Integer; const AScheme: string;
+  const AProxy: IProxy;
   out AConn: IPooledConnection; out AUpgraded: Boolean): Boolean;
 var
   Sock: IHttp2Socket;
@@ -2260,7 +2448,7 @@ begin
   Result := False;
   AConn := nil;
   AUpgraded := False;
-  Sock := DialFor(AHost, APort, AScheme, FConnectTimeoutMs, Protocol);
+  Sock := DialFor(AHost, APort, AScheme, FConnectTimeoutMs, AProxy, Protocol);
   try
     case Protocol of
       npHttp2Tls, npHttp2Cleartext:
@@ -2295,7 +2483,8 @@ begin
             // codec/policy selection is unchanged), which then gets pooled
             // (doc/design/fallback.md: "keep the HTTP/1.1 connection").
             Sock.Close;
-            Sock := DialFor(AHost, APort, AScheme, FConnectTimeoutMs, Protocol);
+            Sock := DialFor(AHost, APort, AScheme, FConnectTimeoutMs, AProxy,
+              Protocol);
             AConn := WrapHttp1(Sock, AOrigin);
           end;
         end;
@@ -2313,7 +2502,7 @@ end;
 function TConnectionPool.Acquire(const AOrigin, AHost: string;
   const APort: Word; const ARequest: TStreamRequest;
   const AHeaderTimeoutMs: Integer;
-  const AToken: ICancellationToken): IHttpResponse;
+  const AToken: ICancellationToken; const AProxy: IProxy): IHttpResponse;
 var
   Deadline: QWord;
   Conn: IPooledConnection;
@@ -2336,7 +2525,7 @@ begin
         // the one transport-selection point: TLS vs cleartext and the HTTP/2
         // vs HTTP/1.1 codec (doc/design/fallback.md "Negotiation")
         OpenForTxn(AOrigin, AHost, APort, ARequest, AHeaderTimeoutMs,
-          ARequest.Scheme, Conn, Upgraded);
+          ARequest.Scheme, AProxy, Conn, Upgraded);
       end;
     finally
       FLock.Release;
@@ -2492,9 +2681,11 @@ constructor THttpClient.Create(const AFactory: IHttp2SocketFactory;
   const AFollowRedirects: Boolean; const AMaxRedirects, AConnectTimeoutMs,
   AHeaderTimeoutMs, AIdleTimeoutMs: Integer;
   const AObserver: IHttp2Observer;
-  const AHttp1Fallback: Boolean; const AClearTextPolicy: TClearTextPolicy);
+  const AHttp1Fallback: Boolean; const AClearTextPolicy: TClearTextPolicy;
+  const AProxySelector: IProxySelector);
 begin
   inherited Create;
+  FProxySelector := AProxySelector;
   FLock := TCriticalSection.Create;
   FPool := TConnectionPool.Create(AFactory, AMaxConnectionsPerHost,
     AMaxTotalConnections, AMaxStreamsPerConnection, AConnectTimeoutMs,
@@ -2607,6 +2798,7 @@ var
   Port: Word;
   R: TStreamRequest;
   Timeout: Integer;
+  Proxy: IProxy;
 begin
   ParseHttpUrl(ARequest.Url, Host, Port, Path);
   Origin := OriginOfUrl(ARequest.Url);
@@ -2617,12 +2809,22 @@ begin
     raise EHttpProtocolError.Create(
       'cleartext origin rejected (set WithClearText(ctPriorKnowledge) or ' +
       'WithClearText(ctUpgrade) to enable it)', ecProtocolError);
+  // the route is chosen per hop (a redirect re-enters here), on this thread
+  // and outside the pool lock; a selector exception reaches the caller of Send
+  Proxy := nil;
+  if FProxySelector <> nil then
+  begin
+    Proxy := FProxySelector.SelectProxy(ARequest.Url);
+    ValidateProxy(Proxy);
+  end;
+  // the direct key stays the plain origin; a proxied route is its own bucket
+  Origin := Origin + ProxyRouteKey(Proxy);
   R := ARequest.ToStreamRequest;
   Timeout := FHeaderTimeoutMs;
   if ARequest.HeaderTimeoutMs > 0 then
     Timeout := ARequest.HeaderTimeoutMs;
   Result := FPool.Acquire(Origin, Host, Port, R, Timeout,
-    ARequest.CancelToken);
+    ARequest.CancelToken, Proxy);
 end;
 
 procedure THttpClient.Close;

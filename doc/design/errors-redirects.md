@@ -12,6 +12,7 @@ related:
   - "[[messages]]"
   - "[[transport]]"
   - "[[fallback]]"
+  - "[[proxy]]"
   - "[[server-sent-events]]"
   - "[[open-questions]]"
 updated: 2026-10-09
@@ -31,6 +32,10 @@ When `WithFollowRedirects` is on and a `3xx` carries a `Location`:
   fails with `EHttpNotReplayable`).
 - Redirect count is bounded by `MaxRedirects`; exceeding it raises
   `EHttpTooManyRedirects`.
+- The proxy route is chosen again for every hop, so a redirect to a host on
+  the no-proxy list connects directly and a redirect away from one goes
+  through the proxy. A refused `CONNECT` raises `EHttpConnectionError`; an
+  unusable proxy value raises `EHttpProxyConfigError`. See [[proxy]].
 
 ```mermaid
 flowchart TB

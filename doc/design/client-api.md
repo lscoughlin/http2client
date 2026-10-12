@@ -10,6 +10,7 @@ status: done
 up: "[[http2client]]"
 related:
   - "[[architecture]]"
+  - "[[proxy]]"
   - "[[messages]]"
   - "[[open-questions]]"
 updated: 2026-10-08
@@ -57,6 +58,11 @@ type
     function WithFollowRedirects(const AFollow: Boolean): THttpClientFactory;
     function WithMaxRedirects(const AMax: Integer): THttpClientFactory;
     function WithProxy(const AHost: string; const APort: Word): THttpClientFactory;
+    function WithProxySelector(const ASelector: IProxySelector): THttpClientFactory;
+    function WithAllProxy(const AUrl: string): THttpClientFactory;
+    function WithProxyEnvironmentVars(const AEnable: Boolean = True): THttpClientFactory;
+    function WithNoProxy(const AList: string): THttpClientFactory;
+    function WithProxyEnvironmentLookup(const ALookup: TEnvLookup): THttpClientFactory;
     function WithConnectTimeout(const AMs: Integer): THttpClientFactory;
     function WithHeaderTimeout(const AMs: Integer): THttpClientFactory;
     function WithIdleTimeout(const AMs: Integer): THttpClientFactory;
@@ -114,11 +120,21 @@ with `WithMaxTotalConnections(128)`.
 caps to `max`, which is the historic meaning for a single-authority pool.
 Prefer `WithMaxConnectionsPerHost` / `WithMaxTotalConnections`.
 
-`WithProxy(host, port)` routes every dial through an HTTP `CONNECT` tunnel
-to `host:port`; the tunnel is established on the plain socket, so TLS and
-ALPN still target the origin. A proxy that refuses the `CONNECT` surfaces as
-`EHttpConnectionError`; there is no forwarding mode and no silent direct
-fallback. See [[transport]].
+`WithProxy(host, port)` routes every dial that the no-proxy list does not
+exempt through an HTTP `CONNECT` tunnel to `host:port`; the tunnel is
+established on the plain socket, so TLS and ALPN still target the origin. A
+proxy that refuses the `CONNECT` surfaces as `EHttpConnectionError`; there is
+no forwarding mode and no silent direct fallback. See [[transport]].
+
+Three further methods choose the route per request. `WithProxyEnvironmentVars`
+reads `http_proxy`, `https_proxy`, `all_proxy` and `no_proxy` when the client
+is built and is off by default. `WithAllProxy(url)` is the manual counterpart
+of `all_proxy`: one proxy URL, including `https://` and `socks5://` forms with
+credentials, for every scheme without a more specific proxy. `WithNoProxy(list)` adds hosts that always connect directly
+and accepts the `no_proxy` grammar. `WithProxySelector(selector)` installs an
+`IProxySelector`, whose `SelectProxy(uri)` returns the proxy for a request or
+`nil` for a direct connection; a selector overrides every other proxy setting.
+Precedence, grammar, pooling and error behaviour are described in [[proxy]].
 
 The three timeout setters take a single value each — `WithConnectTimeout`,
 `WithHeaderTimeout`, `WithIdleTimeout` — and override the matching default

@@ -1,6 +1,6 @@
 # Examples
 
-Six small programs showing how to use `http2client`. They are smoke builds:
+Seven small programs showing how to use `http2client`. They are smoke builds:
 the build compiles them, it does not run them.
 
 ## Build
@@ -28,6 +28,7 @@ bin/basic_get      https://nghttp2.org/
 bin/post_text      https://nghttp2.org/httpbin/post
 bin/json_request   https://nghttp2.org/httpbin/post
 bin/xml_request    https://nghttp2.org/httpbin/xml
+https_proxy=http://proxy.corp:3128 bin/proxy_env https://nghttp2.org/
 bin/threaded_get   https://nghttp2.org/ 8 25
 bin/sse_stream     https://example.com/events
 # or against the reference event-stream server (cleartext; an http:// URL
@@ -44,6 +45,7 @@ bin/sse_stream     https://example.com/events
 | `xml_request.pas` | `WithXmlBody` / `ReadXmlDocument` for XML. |
 | `threaded_get.pas` | Eight threads sharing one client and its connection pool. |
 | `sse_stream.pas` | `SseRequest` + `TSseReconnectLoop`: read an event stream and resume from `last-event-id`. |
+| `proxy_env.pas` | `WithProxyEnvironmentVars` + `WithNoProxy`: route a GET by `http_proxy` / `https_proxy` / `all_proxy` / `no_proxy`. |
 
 ## Notes
 

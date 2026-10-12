@@ -48,6 +48,16 @@ type
     procedure SetWriteTimeoutMs(const AValue: Integer);
   end;
 
+  /// a keep-alive server: more bytes than were sent never arrive, and the
+  /// connection is not closed.  Read for a count beyond what is available
+  /// therefore raises (a real socket would block until the server gave up);
+  /// ReadSome returns what is there.
+  TKeepAliveSocket = class(TSocketScript, IHttp2Socket, IPartialReader)
+  public
+    function Read(var ABuffer; ACount: Integer): Integer;
+    function ReadSome(var ABuffer; ACount: Integer): Integer;
+  end;
+
   /// a fixed IBodyWriter that yields a scripted list of chunks
   TScriptedBodyWriter = class(TInterfacedObject, IBodyWriter)
   private
@@ -74,6 +84,7 @@ type
     procedure TestChunkedResponseDecodeWithTrailers;
     procedure TestChunkedBodyStreamDecodesIncrementally;
     procedure TestKeepAliveReusesOneSocketForTwoRequests;
+    procedure TestAKeepAliveServerIsNotWaitedOnForAFullBuffer;
     procedure TestReadToCloseFramingForbidsReuse;
     procedure TestHeadResponseIsBodyless;
     procedure TestNoContentResponseIsBodyless;
@@ -477,6 +488,42 @@ begin
       Inc(Total, N);
     end;
     AssertEquals('total decoded bytes', 6, Total);
+  finally
+    Conn.Free;
+  end;
+end;
+
+function TKeepAliveSocket.Read(var ABuffer; ACount: Integer): Integer;
+begin
+  if (Length(FData) - FPos) < ACount then
+    raise EHttpTimeout.Create(
+      'Read waited for more bytes than a keep-alive server will send');
+  Result := inherited Read(ABuffer, ACount);
+end;
+
+function TKeepAliveSocket.ReadSome(var ABuffer; ACount: Integer): Integer;
+begin
+  if FPos >= Length(FData) then
+    raise EHttpTimeout.Create('ReadSome with nothing more to read');
+  Result := inherited Read(ABuffer, ACount);
+end;
+
+procedure THttp1Test.TestAKeepAliveServerIsNotWaitedOnForAFullBuffer;
+var
+  Sock: TKeepAliveSocket;
+  Conn: THttp1Connection;
+  R: IHttpResponse;
+begin
+  // a short response from a server that keeps the connection open: the codec
+  // must take the bytes that arrived instead of waiting for a full buffer
+  Sock := TKeepAliveSocket.Create;
+  Sock.Feed('HTTP/1.1 200 OK'#13#10'Content-Length: 5'#13#10#13#10'hello');
+  Conn := THttp1Connection.Create(Sock);
+  try
+    R := Conn.Send(NewGetRequest('/a'));
+    AssertEquals(200, R.StatusCode);
+    AssertEquals('hello', DrainBody(R.Body));
+    AssertTrue('still reusable', Conn.Reusable);
   finally
     Conn.Free;
   end;

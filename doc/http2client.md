@@ -49,6 +49,7 @@ flowchart TB
 | [[messages]] | `IHttpResponse`, `THttpRequest`, `IHttpHeaders`, header constants, streaming |
 | [[protocol]] | frame layer, HPACK, flow control |
 | [[transport]] | threading and queues, connection lifecycle, TLS/ALPN |
+| [[proxy]] | proxy routing per request: fixed proxy, `http_proxy` / `https_proxy` / `no_proxy`, `WithNoProxy`, `IProxySelector` |
 | [[fallback]] | cleartext h2c (prior knowledge and upgrade) and HTTP/1.1 fallback |
 | [[errors-redirects]] | exception hierarchy, timeouts, cancellation, redirects |
 | [[server-sent-events]] | Server-Sent Events: event-stream parser, SSE source, reconnect/resume, body-read timeout |
@@ -95,7 +96,7 @@ OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib ./myprogram
 
 ## Examples
 
-`examples/` holds five small programs — see `examples/README.md`:
+`examples/` holds seven small programs — see `examples/README.md`:
 
 | Program | Shows |
 |---|---|
@@ -103,6 +104,8 @@ OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib ./myprogram
 | `post_text` | `WithTextBody`, a plain-text request body |
 | `json_request` | `Http2.Readers` JSON send + read |
 | `xml_request` | `Http2.Readers` XML send + read |
+| `sse_stream` | `Http2.Sse` event-stream reader |
+| `proxy_env` | `WithProxyEnvironmentVars` + `WithNoProxy`: routing by `http_proxy` / `https_proxy` / `all_proxy` / `no_proxy` |
 | `threaded_get` | one shared `IHttpClient` driven by many threads |
 
 ```sh

@@ -28,6 +28,14 @@ the lease state machine run against it.
 - **`IHttp2SocketFactory`** — the factory's `WithSocketFactory` installs a
   custom transport, which is how the mock is injected in tests and how a
   caller could supply their own TLS stack.
+- **Proxy routing** — `IProxySelector` and the proxy environment are pure and
+  tested without a socket (`WithProxyEnvironmentLookup` replaces the process
+  environment). A scripted loopback server plays an HTTP `CONNECT` proxy, an
+  https proxy and a SOCKS5 proxy, and acts as the origin inside the tunnel,
+  which exercises TLS inside TLS on 127.0.0.1 only. An opt-in live gate,
+  `make validate-proxy`, drives the client through reference proxies in
+  `tools/validate/proxy_servers.py` and checks their logs for the route taken;
+  with `nghttpd` installed it also runs strict-mode HTTP/2 through each proxy kind.
 - **Pure layers** — `THpackCodec`, `TWindow`, `TFrame`/`TFrameHeader`
   serialization, and the header codec are pure enough to test in isolation.
 - **`TResponseReader<T>`** — the base reader plus the optional

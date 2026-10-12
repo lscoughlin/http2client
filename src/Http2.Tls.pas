@@ -19,7 +19,7 @@ interface
 uses
   SysUtils, Classes, Sockets, ssockets, BaseUnix,
   mormot.core.base, mormot.lib.openssl11,
-  Http2.Errors;
+  Http2.Errors, Http2.Proxy, Http2.Socks;
 
 const
   /// the single ALPN protocol this client offers in strict mode (RFC 7540
@@ -124,12 +124,38 @@ function SocketWriteFully(AFd, ACount, ATimeoutMs: Integer;
   const ABuffer): Integer;
 
 type
+  /// a socket that can return whatever is available instead of insisting on
+  /// the full count (IHttp2Socket.Read reads exactly ACount bytes or up to
+  /// EOF).  A TLS layer carried over another stream needs this: records arrive
+  /// in arbitrary sizes and waiting for a full buffer would stall the
+  /// handshake.
+  IPartialReader = interface
+    ['{7B1D5E02-9F6A-4C57-8A31-5D2E0C4A9B21}']
+    /// block until at least one byte is available, then return between 1 and
+    /// ACount bytes; 0 means end of stream
+    function ReadSome(var ABuffer; ACount: Integer): Integer;
+  end;
+
+  /// implemented by a socket factory that dials through a per-request proxy
+  /// (doc/design/proxy.md).  A factory that lacks it is dialled without a
+  /// proxy, as before.
+  IProxySocketFactory = interface
+    ['{7B1D5E02-9F6A-4C57-8A31-5D2E0C4A9B22}']
+    /// like ICleartextSocketFactory.DialProtocol; AProxy nil dials directly
+    function DialProtocolVia(const AHost: string; const APort: Word;
+      const AScheme: string; const AHttp1Fallback: Boolean;
+      const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
+      const AProxy: IProxy;
+      out AProtocol: TNegotiatedProtocol): IHttp2Socket;
+  end;
+
   /// the production transport selector (plan S13): picks TLS or cleartext and
   /// reports the wire protocol it committed to.  Https offers "h2", or
   /// "h2"+"http/1.1" when fallback is on; an empty ALPN result with fallback
   /// on means HTTP/1.1 (RFC 7301).  A cleartext origin honours the policy
   /// (doc/design/fallback.md "Negotiation").
-  TProtocolSocketFactory = class(TInterfacedObject, ICleartextSocketFactory)
+  TProtocolSocketFactory = class(TInterfacedObject, ICleartextSocketFactory,
+    IProxySocketFactory)
   private
     FCACertFile: string;
     FInsecure: Boolean;
@@ -143,13 +169,18 @@ type
       const AScheme: string; const AHttp1Fallback: Boolean;
       const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
       out AProtocol: TNegotiatedProtocol): IHttp2Socket;
+    function DialProtocolVia(const AHost: string; const APort: Word;
+      const AScheme: string; const AHttp1Fallback: Boolean;
+      const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
+      const AProxy: IProxy;
+      out AProtocol: TNegotiatedProtocol): IHttp2Socket;
   end;
 
   /// a plain (cleartext) TCP socket over fcl-net's TInetSocket. When a proxy
   /// is configured the TCP connection goes to the proxy and a CONNECT tunnel
   /// to the real target is negotiated first, so every layer above (TLS, h2c,
   /// HTTP/1.1) sees a transparent byte stream to the origin.
-  TPlainSocket = class(TInterfacedObject, IHttp2Socket)
+  TPlainSocket = class(TInterfacedObject, IHttp2Socket, IPartialReader)
   private
     FSocket: TInetSocket;
     FHandle: Integer;
@@ -165,6 +196,7 @@ type
     /// the underlying OS socket handle (needed to hand the socket to OpenSSL)
     property Handle: Integer read FHandle;
     function Read(var ABuffer; ACount: Integer): Integer;
+    function ReadSome(var ABuffer; ACount: Integer): Integer;
     function Write(const ABuffer; ACount: Integer): Integer;
     procedure Close;
     function GetConnected: Boolean;
@@ -179,8 +211,15 @@ type
   /// a TLS socket over an existing connected IHttp2Socket (ALPN "h2")
   // - the crypto operations are exposed as virtual seams so tests can inject
   //   a scripted handshake result without touching the network
-  TTlsSocket = class(TInterfacedObject, IHttp2Socket)
+  TTlsSocket = class(TInterfacedObject, IHttp2Socket, IPartialReader)
   private
+    /// True when the transport is another byte stream (for example a TLS
+    /// connection to an https proxy) rather than a plain TCP socket: OpenSSL
+    /// then runs on a pair of memory BIOs and this class moves the bytes
+    FStreamMode: Boolean;
+    FRbio: PBIO;
+    FWbio: PBIO;
+    FEofFed: Boolean;
     FTransport: IHttp2Socket;
     FHost: string;
     FInsecure: Boolean;
@@ -194,6 +233,9 @@ type
     FConnectTimeoutMs: Integer;
     FReadTimeoutMs: Integer;
     FWriteTimeoutMs: Integer;
+    procedure BioFlush;
+    function BioFeed: Boolean;
+    function StreamHandshake(const ASsl: PSSL): Integer;
   protected
     // --- crypto seams (overridden by tests) ---
     function CreateSslContext: PSSL_CTX; virtual;
@@ -248,6 +290,22 @@ type
     /// override the ALPN offer this socket will send in Establish; ignored by
     /// the Dial overloads, which set it for you
     procedure SetAlpnOffer(const AOffer: TBytes);
+    /// dial through AProxy (nil = direct): the proxy leg is TCP, or TCP+TLS for
+    /// an https proxy, and a CONNECT or SOCKS5 tunnel to AHost:APort is
+    /// negotiated before TLS to the origin begins
+    class function DialVia(const AHost: string; const APort: Word;
+      const AInsecure: Boolean; const AConnectTimeoutMs: Integer;
+      const ACACertFile: string; const AProxy: IProxy): IHttp2Socket;
+    class function DialWithAlpnVia(const AHost: string; const APort: Word;
+      const AAlpnOffer: TBytes; const AInsecure: Boolean;
+      const AConnectTimeoutMs: Integer; const ACACertFile: string;
+      const AProxy: IProxy): IHttp2Socket;
+    class function DialCleartextVia(const AHost: string; const APort: Word;
+      const AConnectTimeoutMs: Integer; const AProxy: IProxy;
+      const AInsecure: Boolean = False;
+      const ACACertFile: string = ''): IHttp2Socket;
+    function ReadSome(var ABuffer; ACount: Integer): Integer;
+    property StreamMode: Boolean read FStreamMode write FStreamMode;
     property Insecure: Boolean read FInsecure;
     /// PEM bundle used to verify the peer; '' = the system trust store
     property CACertFile: string read FCACertFile;
@@ -420,17 +478,77 @@ begin
   end;
 end;
 
+type
+  /// the proxy exchange over a raw descriptor
+  TFdChannel = class(TInterfacedObject, ISocksChannel)
+  private
+    FFd: Integer;
+    FTimeoutMs: Integer;
+  public
+    constructor Create(const AFd, ATimeoutMs: Integer);
+    procedure WriteAll(const AData: TBytes);
+    function ReadSome(var ABuffer; const ACount: Integer): Integer;
+  end;
+
+  /// the proxy exchange over an IHttp2Socket (for example a TLS socket to an
+  /// https proxy)
+  TSocketChannel = class(TInterfacedObject, ISocksChannel)
+  private
+    FSock: IHttp2Socket;
+  public
+    constructor Create(const ASock: IHttp2Socket);
+    procedure WriteAll(const AData: TBytes);
+    function ReadSome(var ABuffer; const ACount: Integer): Integer;
+  end;
+
+constructor TFdChannel.Create(const AFd, ATimeoutMs: Integer);
+begin
+  inherited Create;
+  FFd := AFd;
+  FTimeoutMs := ATimeoutMs;
+end;
+
+procedure TFdChannel.WriteAll(const AData: TBytes);
+begin
+  if Length(AData) > 0 then
+    SocketWriteFully(FFd, Length(AData), FTimeoutMs, AData[0]);
+end;
+
+function TFdChannel.ReadSome(var ABuffer; const ACount: Integer): Integer;
+begin
+  // reads exactly ACount (or to EOF): callers ask for exactly what the
+  // protocol still needs, so nothing past the proxy reply is consumed
+  Result := SocketReadFully(FFd, ACount, FTimeoutMs, ABuffer);
+end;
+
+constructor TSocketChannel.Create(const ASock: IHttp2Socket);
+begin
+  inherited Create;
+  FSock := ASock;
+end;
+
+procedure TSocketChannel.WriteAll(const AData: TBytes);
+begin
+  if Length(AData) > 0 then
+    FSock.Write(AData[0], Length(AData));
+end;
+
+function TSocketChannel.ReadSome(var ABuffer; const ACount: Integer): Integer;
+begin
+  Result := FSock.Read(ABuffer, ACount);
+end;
+
 /// read one CRLF/LF-terminated line from the tunnel handshake; False only at
 // EOF.  Byte-at-a-time so it never consumes bytes past the CONNECT response
 // (any payload beyond the blank line belongs to the tunnel)
-function ProxyReadLine(AFd, ATimeoutMs: Integer;
+function ProxyReadLineCh(const ACh: ISocksChannel;
   out ALine: AnsiString): Boolean;
 var
   C: AnsiChar;
 begin
   ALine := '';
   repeat
-    if SocketReadFully(AFd, 1, ATimeoutMs, C) = 0 then
+    if ACh.ReadSome(C, 1) <= 0 then
       Exit(False);
     if C = #10 then
       Exit(True);
@@ -465,24 +583,42 @@ begin
     Result := StrToIntDef(string(Digits), 0);
 end;
 
-/// negotiate an HTTP CONNECT tunnel to AHost:APort over an already-connected
-/// AFd.  Raises EHttpConnectionError unless the proxy answers a 2xx status; a
-/// non-2xx or a truncated response is a connection failure, not a fallback.
-procedure EstablishProxyTunnelFd(AFd: Integer; const AHost: string;
-  const APort: Word; const ATimeoutMs: Integer);
-var
-  Req, Line: AnsiString;
-  Code: Integer;
+function ConnectAuthority(const AHost: string; const APort: Word): AnsiString;
 begin
-  Req := 'CONNECT ' + AnsiString(AHost) + ':' + AnsiString(IntToStr(APort)) +
-    ' HTTP/1.1'#13#10'Host: ' + AnsiString(AHost) + ':' +
-    AnsiString(IntToStr(APort)) + #13#10#13#10;
-  SocketWriteFully(AFd, Length(Req), ATimeoutMs, Req[1]);
+  // an IPv6 literal is bracketed in a request target (RFC 3986)
+  if (Pos(':', AHost) > 0) and (Copy(AHost, 1, 1) <> '[') then
+    Result := '[' + AnsiString(AHost) + ']'
+  else
+    Result := AnsiString(AHost);
+  Result := Result + ':' + AnsiString(IntToStr(APort));
+end;
+
+/// negotiate an HTTP CONNECT tunnel to AHost:APort over ACh.  Sends
+/// Proxy-Authorization: Basic when AUserName is not empty.  Raises
+/// EHttpConnectionError unless the proxy answers a 2xx status; a non-2xx or a
+/// truncated response is a connection failure, not a fallback.  Credentials
+/// never appear in a message.
+procedure EstablishConnectTunnel(const ACh: ISocksChannel; const AHost: string;
+  const APort: Word; const AUserName, APassword: string);
+var
+  Req, Line, Auth: AnsiString;
+  Code: Integer;
+  Bytes: TBytes;
+begin
+  Auth := ConnectAuthority(AHost, APort);
+  Req := 'CONNECT ' + Auth + ' HTTP/1.1'#13#10'Host: ' + Auth + #13#10;
+  if AUserName <> '' then
+    Req := Req + 'Proxy-Authorization: Basic ' +
+      AnsiString(ProxyBasicCredentials(AUserName, APassword)) + #13#10;
+  Req := Req + #13#10;
+  SetLength(Bytes, Length(Req));
+  Move(Req[1], Bytes[0], Length(Req));
+  ACh.WriteAll(Bytes);
   // skip any informational (1xx) response and any blank separators, then
   // require a 2xx; a blank line must not be treated as a status
   Code := 100;
   repeat
-    if not ProxyReadLine(AFd, ATimeoutMs, Line) then
+    if not ProxyReadLineCh(ACh, Line) then
       raise EHttpConnectionError.Create(
         'proxy closed the connection during CONNECT');
     if Line = '' then
@@ -494,9 +630,28 @@ begin
       [string(Line)]);
   // drain the response headers up to the blank line
   repeat
-    if not ProxyReadLine(AFd, ATimeoutMs, Line) then
+    if not ProxyReadLineCh(ACh, Line) then
       Break;
   until Line = '';
+end;
+
+procedure EstablishProxyTunnelFd(AFd: Integer; const AHost: string;
+  const APort: Word; const ATimeoutMs: Integer;
+  const AUserName: string; const APassword: string);
+begin
+  EstablishConnectTunnel(TFdChannel.Create(AFd, ATimeoutMs), AHost, APort,
+    AUserName, APassword);
+end;
+
+/// run the tunnel exchange the proxy kind calls for over ACh
+procedure EstablishTunnelOver(const ACh: ISocksChannel; const AProxy: IProxy;
+  const AHost: string; const APort: Word);
+begin
+  if AProxy.Kind = pkSocks5 then
+    EstablishSocksTunnel(ACh, AProxy, AHost, APort)
+  else
+    EstablishConnectTunnel(ACh, AHost, APort, AProxy.UserName,
+      AProxy.Password);
 end;
 
 { TPlainSocket }
@@ -544,7 +699,7 @@ begin
 {$ENDIF}
   if AProxyHost <> '' then
     try
-      EstablishProxyTunnelFd(FHandle, AHost, APort, AConnectTimeoutMs);
+      EstablishProxyTunnelFd(FHandle, AHost, APort, AConnectTimeoutMs, '', '');
     except
       Close;
       raise;
@@ -575,6 +730,29 @@ begin
   if not FConnected then
     raise EHttpConnectionClosed.Create('socket is closed');
   Result := SocketReadFully(FHandle, ACount, FReadTimeoutMs, ABuffer);
+end;
+
+function TPlainSocket.ReadSome(var ABuffer; ACount: Integer): Integer;
+var
+  n: ssize_t;
+begin
+  if not FConnected then
+    raise EHttpConnectionClosed.Create('socket is closed');
+  if ACount <= 0 then
+    Exit(0);
+  SetSocketTimeout(FHandle, SOL_SOCKET, SO_RCVTIMEO, FReadTimeoutMs);
+  while True do
+  begin
+    n := fpRecv(FHandle, @ABuffer, ACount, 0);
+    if n >= 0 then
+      Exit(n);
+    if SocketTimedOut then
+      raise EHttpTimeout.CreateFmt('read timed out after %d ms',
+        [FReadTimeoutMs])
+    else if fpGetErrno <> ESysEINTR then
+      raise EHttpConnectionClosed.CreateFmt('socket read failed (errno %d)',
+        [fpGetErrno]);
+  end;
 end;
 
 function TPlainSocket.Write(const ABuffer; ACount: Integer): Integer;
@@ -617,6 +795,74 @@ end;
 procedure TPlainSocket.SetWriteTimeoutMs(const AValue: Integer);
 begin
   FWriteTimeoutMs := AValue;
+end;
+
+{ routed dialing }
+
+/// connect AHost:APort through AProxy (nil = direct).  The result is the
+/// socket the origin protocol runs on: after a CONNECT or SOCKS5 tunnel it is
+/// a transparent byte stream to the origin.  AStream is True when that socket
+/// is not a plain TCP socket (an https proxy), so a TLS layer above must run
+/// in memory-BIO mode.
+function DialRoutedTransport(const AHost: string; const APort: Word;
+  const AConnectTimeoutMs: Integer; const AProxy: IProxy;
+  const AInsecure: Boolean; const ACACertFile: string;
+  out AStream: Boolean): IHttp2Socket;
+var
+  Plain: TPlainSocket;
+  Leg: TTlsSocket;
+  Who: string;
+begin
+  AStream := False;
+  if AProxy = nil then
+  begin
+    Result := TPlainSocket.Create(AHost, APort, AConnectTimeoutMs);
+    Exit;
+  end;
+  ValidateProxy(AProxy);
+  Who := Format('%s:%d', [AProxy.Host, AProxy.Port]);
+  // plain TCP to the proxy first: no tunnel is requested by the constructor
+  Plain := TPlainSocket.Create(AProxy.Host, AProxy.Port, AConnectTimeoutMs);
+  Result := Plain;
+  Plain.SetReadTimeoutMs(AConnectTimeoutMs);
+  Plain.SetWriteTimeoutMs(AConnectTimeoutMs);
+  try
+    if AProxy.Kind = pkHttps then
+    begin
+      // TLS to the proxy, verified against the proxy's host name; no ALPN, the
+      // CONNECT exchange is HTTP/1.1
+      Leg := TTlsSocket.Create(Plain, AProxy.Host, AInsecure, ACACertFile);
+      Leg.FAlpnOffer := nil;
+      Leg.FRequireH2 := False;
+      Leg.ConnectTimeoutMs := AConnectTimeoutMs;
+      Leg.ReadTimeoutMs := AConnectTimeoutMs;
+      Leg.WriteTimeoutMs := AConnectTimeoutMs;
+      try
+        Leg.Establish;
+      except
+        on E: EHttpConnectionError do
+        begin
+          Leg.Free;
+          raise EHttpConnectionError.CreateFmt(
+            'TLS to proxy %s failed: %s', [Who, E.Message]);
+        end;
+        on E: Exception do
+        begin
+          Leg.Free;
+          raise;
+        end;
+      end;
+      Result := Leg;
+      AStream := True;
+      EstablishTunnelOver(TSocketChannel.Create(Leg), AProxy, AHost, APort);
+    end
+    else
+      EstablishTunnelOver(TFdChannel.Create(Plain.Handle, AConnectTimeoutMs),
+        AProxy, AHost, APort);
+  except
+    Result.Close;
+    raise;
+  end;
 end;
 
 { TTlsSocket }
@@ -799,15 +1045,34 @@ begin
         raise EHttpConnectionError.Create('SSL_set1_host failed');
     if ApplySniHost(FSsl, FHost) <> 1 then
       raise EHttpConnectionError.Create('SSL_set_tlsext_host_name failed');
-    if BindSocket(FSsl, GetSocketFd) <> 1 then
-      raise EHttpConnectionError.Create('SSL_set_fd failed');
-    // SSL_connect recv()s/send()s directly on the fd, so install the deadline
-    // there as well: a stalled handshake must not block forever
-    SetSocketTimeout(GetSocketFd, SOL_SOCKET, SO_RCVTIMEO, FConnectTimeoutMs);
-    SetSocketTimeout(GetSocketFd, SOL_SOCKET, SO_SNDTIMEO, FConnectTimeoutMs);
-    r := HandshakeConnect(FSsl);
+    if FStreamMode then
+    begin
+      // the transport is another byte stream: OpenSSL gets two memory BIOs
+      // (SSL_set_bio takes ownership of both) and StreamHandshake moves the
+      // bytes; deadlines are the transport's own
+      FRbio := BIO_new(BIO_s_mem());
+      FWbio := BIO_new(BIO_s_mem());
+      if (FRbio = nil) or (FWbio = nil) then
+        raise EHttpConnectionError.Create('BIO_new failed');
+      SSL_set_bio(FSsl, FRbio, FWbio);
+      FTransport.ReadTimeoutMs := FConnectTimeoutMs;
+      FTransport.WriteTimeoutMs := FConnectTimeoutMs;
+      r := StreamHandshake(FSsl);
+      FTransport.ReadTimeoutMs := FReadTimeoutMs;
+      FTransport.WriteTimeoutMs := FWriteTimeoutMs;
+    end
+    else
+    begin
+      if BindSocket(FSsl, GetSocketFd) <> 1 then
+        raise EHttpConnectionError.Create('SSL_set_fd failed');
+      // SSL_connect recv()s/send()s directly on the fd, so install the
+      // deadline there as well: a stalled handshake must not block forever
+      SetSocketTimeout(GetSocketFd, SOL_SOCKET, SO_RCVTIMEO, FConnectTimeoutMs);
+      SetSocketTimeout(GetSocketFd, SOL_SOCKET, SO_SNDTIMEO, FConnectTimeoutMs);
+      r := HandshakeConnect(FSsl);
+    end;
     if r <> 1 then
-      if SocketTimedOut then
+      if (not FStreamMode) and SocketTimedOut then
         raise EHttpTimeout.CreateFmt('TLS handshake timed out after %d ms',
           [FConnectTimeoutMs])
       else
@@ -823,6 +1088,8 @@ begin
     FHandshaked := True;
   except
     DestroySslHandle;
+    FRbio := nil;
+    FWbio := nil;
     DestroySslContext;
     raise;
   end;
@@ -890,6 +1157,69 @@ begin
   Result := Sock;
 end;
 
+class function TTlsSocket.DialVia(const AHost: string; const APort: Word;
+  const AInsecure: Boolean; const AConnectTimeoutMs: Integer;
+  const ACACertFile: string; const AProxy: IProxy): IHttp2Socket;
+var
+  Transport: IHttp2Socket;
+  Stream: Boolean;
+  Sock: TTlsSocket;
+begin
+  Transport := DialRoutedTransport(AHost, APort, AConnectTimeoutMs, AProxy,
+    AInsecure, ACACertFile, Stream);
+  Sock := TTlsSocket.Create(Transport, AHost, AInsecure, ACACertFile);
+  Sock.FStreamMode := Stream;
+  Sock.ConnectTimeoutMs := AConnectTimeoutMs;
+  Sock.ReadTimeoutMs := AConnectTimeoutMs;
+  try
+    Sock.Establish;
+  except
+    Sock.Free;
+    raise;
+  end;
+  Result := Sock;
+end;
+
+class function TTlsSocket.DialWithAlpnVia(const AHost: string;
+  const APort: Word; const AAlpnOffer: TBytes; const AInsecure: Boolean;
+  const AConnectTimeoutMs: Integer; const ACACertFile: string;
+  const AProxy: IProxy): IHttp2Socket;
+var
+  Transport: IHttp2Socket;
+  Stream: Boolean;
+  Sock: TTlsSocket;
+begin
+  Transport := DialRoutedTransport(AHost, APort, AConnectTimeoutMs, AProxy,
+    AInsecure, ACACertFile, Stream);
+  Sock := TTlsSocket.Create(Transport, AHost, AInsecure, ACACertFile);
+  Sock.FStreamMode := Stream;
+  Sock.ConnectTimeoutMs := AConnectTimeoutMs;
+  Sock.ReadTimeoutMs := AConnectTimeoutMs;
+  // the caller supplies the offer and applies its own ALPN policy afterwards
+  Sock.FAlpnOffer := AAlpnOffer;
+  Sock.FRequireH2 := False;
+  try
+    Sock.Establish;
+  except
+    Sock.Free;
+    raise;
+  end;
+  Result := Sock;
+end;
+
+class function TTlsSocket.DialCleartextVia(const AHost: string;
+  const APort: Word; const AConnectTimeoutMs: Integer; const AProxy: IProxy;
+  const AInsecure: Boolean; const ACACertFile: string): IHttp2Socket;
+var
+  Stream: Boolean;
+begin
+  Result := DialRoutedTransport(AHost, APort, AConnectTimeoutMs, AProxy,
+    AInsecure, ACACertFile, Stream);
+  Result.ConnectTimeoutMs := AConnectTimeoutMs;
+  Result.ReadTimeoutMs := AConnectTimeoutMs;
+  Result.WriteTimeoutMs := AConnectTimeoutMs;
+end;
+
 function TTlsSocket.Read(var ABuffer; ACount: Integer): Integer;
 var
   n, err: Integer;
@@ -901,7 +1231,8 @@ begin
     Exit(0);
   // SSL_read ultimately recv()s on the underlying fd, so the read deadline
   // must be installed there for a stalled peer to surface as EHttpTimeout
-  SetSocketTimeout(GetSocketFd, SOL_SOCKET, SO_RCVTIMEO, FReadTimeoutMs);
+  if not FStreamMode then
+    SetSocketTimeout(GetSocketFd, SOL_SOCKET, SO_RCVTIMEO, FReadTimeoutMs);
   base := PByte(@ABuffer);
   Result := 0;
   while Result < ACount do
@@ -912,10 +1243,18 @@ begin
     else
     begin
       err := LastSslError(FSsl, n);
-      if (err = SSL_ERROR_ZERO_RETURN) or
-         ((err = SSL_ERROR_SYSCALL) and (n = 0)) then
+      if FStreamMode and (err = SSL_ERROR_WANT_READ) then
+      begin
+        BioFlush;
+        BioFeed;            // at EOF the next SSL_read reports the close
+      end
+      else if FStreamMode and (err = SSL_ERROR_WANT_WRITE) then
+        BioFlush
+      else if (err = SSL_ERROR_ZERO_RETURN) or
+         ((err = SSL_ERROR_SYSCALL) and (n = 0)) or
+         (FStreamMode and FEofFed and (err = SSL_ERROR_SSL)) then
         Exit // clean close_notify, or peer closed the transport without one
-      else if SocketTimedOut then
+      else if (not FStreamMode) and SocketTimedOut then
         raise EHttpTimeout.CreateFmt('TLS read timed out after %d ms',
           [FReadTimeoutMs])
       else
@@ -934,18 +1273,30 @@ begin
     raise EHttpConnectionError.Create('TLS handshake not completed');
   if ACount <= 0 then
     Exit(0);
-  SetSocketTimeout(GetSocketFd, SOL_SOCKET, SO_SNDTIMEO, FWriteTimeoutMs);
+  if not FStreamMode then
+    SetSocketTimeout(GetSocketFd, SOL_SOCKET, SO_SNDTIMEO, FWriteTimeoutMs);
   base := PByte(@ABuffer);
   Result := 0;
   while Result < ACount do
   begin
     n := SslWriteBytes(FSsl, base + Result, ACount - Result);
     if n > 0 then
-      Inc(Result, n)
+    begin
+      Inc(Result, n);
+      if FStreamMode then
+        BioFlush;
+    end
     else
     begin
       err := LastSslError(FSsl, n);
-      if SocketTimedOut then
+      if FStreamMode and (err = SSL_ERROR_WANT_READ) then
+      begin
+        BioFlush;
+        BioFeed;
+      end
+      else if FStreamMode and (err = SSL_ERROR_WANT_WRITE) then
+        BioFlush
+      else if (not FStreamMode) and SocketTimedOut then
         raise EHttpTimeout.CreateFmt('TLS write timed out after %d ms',
           [FWriteTimeoutMs])
       else
@@ -955,11 +1306,115 @@ begin
   end;
 end;
 
+function TTlsSocket.ReadSome(var ABuffer; ACount: Integer): Integer;
+var
+  n, err: Integer;
+begin
+  if not FHandshaked then
+    raise EHttpConnectionError.Create('TLS handshake not completed');
+  if ACount <= 0 then
+    Exit(0);
+  if not FStreamMode then
+    SetSocketTimeout(GetSocketFd, SOL_SOCKET, SO_RCVTIMEO, FReadTimeoutMs);
+  while True do
+  begin
+    n := SslReadBytes(FSsl, @ABuffer, ACount);
+    if n > 0 then
+      Exit(n);
+    err := LastSslError(FSsl, n);
+    if FStreamMode and (err = SSL_ERROR_WANT_READ) then
+    begin
+      BioFlush;
+      BioFeed;
+    end
+    else if FStreamMode and (err = SSL_ERROR_WANT_WRITE) then
+      BioFlush
+    else if (err = SSL_ERROR_ZERO_RETURN) or
+       ((err = SSL_ERROR_SYSCALL) and (n = 0)) or
+       (FStreamMode and FEofFed and (err = SSL_ERROR_SSL)) then
+      Exit(0)
+    else if (not FStreamMode) and SocketTimedOut then
+      raise EHttpTimeout.CreateFmt('TLS read timed out after %d ms',
+        [FReadTimeoutMs])
+    else
+      raise EHttpConnectionClosed.CreateFmt(
+        'TLS read failed (SSL_get_error=%d)', [err]);
+  end;
+end;
+
+{ memory-BIO plumbing for a TLS layer carried over another byte stream }
+
+procedure TTlsSocket.BioFlush;
+var
+  Buf: array[0..16383] of Byte;
+  N: Integer;
+begin
+  if FWbio = nil then
+    Exit;
+  while BIO_ctrl(FWbio, _BIO_CTRL_PENDING, 0, nil) > 0 do
+  begin
+    N := BIO_read(FWbio, @Buf[0], SizeOf(Buf));
+    if N <= 0 then
+      Break;
+    FTransport.Write(Buf[0], N);
+  end;
+end;
+
+function TTlsSocket.BioFeed: Boolean;
+var
+  Buf: array[0..16383] of Byte;
+  N: Integer;
+  PR: IPartialReader;
+begin
+  if Supports(FTransport, IPartialReader, PR) then
+    N := PR.ReadSome(Buf[0], SizeOf(Buf))
+  else
+    N := FTransport.Read(Buf[0], 1);
+  if N <= 0 then
+  begin
+    // an empty read BIO now reports end of stream instead of "try again"
+    BIO_ctrl(FRbio, BIO_C_SET_BUF_MEM_EOF_RETURN, 0, nil);
+    FEofFed := True;
+    Exit(False);
+  end;
+  if BIO_write(FRbio, @Buf[0], N) <> N then
+    raise EHttpConnectionError.Create('BIO_write failed');
+  Result := True;
+end;
+
+function TTlsSocket.StreamHandshake(const ASsl: PSSL): Integer;
+var
+  r, err: Integer;
+begin
+  repeat
+    r := HandshakeConnect(ASsl);
+    BioFlush;
+    if r = 1 then
+      Exit(1);
+    err := LastSslError(ASsl, r);
+    if err = SSL_ERROR_WANT_READ then
+    begin
+      if not BioFeed then
+        Exit(r);            // the proxy closed during the handshake
+    end
+    else if err <> SSL_ERROR_WANT_WRITE then
+      Exit(r);
+  until False;
+end;
+
 procedure TTlsSocket.Close;
 begin
   if FSsl <> nil then
     SslShutdown(FSsl);
+  if FStreamMode and FHandshaked then
+    try
+      BioFlush;             // deliver close_notify through the tunnel
+    except
+      // the transport may already be gone
+    end;
   DestroySslHandle;
+  FRbio := nil;
+  FWbio := nil;
   DestroySslContext;
   FHandshaked := False;
   if FTransport <> nil then
@@ -1023,6 +1478,22 @@ function TProtocolSocketFactory.DialProtocol(const AHost: string;
   const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
   out AProtocol: TNegotiatedProtocol): IHttp2Socket;
 var
+  Proxy: IProxy;
+begin
+  // the proxy given to the constructor is a fixed HTTP proxy for every dial
+  Proxy := nil;
+  if FProxyHost <> '' then
+    Proxy := TProxy.Create(FProxyHost, FProxyPort);
+  Result := DialProtocolVia(AHost, APort, AScheme, AHttp1Fallback, APolicy,
+    ATimeoutMs, Proxy, AProtocol);
+end;
+
+function TProtocolSocketFactory.DialProtocolVia(const AHost: string;
+  const APort: Word; const AScheme: string; const AHttp1Fallback: Boolean;
+  const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
+  const AProxy: IProxy;
+  out AProtocol: TNegotiatedProtocol): IHttp2Socket;
+var
   Sock: IHttp2Socket;
   Name: string;
 begin
@@ -1040,15 +1511,15 @@ begin
         // until then the caller drives HTTP/1.1 directly on this transport
         begin
           AProtocol := npHttp1Cleartext;
-          Result := TTlsSocket.DialCleartext(AHost, APort, ATimeoutMs, FProxyHost,
-            FProxyPort);
+          Result := TTlsSocket.DialCleartextVia(AHost, APort, ATimeoutMs, AProxy,
+            FInsecure, FCACertFile);
         end;
     else
       // ctPriorKnowledge: speak HTTP/2 at once, the caller writes the preface
       begin
         AProtocol := npHttp2Cleartext;
-        Result := TTlsSocket.DialCleartext(AHost, APort, ATimeoutMs, FProxyHost,
-          FProxyPort);
+        Result := TTlsSocket.DialCleartextVia(AHost, APort, ATimeoutMs, AProxy,
+          FInsecure, FCACertFile);
       end;
     end;
     Exit;
@@ -1056,8 +1527,8 @@ begin
 
   // https: the ALPN offer follows the fallback flag, then the result maps to a
   // codec.  DialWithAlpn skips the strict check so we can map the name here.
-  Sock := TTlsSocket.DialWithAlpn(AHost, APort, AlpnOfferFor(AHttp1Fallback),
-    FInsecure, ATimeoutMs, FCACertFile, FProxyHost, FProxyPort);
+  Sock := TTlsSocket.DialWithAlpnVia(AHost, APort, AlpnOfferFor(AHttp1Fallback),
+    FInsecure, ATimeoutMs, FCACertFile, AProxy);
   // $interfaces com: an interface reference points past the object's VMT, so
   // `TTlsSocket(Sock)` (a raw hard cast) would read the wrong memory.  Recover
   // the object with `as TObject` before the class cast so the property read

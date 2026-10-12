@@ -22,7 +22,7 @@
         </SyntaxOptions>
       </Parsing>
     </CompilerOptions>
-    <Files Count="15">
+    <Files Count="18">
       <Item1>
         <Filename Value="src/Http2.pas"/>
         <UnitName Value="Http2"/>
@@ -87,6 +87,14 @@
         <Filename Value="src/Http2.Sse.pas"/>
         <UnitName Value="Http2.Sse"/>
       </Item16>
+      <Item17>
+        <Filename Value="src/Http2.Proxy.pas"/>
+        <UnitName Value="Http2.Proxy"/>
+      </Item17>
+      <Item18>
+        <Filename Value="src/Http2.Socks.pas"/>
+        <UnitName Value="Http2.Socks"/>
+      </Item18>
     </Files>
     <RequiredPkgs Count="1">
       <Item1>

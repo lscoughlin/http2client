@@ -14,6 +14,7 @@ related:
   - "[[protocol]]"
   - "[[transport]]"
   - "[[fallback]]"
+  - "[[proxy]]"
   - "[[errors-redirects]]"
 updated: 2026-10-09
 ---
@@ -39,7 +40,9 @@ Recorded in the owning note; listed here only as a lookup index.
 | Decision | Owning note |
 | --- | --- |
 | `MaxStreamsPerConnection` default and peer `SETTINGS_MAX_CONCURRENT_STREAMS` of `0` | [[client-api]] |
-| Proxy: `CONNECT` tunnel only, no forwarding; `:authority`/`:scheme` unchanged | [[transport]] |
+| Proxy: `CONNECT` tunnel only, no forwarding; `:authority`/`:scheme` unchanged | [[transport]], [[proxy]] |
+| Proxy: no forwarding mode; `socks5` / `socks5h` (RFC 1928, 1929) and `https://` proxies are supported, SOCKS4 is not | [[proxy]] |
+| Proxy route is chosen per request; selector > `WithProxy` > `WithAllProxy` > environment (`http_proxy`/`https_proxy`, then `all_proxy`); loopback always connects directly | [[proxy]] |
 | HTTP/1.1 fallback implemented, off by default (`WithHttp1Fallback`) | [[fallback]] |
 | Transparent retry: idempotent (no body writer) + `ecRefusedStream`/GOAWAY only | [[transport]] |
 | `ftPriority` is parsed but never sent | [[protocol]] |

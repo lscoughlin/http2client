@@ -138,6 +138,11 @@ tasks:
     cmds:
       - bash tools/validate/sse-live.sh
 
+  validate:proxy:
+    desc: 'Live proxy gate — HTTP CONNECT, https and SOCKS5 proxies via tools/validate/proxy_servers.py'
+    cmds:
+      - bash tools/validate/proxy-live.sh
+
   validate:harness:
     desc: 'S12 gate B — 146-id h2-client-test-harness sweep (~30 min, Docker)'
     deps:

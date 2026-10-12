@@ -13,6 +13,7 @@ related:
   - "[[architecture]]"
   - "[[fpc-runtime]]"
   - "[[fallback]]"
+  - "[[proxy]]"
   - "[[open-questions]]"
 updated: 2026-10-08
 ---
@@ -201,7 +202,9 @@ idempotent methods (no body writer), and only on `ecRefusedStream` or a
   them. The default stays strict. See [[fallback]].
 - Certificate validation/trust configuration is a factory concern (hostname
   verification on by default).
-- Proxy: with `WithProxy`, negotiate TLS/`h2` over a caller-supplied
+- Proxy: when a request is routed through a proxy (`WithProxy`, the proxy
+  environment variables or an `IProxySelector`; see [[proxy]], including the
+  SOCKS5 variant), negotiate TLS/`h2` over a caller-supplied
   forward proxy via an HTTP `CONNECT` tunnel to the origin. The TCP
   connection goes to the proxy; the `CONNECT` is negotiated on the plain
   socket before TLS, so SNI, certificate verification and ALPN still target

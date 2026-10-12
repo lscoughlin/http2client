@@ -6,6 +6,7 @@
 #   make test     build + run the fpcunit suite
 #   make examples compile the example programs into bin/
 #   make validate-sse  opt-in live SSE case against tools/validate/sse_server.py
+#   make validate-proxy  opt-in live proxy gate against tools/validate/proxy_servers.py
 #   make clean    remove build outputs
 
 FPC        ?= fpc
@@ -23,7 +24,7 @@ TESTSRC    = $(wildcard test/*.pas)
 EXAMPLESRC = $(wildcard examples/*.pas)
 BIN        = bin
 
-.PHONY: all test examples clean validate-interop validate-harness validate-sse validate
+.PHONY: all test examples clean validate-interop validate-harness validate-sse validate-proxy validate
 
 all: $(BIN)/libhttp2.a
 
@@ -59,5 +60,12 @@ validate-harness:
 # this target is the only way it executes.
 validate-sse: all | $(BIN)
 	bash tools/validate/sse-live.sh
+
+# Opt-in live proxy gate: tools/validate/proxy-live.sh starts reference
+# origins plus HTTP CONNECT, https and SOCKS5 proxies on loopback, runs
+# TProxyLiveTest through the real client, and checks the servers' logs for the
+# route each request took.
+validate-proxy: all | $(BIN)
+	bash tools/validate/proxy-live.sh
 
 validate: validate-interop validate-harness

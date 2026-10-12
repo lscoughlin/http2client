@@ -285,6 +285,7 @@ function TBufferedReader.Fill: Boolean;
 var
   N: Integer;
   Tmp: TBytes;
+  PR: IPartialReader;
 begin
   // compact the consumed prefix so the buffer does not grow without bound
   if FPos > 0 then
@@ -295,7 +296,13 @@ begin
     FPos := 0;
   end;
   SetLength(Tmp, cHttp1ReadBufferSize);
-  N := FSocket.Read(Tmp[0], cHttp1ReadBufferSize);
+  // IHttp2Socket.Read insists on the full count (or EOF), which would stall a
+  // keep-alive connection until the server closes it.  A socket that can
+  // return what is available says so with IPartialReader.
+  if Supports(FSocket, IPartialReader, PR) then
+    N := PR.ReadSome(Tmp[0], cHttp1ReadBufferSize)
+  else
+    N := FSocket.Read(Tmp[0], cHttp1ReadBufferSize);
   if N <= 0 then
     Exit(False);
   if FEnd + N > Length(FBuf) then

@@ -91,7 +91,7 @@ task test
 ```
 
 The `test` task compiles the library and the unit suite. Then it runs the
-suite. The suite has 409 tests (the SSE live case skips unless
+suite. The suite has 550 tests (the SSE live case skips unless
 `SSE_TEST_URL` is set; run it with `task validate:sse`).
 
 The suite uses `fpcunit` and a mock socket. It needs no network and no server.
@@ -100,7 +100,7 @@ Every test must pass. The task returns a non-zero exit code when a test fails.
 
 ## Validate
 
-The validation suite has four levels, plus an opt-in live gate. Each level
+The validation suite has four levels, plus two opt-in live gates. Each level
 has its own task.
 
 | Task | What it checks | Time |
@@ -110,6 +110,7 @@ has its own task.
 | `task validate:interop` | A real TLS peer, `nghttpd`. Cases A.1 to A.13. | About 1 minute |
 | `task validate:harness` | The RFC conformance harness. 146 case ids. | About 30 minutes |
 | `task validate:sse` | The opt-in live SSE case against `tools/validate/sse_server.py`. | Seconds |
+| `task validate:proxy` | The opt-in live proxy case: HTTP `CONNECT`, https and SOCKS5 proxies from `tools/validate/proxy_servers.py`, with and without credentials, HTTP/2 through each proxy kind when `nghttpd` is installed, plus a check of the proxy logs. | Seconds |
 
 Run the full suite with one command:
 
@@ -256,6 +257,41 @@ Client := THttpClientFactory.Create
 `TClearTextPolicy` lives in `Http2.Tls`. You must name that unit in your
 `uses` clause to write the value `ctPriorKnowledge` or `ctUpgrade`.
 
+A client reaches each origin directly or through an HTTP proxy, chosen per
+request:
+
+```pascal
+// Read http_proxy, https_proxy and no_proxy when the client is built.
+Client := THttpClientFactory.Create
+  .WithProxyEnvironmentVars
+  .WithNoProxy('.internal.example')
+  .Build;
+
+// One proxy URL for every scheme (the manual form of all_proxy).
+Client := THttpClientFactory.Create
+  .WithAllProxy('socks5://user:pw@127.0.0.1:1080')
+  .Build;
+
+// A fixed proxy.
+Client := THttpClientFactory.Create
+  .WithProxy('proxy.corp', 3128)
+  .Build;
+
+// A SOCKS5 proxy; the proxy resolves host names.
+Client := THttpClientFactory.Create
+  .WithProxyEnvironmentVars   // e.g. https_proxy=socks5://user:pw@127.0.0.1:1080
+  .Build;
+
+// A selector returns a proxy per URI, or nil for a direct connection.
+Client := THttpClientFactory.Create
+  .WithProxySelector(MySelector)   // MySelector implements IProxySelector
+  .Build;
+```
+
+A selector overrides `WithProxy`, which overrides `WithAllProxy`, which overrides the environment. The
+environment is read only when `WithProxyEnvironmentVars` is on. Proxies are
+reached with a `CONNECT` tunnel, over TLS for an `https://` proxy value, or a SOCKS5 `CONNECT` for `socks5://`; see `doc/design/proxy.md`.
+
 For a test against a private certificate, use `WithCACertFile`.
 For a self-signed certificate, use `WithInsecureTls`.
 
@@ -298,7 +334,7 @@ descendant (arrays, numbers, strings). A body that does not parse raises
 
 ## Examples
 
-The `examples/` directory has six small programs. Build them all with:
+The `examples/` directory has seven small programs. Build them all with:
 
 ```sh
 make examples      # or: task examples
@@ -315,6 +351,7 @@ bin/json_request   https://nghttp2.org/httpbin/post
 bin/xml_request    https://nghttp2.org/httpbin/xml
 bin/threaded_get   https://nghttp2.org/ 8 25
 bin/sse_stream     http://127.0.0.1:8091/events   # tools/validate/sse_server.py
+https_proxy=http://proxy.corp:3128 bin/proxy_env https://nghttp2.org/
 ```
 
 | Program | Shows |
@@ -325,13 +362,14 @@ bin/sse_stream     http://127.0.0.1:8091/events   # tools/validate/sse_server.py
 | `xml_request.pas` | `WithXmlBody` + `ReadXmlDocument` (`TXMLDocument`). |
 | `threaded_get.pas` | Many threads sharing one client and its pool. |
 | `sse_stream.pas` | `SseRequest` + `TSseReconnectLoop` over an event stream. |
+| `proxy_env.pas` | A GET routed by the proxy environment variables. |
 
 ## Project layout
 
 | Path | Content |
 |---|---|
 | `src/` | The library units. |
-| `examples/` | Six small, runnable programs. See [Examples](#examples). |
+| `examples/` | Seven small, runnable programs. See [Examples](#examples). |
 | `test/` | The unit suite, the mock socket, and the `h2probe` CLI. |
 | `tools/validate/` | The interop, sanity, and harness scripts. |
 | `bin/` | The build output. |
@@ -344,6 +382,8 @@ bin/sse_stream     http://127.0.0.1:8091/events   # tools/validate/sse_server.py
 
 - `doc/http2client.md` gives the document map.
 - `doc/design/client-api.md` gives the full factory surface.
+- `doc/design/proxy.md` gives the proxy routing: environment variables,
+  the no-proxy list, and `IProxySelector`.
 - `doc/design/messages.md` gives the request and response types.
 - `doc/design/server-sent-events.md` gives the SSE parser, source, and
   reconnect/resume loop.
@@ -369,6 +409,12 @@ and to the raw sweep log at `[[harness-log]]`.
   read timeout and a blocked read cannot be cancelled. See
   `doc/design/server-sent-events.md`.
 
+- Proxies are reached by `CONNECT` tunnel only. An `http_proxy` for an
+  `http://` origin tunnels instead of forwarding, and many proxies refuse
+  `CONNECT` to ports other than 443; a `socks5://` proxy has no such
+  restriction. SOCKS4 and SOCKS5 `BIND` / `UDP ASSOCIATE` are not
+  implemented. See `doc/design/proxy.md`.
+
 ## License
 
 This product is licensed under the Apache License, Version 2.0.
@@ -376,5 +422,9 @@ See the `LICENSE` file for the full text.
 
 Copyright 2026 Liam Seamus Coughlin.
 
-The library uses mORMot2 for TLS and ALPN. mORMot2 keeps its own license.
+The library uses mORMot2 for TLS and ALPN. The proxy-routing code is
+self-contained but follows mORMot2's designs for URL parsing (`TUri`), CIDR
+matching (`TIp4SubNet`), loopback detection and the `CONNECT` exchange; see
+`doc/design/proxy.md`, section "mORMot2 as a reference". mORMot2 keeps its own
+license.
 See the `NOTICE` file for the full list of third-party components.

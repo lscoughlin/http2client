@@ -65,6 +65,9 @@ type
   EHttpTooManySseRetries = class(EHttpError);
   /// a non-replayable body cannot be re-sent on a 307/308 redirect
   EHttpNotReplayable = class(EHttpError);
+  /// a proxy value, selector result or SOCKS5 credential is unusable
+  /// (doc/design/proxy.md "Errors"); never carries a password in its message
+  EHttpProxyConfigError = class(EHttpError);
 
 /// stable, human-readable name for a wire error code
 function Http2ErrorCodeName(const ACode: THttp2ErrorCode): string;

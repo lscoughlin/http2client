@@ -144,7 +144,10 @@ this scope:
 - Body: `Content-Length` or `Transfer-Encoding: chunked`.
 - Response: status line, headers, and body. The body uses
   `Content-Length`, chunked coding, or connection close.
-- Connection reuse: `keep-alive` is the default in HTTP/1.1.
+- Connection reuse: `keep-alive` is the default in HTTP/1.1. The codec takes
+  the bytes that have arrived rather than waiting for a full read buffer, so
+  a response on a connection the server keeps open is delivered at once. A
+  transport signals this through `IPartialReader`.
 - The codec does not do request pipelining.
 
 HTTP/1.1 has no multiplexing. One connection carries one request at a time.
