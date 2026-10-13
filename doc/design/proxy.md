@@ -10,14 +10,14 @@ tags:
   - api
   - transport
 status: done
-up: "[[http2client]]"
+up: "[http2client](../http2client.md)"
 related:
-  - "[[client-api]]"
-  - "[[transport]]"
-  - "[[fallback]]"
-  - "[[errors-redirects]]"
-  - "[[open-questions]]"
-  - "[[toolchain]]"
+  - "[client-api](client-api.md)"
+  - "[transport](transport.md)"
+  - "[fallback](fallback.md)"
+  - "[errors-redirects](errors-redirects.md)"
+  - "[open-questions](open-questions.md)"
+  - "[toolchain](../verification/toolchain.md)"
 updated: 2026-10-13
 ---
 
@@ -28,7 +28,7 @@ note describes how the route for each request is chosen: a fixed proxy, the
 `http_proxy` / `https_proxy` / `no_proxy` environment variables, a manual
 bypass list, or a caller-supplied selector. The tunnel mechanics themselves
 (`CONNECT`, the SOCKS5 handshake, TLS and ALPN inside the tunnel) are
-described in [[transport]]. SOCKS5 follows RFC 1928, with username/password
+described in [transport](transport.md). SOCKS5 follows RFC 1928, with username/password
 authentication from RFC 1929; the proxy URL conventions follow Go's
 `net/http` and `golang.org/x/net/proxy`.
 
@@ -337,7 +337,7 @@ once, so an implementation is invoked concurrently. An exception raised by the s
 propagates unchanged out of `Send`. A returned `IProxy` with an empty host or
 a zero port raises `EHttpProxyConfigError`.
 
-A WebSocket ([[websocket]]) is routed by the same selector. It is called once
+A WebSocket ([websocket](websocket.md)) is routed by the same selector. It is called once
 with the URL's `http` or `https` form (`ws` maps to `http`, `wss` to `https`),
 so `http_proxy`, `https_proxy`, `all_proxy` and `no_proxy` apply as for the
 equivalent HTTP request, and the tunnel is a `CONNECT` or SOCKS5 connection
@@ -348,7 +348,7 @@ for `ws` as well.
 - The tunnel (HTTP `CONNECT` or SOCKS5) is negotiated on the proxy
   connection before TLS, so SNI,
   certificate verification and ALPN target the origin, not the proxy
-  ([[transport]]).
+  ([transport](transport.md)).
 - Cleartext origins (`http://`, h2c and HTTP/1.1) tunnel the same way, which
   keeps one mechanism for every scheme.
 - A declined h2c upgrade keeps the connection that carried it, so it opens no
@@ -375,7 +375,7 @@ for `ws` as well.
 > `Http2.Proxy` and `Http2.Socks` take **no** dependency on it: they are
 > self-contained units that mirror these designs, with mORMot2's behaviour
 > and edge cases as the guide. Names below are from the checkout recorded in
-> [[toolchain]].
+> [toolchain](../verification/toolchain.md).
 
 | mORMot2 piece | What it shows | Mirrored here by |
 | --- | --- | --- |

@@ -7,7 +7,7 @@ tags:
   - verification
   - validation
 status: validated
-up: "[[http2client]]"
+up: "[http2client](../http2client.md)"
 updated: 2026-10-13
 validation-results: "bin/validation-results.md"
 harness-log: "doc/verification/harness-run-full.log"
@@ -92,7 +92,7 @@ mid-flight GOAWAY; the same semantics are covered by unit tests
 in `test/Http2.ConnectionLifecycle.Test.pas`).
 
 The cleartext and fallback paths these cases exercise are described in
-[[fallback]] (`src/Http2.Http1.pas`, `src/Http2.Client.pas`).
+[fallback](../design/fallback.md) (`src/Http2.Http1.pas`, `src/Http2.Client.pas`).
 
 **A.7 and flow control.** `TFlowControl` is wired into the runtime: the
 connection returns window credit after receiving DATA, so a 100 KB response
@@ -164,7 +164,7 @@ the *intent* is ported, not the bytes.
 
 | ID | Legacy raw run (stretch) | Condition |
 |---|---|---|
-| C.6 | `grunt mochaTest:client` with `HTTP2_BROWSER=test/testclient` | **Ported, not raw-run.** The suite speaks **draft-09** plaintext `h2c`; the shipped client implements the RFC 7540 cleartext paths (`ctPriorKnowledge` / `ctUpgrade`, see [[fallback]]) but not the draft-09 wire dialect (different preface/ALPN, and the 2014 node deps do not run on node v26). The h2c code path is instead covered by interop A.10–A.13 and by `test/Http2.ClearText.Test.pas`. Recorded as a documented skip. |
+| C.6 | `grunt mochaTest:client` with `HTTP2_BROWSER=test/testclient` | **Ported, not raw-run.** The suite speaks **draft-09** plaintext `h2c`; the shipped client implements the RFC 7540 cleartext paths (`ctPriorKnowledge` / `ctUpgrade`, see [fallback](../design/fallback.md)) but not the draft-09 wire dialect (different preface/ALPN, and the 2014 node deps do not run on node v26). The h2c code path is instead covered by interop A.10–A.13 and by `test/Http2.ClearText.Test.pas`. Recorded as a documented skip. |
 
 ## D. h2spec (optional appendix)
 

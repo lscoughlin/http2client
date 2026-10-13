@@ -7,12 +7,12 @@ tags:
   - design
   - api
 status: done
-up: "[[http2client]]"
+up: "[http2client](../http2client.md)"
 related:
-  - "[[architecture]]"
-  - "[[proxy]]"
-  - "[[messages]]"
-  - "[[open-questions]]"
+  - "[architecture](architecture.md)"
+  - "[proxy](proxy.md)"
+  - "[messages](messages.md)"
+  - "[open-questions](open-questions.md)"
 updated: 2026-10-13
 ---
 
@@ -82,13 +82,13 @@ Defaults:
 | `MaxConnectionsPerHost` | `4` | concurrent TCP connections to one authority (`host:port`) |
 | `MaxTotalConnections` | `32` | concurrent TCP connections across every authority combined |
 | `MaxStreamsPerConnection` | `100` | concurrent streams per connection offered to the peer |
-| `FollowRedirects` | `True` | automatic redirect handling (see [[errors-redirects]]) |
+| `FollowRedirects` | `True` | automatic redirect handling (see [errors-redirects](errors-redirects.md)) |
 | `MaxRedirects` | `10` | redirect chain limit before `EHttpTooManyRedirects` |
 | `ConnectTimeoutMs` | `10000` | TCP + TLS handshake deadline |
 | `HeaderTimeoutMs` | `30000` | response-header deadline once headers are expected |
 | `IdleTimeoutMs` | `60000` | idle connection reap time |
-| `Http1Fallback` | `False` | allow HTTP/1.1 when the peer does not offer `h2`; see [[fallback]] |
-| `ClearTextPolicy` | `ctReject` | reject `http` origins; `ctPriorKnowledge`, `ctUpgrade` and `ctHttp1` accept them (`ctHttp1` speaks HTTP/1.1 with no upgrade probe); see [[fallback]] |
+| `Http1Fallback` | `False` | allow HTTP/1.1 when the peer does not offer `h2`; see [fallback](fallback.md) |
+| `ClearTextPolicy` | `ctReject` | reject `http` origins; `ctPriorKnowledge`, `ctUpgrade` and `ctHttp1` accept them (`ctHttp1` speaks HTTP/1.1 with no upgrade probe); see [fallback](fallback.md) |
 
 Two connection caps apply, because a pool has two different budgets: a
 **per-authority** one (how many TCP connections may serve one `host:port`, a
@@ -116,7 +116,7 @@ uses them to bound each host tightly while still allowing many hosts.
 exempt through an HTTP `CONNECT` tunnel to `host:port`; the tunnel is
 established on the plain socket, so TLS and ALPN still target the origin. A
 proxy that refuses the `CONNECT` surfaces as `EHttpConnectionError`; there is
-no forwarding mode and no silent direct fallback. See [[transport]].
+no forwarding mode and no silent direct fallback. See [transport](transport.md).
 
 Three further methods choose the route per request. `WithProxyEnvironmentVars`
 reads `http_proxy`, `https_proxy`, `all_proxy` and `no_proxy` when the client
@@ -126,11 +126,11 @@ credentials, for every scheme without a more specific proxy. `WithNoProxy(list)`
 and accepts the `no_proxy` grammar. `WithProxySelector(selector)` installs an
 `IProxySelector`, whose `SelectProxy(uri)` returns the proxy for a request or
 `nil` for a direct connection; a selector overrides every other proxy setting.
-Precedence, grammar, pooling and error behaviour are described in [[proxy]].
+Precedence, grammar, pooling and error behaviour are described in [proxy](proxy.md).
 
 The three timeout setters take a single value each — `WithConnectTimeout`,
 `WithHeaderTimeout`, `WithIdleTimeout` — and override the matching default
-below for every request on the built client. See [[errors-redirects]].
+below for every request on the built client. See [errors-redirects](errors-redirects.md).
 
 `WithSocketFactory` replaces the transport wholesale. It is the seam the
 test suite uses (`IHttp2SocketFactory` with an in-memory socket) and the
@@ -138,7 +138,7 @@ hook for a caller who must supply their own TLS stack. `WithCACertFile`
 points certificate verification at a specific trust bundle;
 `WithInsecureTls` disables verification (test/development only, never a
 default). `WithObserver` installs an `IHttp2Observer` for connection,
-stream, and frame-level events — see [[testing-observability]].
+stream, and frame-level events — see [testing-observability](testing-observability.md).
 
 ### TLS and trust
 
@@ -180,18 +180,18 @@ type
 
 `Send` **blocks until response status and headers are available**, then
 returns an `IHttpResponse` whose body can be streamed or drained (see
-[[messages]]). It does not block until the body is complete. `Send` is
+[messages](messages.md)). It does not block until the body is complete. `Send` is
 thread-safe and may be called concurrently from many threads; each call
 acquires its own stream lease.
 
-The second `Send` opens a WebSocket (see [[websocket]]): it dials a dedicated
+The second `Send` opens a WebSocket (see [websocket](websocket.md)): it dials a dedicated
 HTTP/1.1 connection, runs the upgrade handshake and returns an `IWebSocket`
 whose listener callbacks run on its own reader thread. That connection is not
 pooled. A class that implements `IHttpClient` itself has to provide both
 overloads.
 
 `Close` stops accepting new leases, gracefully closes open connections
-(GOAWAY, see [[transport]]), and releases the pool. Outstanding
+(GOAWAY, see [transport](transport.md)), and releases the pool. Outstanding
 `IHttpResponse` bodies remain readable until they complete or the caller
 releases them.
 
@@ -232,5 +232,5 @@ flowchart TB
 The connection thread is the **sole writer** to the socket: callers never
 touch the socket directly, they only enqueue frames. This keeps
 HPACK encoder state and flow-control accounting single-threaded on the
-write side. See [[transport]] for the queue design and [[protocol]] for
+write side. See [transport](transport.md) for the queue design and [protocol](protocol.md) for
 flow control.

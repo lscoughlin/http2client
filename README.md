@@ -445,8 +445,9 @@ The connection speaks HTTP/1.1 (RFC 6455); a WebSocket is not pooled. See
 - `doc/verification/validation.md` gives the validation results and the reasons.
 - `doc/verification/toolchain.md` gives the exact tool versions and revisions.
 
-The validation record refers to the generated table at `[[validation-results]]`
-and to the raw sweep log at `[[harness-log]]`.
+The validation record refers to the generated table at
+`bin/validation-results.md` and to the raw sweep log at
+[`doc/verification/harness-run-full.log`](doc/verification/harness-run-full.log).
 
 ## Known limits
 

@@ -7,11 +7,11 @@ tags:
   - design
   - architecture
 status: done
-up: "[[http2client]]"
+up: "[http2client](../http2client.md)"
 related:
-  - "[[client-api]]"
-  - "[[transport]]"
-  - "[[fpc-runtime]]"
+  - "[client-api](client-api.md)"
+  - "[transport](transport.md)"
+  - "[fpc-runtime](fpc-runtime.md)"
 updated: 2026-10-13
 ---
 
@@ -70,7 +70,7 @@ flowchart TB
 Layering, top down:
 
 1. **`THttpClientFactory`** — immutable builder record; produces a configured
-   `IHttpClient`. See [[client-api]].
+   `IHttpClient`. See [client-api](client-api.md).
 2. **`IHttpClient` / `THttpClient`** — public entry point, thread-safe,
    owns the pool, hands out leases. `Send` may be called concurrently.
 3. **`TConnectionPool`** — `TDictionary<string, TConnectionList>` guarded by
@@ -78,7 +78,7 @@ Layering, top down:
    and the global `MaxTotalConnections` budget.
 4. **`IConnection` / `TConnection`** — owns one socket, one background
    thread, and all connection-scoped HTTP/2 state (HPACK, settings, windows,
-   stream-id counter). See [[transport]].
+   stream-id counter). See [transport](transport.md).
 5. **`TStreamLease` / stream state** — one request/response exchange.
 
 ## Unit layout and naming
@@ -121,7 +121,7 @@ unit Http2;             // umbrella: re-exports every unit above EXCEPT Http2.Re
 ```
 
 `Http2.Readers` is deliberately **outside** the umbrella and the core: it is the only unit that depends on `fcl-json`/`fcl-xml`, so a caller
-links it only by naming it in their own `uses` clause. See [[messages]].
+links it only by naming it in their own `uses` clause. See [messages](messages.md).
 
 **Dependency direction.** `Http2.Client` and `Http2.Connection` are the
 concurrency owners; the layers below them are pure and independently
@@ -137,4 +137,4 @@ Conventions:
 - **Parameters**: `A` prefix (`ARequest`, `AValue`), `const` for managed
   types (avoids an implicit copy + refcount churn).
 - **Header-name constants** are lowercase (`HeaderContentType` = `'content-type'`)
-  because HTTP/2 requires lowercase on the wire. See [[messages]].
+  because HTTP/2 requires lowercase on the wire. See [messages](messages.md).

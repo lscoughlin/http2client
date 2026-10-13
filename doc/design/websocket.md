@@ -10,16 +10,16 @@ tags:
   - api
   - protocol
 status: done
-up: "[[http2client]]"
+up: "[http2client](../http2client.md)"
 related:
-  - "[[client-api]]"
-  - "[[transport]]"
-  - "[[errors-redirects]]"
-  - "[[proxy]]"
-  - "[[fallback]]"
-  - "[[testing-observability]]"
-  - "[[open-questions]]"
-  - "[[toolchain]]"
+  - "[client-api](client-api.md)"
+  - "[transport](transport.md)"
+  - "[errors-redirects](errors-redirects.md)"
+  - "[proxy](proxy.md)"
+  - "[fallback](fallback.md)"
+  - "[testing-observability](testing-observability.md)"
+  - "[open-questions](open-questions.md)"
+  - "[toolchain](../verification/toolchain.md)"
 updated: 2026-10-13
 ---
 
@@ -154,7 +154,7 @@ The connection to the server is made by a dial that speaks HTTP/1.1 only
 (`IHttp1SocketFactory`): for `wss` the ALPN offer is `http/1.1` alone, a server
 that selects `h2` is refused, and a server that answers no ALPN is accepted,
 since many WebSocket servers lack ALPN. The fallback and cleartext switches of
-[[fallback]] do not apply: a `ws://` URL is allowed under the default
+[fallback](fallback.md) do not apply: a `ws://` URL is allowed under the default
 cleartext policy. A socket factory that lacks the dial makes `Send` raise
 `EHttpWebSocketError`.
 
@@ -266,10 +266,10 @@ outside `1000`-`1003`, `1007`-`1011` and `3000`-`4999`, cannot be sent.
 
 ## Routing and pooling
 
-The proxy selector (see [[proxy]]) is called once, with the URL's `http` or
+The proxy selector (see [proxy](proxy.md)) is called once, with the URL's `http` or
 `https` form (`ws` maps to `http`, `wss` to `https`), so `http_proxy`,
 `https_proxy`, `all_proxy` and `no_proxy` apply as for the same HTTP request.
-Both `ws` and `wss` go through the tunnel kinds described in [[transport]]:
+Both `ws` and `wss` go through the tunnel kinds described in [transport](transport.md):
 `CONNECT`, `CONNECT` inside TLS to an `https://` proxy, and SOCKS5. Loopback
 connects directly.
 
@@ -306,7 +306,7 @@ All derive from `EHttpError`.
 > already depends on mORMot2 for TLS (`mormot.lib.openssl11`). `Http2.WebSocket`
 > and `Http2.WebSocketClient` take **no** dependency on it: they are
 > self-contained units that mirror its designs. Names below are from the
-> checkout recorded in [[toolchain]].
+> checkout recorded in [toolchain](../verification/toolchain.md).
 
 | mORMot2 piece | What it shows | Mirrored here by |
 | --- | --- | --- |
@@ -338,7 +338,7 @@ Behaviour of the reference code that shapes the design:
 - Total handshake time is bounded per step (the dial, then each response
   read), not as one budget.
 - The Autobahn|Testsuite fuzzing client run needs Docker; see
-  [[testing-observability]].
+  [testing-observability](testing-observability.md).
 
 ## Example
 

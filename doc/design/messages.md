@@ -7,11 +7,11 @@ tags:
   - design
   - api
 status: done
-up: "[[http2client]]"
+up: "[http2client](../http2client.md)"
 related:
-  - "[[client-api]]"
-  - "[[protocol]]"
-  - "[[open-questions]]"
+  - "[client-api](client-api.md)"
+  - "[protocol](protocol.md)"
+  - "[open-questions](open-questions.md)"
 updated: 2026-10-13
 ---
 
@@ -107,7 +107,7 @@ adding `{$modeswitch genericmethods}` (`probe10.pas`) does not help. Under
 therefore uses **`{$mode delphi}`** and puts the generic on a **class**
 (`TResponseReader<T>`) so it also works as a specialized class when a
 method-level generic is undesirable. `IResponseReader<T>` remains the
-interface form for dependency injection. See [[fpc-runtime]] for the full
+interface form for dependency injection. See [fpc-runtime](fpc-runtime.md) for the full
 verified-facts table.
 
 - `StatusCode` is the HTTP/2 `:status` pseudo-header (exactly one required
@@ -179,18 +179,18 @@ type
   build itself must call `Clone` first. `Clone` copies the record and deep
   copies the header map (every repeated value preserved). `TSseReconnectLoop`
   clones its request before echoing `last-event-id`, so the caller's request
-  is never modified ([[server-sent-events]]).
+  is never modified ([server-sent-events](server-sent-events.md)).
 - Pseudo-header mapping happens at encode time (`THttpRequest.ToStreamRequest`):
   `:method` ← method token, `:scheme` ← the URL scheme (`'http'` or
   `'https'`), `:path` ← path+query (`'/'` when empty), `:authority` ←
   `host[:port]` (port omitted when the scheme default). Regular headers
   follow, all names lowercased. The scheme also drives transport selection
-  (TLS vs cleartext, and the cleartext policy) — see [[fallback]].
+  (TLS vs cleartext, and the cleartext policy) — see [fallback](fallback.md).
 - `AddPseudo` is how the codec carries the pseudo-headers without them
   entering the public `Headers` map; `GetPseudo` reads one back. A caller
   cannot inject a pseudo-header into `Headers` by accident.
 - A `FBodyWriter` body is single-use / non-replayable (see
-  [[errors-redirects]]).
+  [errors-redirects](errors-redirects.md)).
 
 ## Headers and header names
 

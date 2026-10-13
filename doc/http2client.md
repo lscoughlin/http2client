@@ -16,7 +16,7 @@ An Object Pascal HTTP/2 client.
 
 Target: **Free Pascal 3.2.4** (`{$mode delphi}`), advanced records +
 interfaces. Language claims are verified against FPC 3.2.4 — see
-[[fpc-runtime]] and the re-runnable probes under
+[fpc-runtime](design/fpc-runtime.md) and the re-runnable probes under
 [`reference/fpc-verified/`](reference/fpc-verified/README.md).
 
 ## Design model
@@ -25,7 +25,7 @@ A **lease is one HTTP/2 stream, not one TCP connection**. A single
 connection multiplexes many concurrent streams. `MaxConnectionsPerHost` caps
 concurrent **TCP connections to one authority** and `MaxTotalConnections` caps
 them **across all authorities**; `MaxStreamsPerConnection` (and the peer's
-`SETTINGS_MAX_CONCURRENT_STREAMS`) caps **concurrent requests**. The rest of the design depends on this model. Details in [[architecture]].
+`SETTINGS_MAX_CONCURRENT_STREAMS`) caps **concurrent requests**. The rest of the design depends on this model. Details in [architecture](design/architecture.md).
 
 ```mermaid
 flowchart TB
@@ -41,26 +41,26 @@ flowchart TB
 
 | Note | Covers |
 | --- | --- |
-| [[architecture]] | resolved multiplexing model, component diagram, unit layout and naming |
-| [[fpc-runtime]] | language mode, compiler directives, verified FPC facts, ARC/memory model |
-| [[client-api]] | `THttpClientFactory` + `IHttpClient`, defaults, lease acquisition |
-| [[messages]] | `IHttpResponse`, `THttpRequest`, `IHttpHeaders`, header constants, streaming |
-| [[protocol]] | frame layer, HPACK, flow control |
-| [[transport]] | threading and queues, connection lifecycle, TLS/ALPN |
-| [[proxy]] | proxy routing per request: fixed proxy, `http_proxy` / `https_proxy` / `no_proxy`, `WithNoProxy`, `IProxySelector` |
-| [[websocket]] | WebSocket client (RFC 6455): `IWebSocketRequest`, `IWebSocketListener`, `IWebSocket`, demand-driven delivery, close handshake, `ws`/`wss` through every proxy kind |
-| [[fallback]] | cleartext h2c (prior knowledge and upgrade) and HTTP/1.1 fallback |
-| [[errors-redirects]] | exception hierarchy, timeouts, cancellation, redirects |
-| [[server-sent-events]] | Server-Sent Events: event-stream parser, SSE source, reconnect/resume, body-read timeout |
-| [[testing-observability]] | test seams, `fpcunit`, `IHttp2Observer` |
-| [[open-questions]] | single source of truth for unresolved decisions |
+| [architecture](design/architecture.md) | resolved multiplexing model, component diagram, unit layout and naming |
+| [fpc-runtime](design/fpc-runtime.md) | language mode, compiler directives, verified FPC facts, ARC/memory model |
+| [client-api](design/client-api.md) | `THttpClientFactory` + `IHttpClient`, defaults, lease acquisition |
+| [messages](design/messages.md) | `IHttpResponse`, `THttpRequest`, `IHttpHeaders`, header constants, streaming |
+| [protocol](design/protocol.md) | frame layer, HPACK, flow control |
+| [transport](design/transport.md) | threading and queues, connection lifecycle, TLS/ALPN |
+| [proxy](design/proxy.md) | proxy routing per request: fixed proxy, `http_proxy` / `https_proxy` / `no_proxy`, `WithNoProxy`, `IProxySelector` |
+| [websocket](design/websocket.md) | WebSocket client (RFC 6455): `IWebSocketRequest`, `IWebSocketListener`, `IWebSocket`, demand-driven delivery, close handshake, `ws`/`wss` through every proxy kind |
+| [fallback](design/fallback.md) | cleartext h2c (prior knowledge and upgrade) and HTTP/1.1 fallback |
+| [errors-redirects](design/errors-redirects.md) | exception hierarchy, timeouts, cancellation, redirects |
+| [server-sent-events](design/server-sent-events.md) | Server-Sent Events: event-stream parser, SSE source, reconnect/resume, body-read timeout |
+| [testing-observability](design/testing-observability.md) | test seams, `fpcunit`, `IHttp2Observer` |
+| [open-questions](design/open-questions.md) | single source of truth for unresolved decisions |
 
 ## Verification
 
 | Note | Covers |
 | --- | --- |
-| [[validation]] | the validation record: what is gate, what is oracle, the commands, and the results |
-| [[toolchain]] | locked, externally verified tool and library revisions |
+| [validation](verification/validation.md) | the validation record: what is gate, what is oracle, the commands, and the results |
+| [toolchain](verification/toolchain.md) | locked, externally verified tool and library revisions |
 
 ## Quick start
 
@@ -85,7 +85,7 @@ begin
 end;
 ```
 
-See [[client-api]] for the full factory surface and [[messages]] for
+See [client-api](design/client-api.md) for the full factory surface and [messages](design/messages.md) for
 request/response construction. On this machine the binary must also find
 OpenSSL at runtime:
 

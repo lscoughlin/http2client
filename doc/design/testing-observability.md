@@ -7,11 +7,11 @@ tags:
   - design
   - testing
 status: done
-up: "[[http2client]]"
+up: "[http2client](../http2client.md)"
 related:
-  - "[[architecture]]"
-  - "[[protocol]]"
-  - "[[transport]]"
+  - "[architecture](architecture.md)"
+  - "[protocol](protocol.md)"
+  - "[transport](transport.md)"
 updated: 2026-10-13
 ---
 

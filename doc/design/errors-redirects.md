@@ -7,14 +7,14 @@ tags:
   - design
   - errors
 status: done
-up: "[[http2client]]"
+up: "[http2client](../http2client.md)"
 related:
-  - "[[messages]]"
-  - "[[transport]]"
-  - "[[fallback]]"
-  - "[[proxy]]"
-  - "[[server-sent-events]]"
-  - "[[open-questions]]"
+  - "[messages](messages.md)"
+  - "[transport](transport.md)"
+  - "[fallback](fallback.md)"
+  - "[proxy](proxy.md)"
+  - "[server-sent-events](server-sent-events.md)"
+  - "[open-questions](open-questions.md)"
 updated: 2026-10-09
 ---
 
@@ -35,7 +35,7 @@ When `WithFollowRedirects` is on and a `3xx` carries a `Location`:
 - The proxy route is chosen again for every hop, so a redirect to a host on
   the no-proxy list connects directly and a redirect away from one goes
   through the proxy. A refused `CONNECT` raises `EHttpConnectionError`; an
-  unusable proxy value raises `EHttpProxyConfigError`. See [[proxy]].
+  unusable proxy value raises `EHttpProxyConfigError`. See [proxy](proxy.md).
 
 ```mermaid
 flowchart TB
@@ -94,7 +94,7 @@ type
   `THttpRequest.WithSseReadTimeout(ms)`, where `0` means "wait indefinitely";
   the lease polls an `ICancellationToken` every 20 ms, and a cancelled or
   expired body read resets the stream with `RST_STREAM(CANCEL)`. See
-  [[server-sent-events]].
+  [server-sent-events](server-sent-events.md).
 - **Uniform reporting:** errors are raised as the exception types above;
   partial records are never left half-owned because ownership is by
   interface (refcount cleans up on unwind).
@@ -114,7 +114,7 @@ flowchart TB
   E -->|"IBodyWriter cannot replay"| N["EHttpNotReplayable"]
 ```
 
-WebSocket failures ([[websocket]]) have their own classes, all deriving from
+WebSocket failures ([websocket](websocket.md)) have their own classes, all deriving from
 `EHttpError`: `EHttpWebSocketError` for misuse (an unusable URL, header,
 subprotocol or argument), `EHttpWebSocketClosedError` for a send after the
 output side closed, `EHttpWebSocketHandshakeError` when the server does not
@@ -127,4 +127,4 @@ of being raised.
 A connection-level failure **takes precedence over** a queued stream error:
 if the transport dies while a retryable stream error is pending, the caller
 sees `EHttpConnectionError` so the request is not silently masked as
-non-retryable. See [[protocol]].
+non-retryable. See [protocol](protocol.md).

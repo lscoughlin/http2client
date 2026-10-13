@@ -8,13 +8,13 @@ tags:
   - transport
   - protocol
 status: done
-up: "[[http2client]]"
+up: "[http2client](../http2client.md)"
 related:
-  - "[[transport]]"
-  - "[[protocol]]"
-  - "[[client-api]]"
-  - "[[errors-redirects]]"
-  - "[[open-questions]]"
+  - "[transport](transport.md)"
+  - "[protocol](protocol.md)"
+  - "[client-api](client-api.md)"
+  - "[errors-redirects](errors-redirects.md)"
+  - "[open-questions](open-questions.md)"
 updated: 2026-10-13
 ---
 
@@ -43,14 +43,14 @@ surface".
 All five modes are covered by tests and interop cases A.10–A.13; see
 "Implementation status".
 
-WebSocket connections ([[websocket]]) sit outside these modes. They always
+WebSocket connections ([websocket](websocket.md)) sit outside these modes. They always
 speak HTTP/1.1 for the opening handshake and take no part in the fallback and
 cleartext switches: a `ws://` URL connects under the default cleartext policy.
 
 ## Terms
 
 - **Origin.** The form `scheme://host:port`. The default port follows the
-  scheme. The origin is the connection pool key. See [[architecture]].
+  scheme. The origin is the connection pool key. See [architecture](architecture.md).
 - **Strict mode.** The default. The client requires `h2` over TLS.
 - **Fallback.** The client accepts HTTP/1.1 when the peer does not offer
   `h2`.
@@ -67,7 +67,7 @@ cleartext switches: a `ws://` URL connects under the default cleartext policy.
 ## Negotiation
 
 The client follows one algorithm for each request. The pool caches the
-result for the origin. See [[client-api]] for lease acquisition.
+result for the origin. See [client-api](client-api.md) for lease acquisition.
 
 ### `https` origins
 
@@ -76,7 +76,7 @@ result for the origin. See [[client-api]] for lease acquisition.
    `h2` alone when fallback is off.
 3. Read the ALPN result.
 4. If ALPN is `h2`, use HTTP/2. Write the connection preface. Continue with
-   [[transport]].
+   [transport](transport.md).
 5. If ALPN is `http/1.1` and fallback is on, use the HTTP/1.1 codec.
 6. If ALPN is empty and fallback is on, use HTTP/1.1. RFC 7301 says that an
    empty ALPN result means HTTP/1.1.
@@ -125,7 +125,7 @@ The client does these steps one time for each connection:
 1. Build the request as an HTTP/1.1 request.
 2. Add the header `Upgrade: h2c`.
 3. Add the header `HTTP2-Settings: <value>`. The value is the base64url
-   encoding of the SETTINGS payload, with no padding. See [[protocol]].
+   encoding of the SETTINGS payload, with no padding. See [protocol](protocol.md).
 4. Add the header `Connection: Upgrade, HTTP2-Settings`.
 5. Send the request. Wait for the response.
 6. If the response code is `101`, switch to HTTP/2. Write the connection
@@ -158,7 +158,7 @@ connection to that origin starts with a new upgrade request.
 
 The client re-sends a request in one other case: the peer refused the stream
 or sent `GOAWAY` for it, so the request was never processed, and the method is
-idempotent (see [[transport]]).
+idempotent (see [transport](transport.md)).
 
 
 Rule: the client does not send a later SETTINGS frame that conflicts with
@@ -189,17 +189,17 @@ this scope:
 HTTP/1.1 has no multiplexing. One connection carries one request at a time.
 For HTTP/1.1 origins the client sets the effective stream limit to 1. The
 pool opens more connections when it needs more concurrency, bounded by
-`MaxConnectionsPerHost` and `MaxTotalConnections` (see [[client-api]]).
+`MaxConnectionsPerHost` and `MaxTotalConnections` (see [client-api](client-api.md)).
 
 The codec reuses the public surface. `IHttpClient.Send` and
 `IHttpResponse` do not change. Redirects, timeouts, cancellation, and the
-observer apply to HTTP/1.1 in the same way. See [[errors-redirects]] and
-[[testing-observability]].
+observer apply to HTTP/1.1 in the same way. See [errors-redirects](errors-redirects.md) and
+[testing-observability](testing-observability.md).
 
 ## Factory surface
 
 The factory is a pure value record. Each method returns a new record.
-See [[client-api]].
+See [client-api](client-api.md).
 
 ```pascal
 type
@@ -243,12 +243,12 @@ speak `h2c`.
 
 The pool key is the origin, and the origin includes the scheme. The client
 does not mix a TLS connection with a cleartext connection. The client does
-not mix an HTTP/2 connection with an HTTP/1.1 connection. [[transport]] holds
+not mix an HTTP/2 connection with an HTTP/1.1 connection. [transport](transport.md) holds
 the pool rules.
 
 ## Errors
 
-The client uses the existing exception hierarchy. See [[errors-redirects]].
+The client uses the existing exception hierarchy. See [errors-redirects](errors-redirects.md).
 
 | Condition | Exception |
 | --- | --- |
@@ -320,9 +320,9 @@ in the log once. Under `ctHttp1` none carries an `Upgrade` header; under
 `ctUpgrade` each carries the probe once.
 
 Result: `interop: PASS=13 FAIL=0 SKIP=1` → `interop gate GREEN`
-(see [[validation]]).
+(see [validation](../verification/validation.md)).
 
 ## Known gaps
 
 1. The observer has no cleartext-warning event, so a cleartext request is
-   silent. See [[testing-observability]] and [[open-questions]].
+   silent. See [testing-observability](testing-observability.md) and [open-questions](open-questions.md).

@@ -6,7 +6,7 @@ tags:
   - http2client
   - verification
 status: done
-up: "[[http2client]]"
+up: "[http2client](../http2client.md)"
 updated: 2026-10-13
 ---
 
@@ -63,7 +63,7 @@ above.
 | `make` | present (`/usr/bin/make`) | build. **No `cmake`** (absent). |
 | `task` (go-task) | present `3.54.0` (`/opt/homebrew/bin/task`) | the primary build/test entry point (`task build`, `task test`, `task examples`, `task validate:*`); `Makefile` remains a thin mirror. Note go-task's embedded shell (mvdan/sh) does **not** support `ulimit`. |
 | `openssl` CLI | present (3.6.5) | generate test certs. |
-| `h2spec` | absent | server-conformance only; optional appendix in [[validation]]. |
+| `h2spec` | absent | server-conformance only; optional appendix in [validation](validation.md). |
 
 ## Bootstrap commands
 
@@ -107,7 +107,7 @@ IDE as a design-time package.
 |---|---|
 | Package name / type | `http2client`, `RunAndDesignTime`, `Version 0.19.0` |
 | Units | all 20 in `src/`, `Http2.pas` (umbrella) first; `Http2.Readers.pas` is the optional JSON/XML unit, and `Http2.Encoding.pas` holds the content codings, `Http2.Sse.pas` the Server-Sent Events reader, `Http2.Proxy.pas` and `Http2.Socks.pas` proxy routing, `Http2.WebSocket.pas` and `Http2.WebSocketClient.pas` the WebSocket client |
-| Test suite | 648 tests, 0 errors, 0 failures (registration list: `test/Http2.TestRunner.pas`); see [[testing-observability]] |
+| Test suite | 648 tests, 0 errors, 0 failures (registration list: `test/Http2.TestRunner.pas`); see [testing-observability](../design/testing-observability.md) |
 | `OtherUnitFiles` | `src` + the four vendored mormot dirs (`core`, `lib`, `net`, `crypt`) |
 | `RequiredPkgs` | `FCL` **only** — deliberately **not** the IDE `mormot2` package (see below) |
 | Unit output | `lib/$(TargetCPU)-$(TargetOS)` (gitignored) |

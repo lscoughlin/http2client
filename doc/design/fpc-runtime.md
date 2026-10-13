@@ -7,10 +7,10 @@ tags:
   - design
   - fpc
 status: done
-up: "[[http2client]]"
+up: "[http2client](../http2client.md)"
 related:
-  - "[[architecture]]"
-  - "[[transport]]"
+  - "[architecture](architecture.md)"
+  - "[transport](transport.md)"
 updated: 2026-10-13
 ---
 
@@ -145,5 +145,5 @@ Rules that follow from it:
 - **Threads and cycles**: a thread that holds an interface to its owning
   connection creates a reference cycle that ARC cannot break. The
   `TConnectionThread` therefore holds a **weak reference** to its
-  `TConnection` (see [[transport]]), or the connection explicitly
+  `TConnection` (see [transport](transport.md)), or the connection explicitly
   `Terminate`+`WaitFor`s the thread before releasing state.

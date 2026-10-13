@@ -7,14 +7,14 @@ tags:
   - design
   - concurrency
 status: done
-up: "[[http2client]]"
+up: "[http2client](../http2client.md)"
 related:
-  - "[[protocol]]"
-  - "[[architecture]]"
-  - "[[fpc-runtime]]"
-  - "[[fallback]]"
-  - "[[proxy]]"
-  - "[[open-questions]]"
+  - "[protocol](protocol.md)"
+  - "[architecture](architecture.md)"
+  - "[fpc-runtime](fpc-runtime.md)"
+  - "[fallback](fallback.md)"
+  - "[proxy](proxy.md)"
+  - "[open-questions](open-questions.md)"
 updated: 2026-10-13
 ---
 
@@ -23,7 +23,7 @@ updated: 2026-10-13
 ## Threading and queues
 
 Free Pascal 3.2.4 primitives (all choices below are probe-verified; see
-[[fpc-runtime]]):
+[fpc-runtime](fpc-runtime.md)):
 
 - `TThread` (unit `Classes`) — one subclass per connection,
   `TConnectionThread`.
@@ -199,11 +199,11 @@ idempotent methods (no body writer), and only on `ecRefusedStream` or a
   without the caller's consent. `NPN` is not required.
 - Cleartext `h2c` (prior knowledge and upgrade), cleartext HTTP/1.1 without
   a probe, and HTTP/1.1 fallback are available when the caller enables them.
-  The default stays strict. See [[fallback]].
+  The default stays strict. See [fallback](fallback.md).
 - Certificate validation/trust configuration is a factory concern (hostname
   verification on by default).
 - Proxy: when a request is routed through a proxy (`WithProxy`, the proxy
-  environment variables or an `IProxySelector`; see [[proxy]], including the
+  environment variables or an `IProxySelector`; see [proxy](proxy.md), including the
   SOCKS5 variant), TLS/`h2` is negotiated over a caller-supplied
   forward proxy via an HTTP `CONNECT` tunnel to the origin. The TCP
   connection goes to the proxy; the `CONNECT` is negotiated on the plain
@@ -214,11 +214,11 @@ idempotent methods (no body writer), and only on `ecRefusedStream` or a
 
 ## WebSocket connections
 
-A WebSocket ([[websocket]]) uses a connection of its own rather than a pooled
+A WebSocket ([websocket](websocket.md)) uses a connection of its own rather than a pooled
 one. The dial speaks HTTP/1.1 only: for `https` the ALPN offer is `http/1.1`
 alone (`IHttp1SocketFactory.DialHttp1`), a server that selects `h2` is
 refused, and a server that answers with no ALPN is accepted. The proxy tunnels
-of [[proxy]] apply unchanged. After the `Upgrade` handshake one reader thread
+of [proxy](proxy.md) apply unchanged. After the `Upgrade` handshake one reader thread
 owns every read of the socket; sends from other threads are serialised by a
 lock, and on a connection whose reads and writes share one TLS state the
 socket itself is guarded by a second lock that the reader takes only for short

@@ -7,11 +7,11 @@ tags:
   - design
   - protocol
 status: done
-up: "[[http2client]]"
+up: "[http2client](../http2client.md)"
 related:
-  - "[[transport]]"
-  - "[[messages]]"
-  - "[[open-questions]]"
+  - "[transport](transport.md)"
+  - "[messages](messages.md)"
+  - "[open-questions](open-questions.md)"
 updated: 2026-10-13
 ---
 
@@ -87,7 +87,7 @@ API:
 | `ftPushPromise` | n/a | yes | **rejected**: the client advertises `ENABLE_PUSH=0`, so a PUSH_PROMISE is a connection error (`ecProtocolError`), not silently dropped |
 
 `Send` returning "status + headers" is exactly `ftHeaders` with
-`ffEndHeaders` decoded and `:status` present. See [[messages]].
+`ffEndHeaders` decoded and `:status` present. See [messages](messages.md).
 
 ```mermaid
 sequenceDiagram
@@ -111,7 +111,7 @@ sequenceDiagram
 ## HPACK
 
 Header compression is **connection-scoped and stateful**, which is why the
-codec lives on `TConnection` (see [[transport]]):
+codec lives on `TConnection` (see [transport](transport.md)):
 
 ```pascal
 type

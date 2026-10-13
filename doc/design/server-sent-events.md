@@ -10,15 +10,15 @@ tags:
   - api
   - protocol
 status: done
-up: "[[http2client]]"
+up: "[http2client](../http2client.md)"
 related:
-  - "[[messages]]"
-  - "[[client-api]]"
-  - "[[errors-redirects]]"
-  - "[[transport]]"
-  - "[[fallback]]"
-  - "[[testing-observability]]"
-  - "[[open-questions]]"
+  - "[messages](messages.md)"
+  - "[client-api](client-api.md)"
+  - "[errors-redirects](errors-redirects.md)"
+  - "[transport](transport.md)"
+  - "[fallback](fallback.md)"
+  - "[testing-observability](testing-observability.md)"
+  - "[open-questions](open-questions.md)"
 updated: 2026-10-13
 ---
 
@@ -116,7 +116,7 @@ The format is the WHATWG event-stream grammar (HTML Living Standard,
 byte-in/event-out class** — `TSseEventParser` — with no socket or lease
 dependency, so it can be tested by slicing an input at every byte boundary
 (see "Testing"). It is the SSE analogue of `THpackCodec` in
-[[protocol]]: a pure layer the rest of the stack composes.
+[protocol](protocol.md): a pure layer the rest of the stack composes.
 
 Grammar, exactly:
 
@@ -175,7 +175,7 @@ type
 ```
 
 The parser is UTF-8: a `TSseEvent.Data` is a UTF-8 string. It performs no
-transcoding, matching `ReadText`'s byte-verbatim rule in [[messages]]. A
+transcoding, matching `ReadText`'s byte-verbatim rule in [messages](messages.md). A
 multi-byte sequence split across two `Feed` calls is held until complete.
 
 ## Timeouts and liveness
@@ -235,7 +235,7 @@ exchange.
   `cReadCancelPollSliceMs = 20` slice.
 - On a cancel the lease posts `RST_STREAM(CANCEL)`, releases the lease, and
   raises `EHttpStreamError('body read cancelled', StreamId, ecCancel)`. The
-  stream is reset rather than orphaned, the same rule [[errors-redirects]]
+  stream is reset rather than orphaned, the same rule [errors-redirects](errors-redirects.md)
   applies to a cancelled `Send`.
 
 A caller's `Cancel` therefore unblocks a parked SSE read and half-closes the
@@ -266,7 +266,7 @@ deadlocks.
   `MaxStreamsPerConnection` for its whole life**, which can be hours.
 - Over **HTTP/2** that is one stream among many; the connection is shared.
 - Over the **HTTP/1.1 fallback** the stream limit is 1 by design (see
-  [[fallback]]), so a single SSE stream monopolizes the entire connection
+  [fallback](fallback.md)), so a single SSE stream monopolizes the entire connection
   until it ends. Document this; it is a property of HTTP/1.1, not a defect.
 - Calling `IHttpClient.Close` while an SSE source is open stops new leases
   and gracefully closes connections (GOAWAY); the SSE read then fails with
@@ -278,7 +278,7 @@ deadlocks.
 
 SSE is incompatible with transparent content decoding.
 
-`WithAcceptEncoding` (see [[messages]]) sets `accept-encoding`; a response
+`WithAcceptEncoding` (see [messages](messages.md)) sets `accept-encoding`; a response
 that answers with gzip or deflate is wrapped by `WrapDecodingResponse`
 so `Body` yields plain bytes. That wrapper
 **buffers to the coding's footer** before it can emit anything, which
@@ -308,7 +308,7 @@ id.
 - a **bounded retry count** mirroring the redirect idiom: `MaxRetries`
   (default `10`, `0` = reconnect forever), exceeding which raises
   `EHttpTooManySseRetries` (mirroring `EHttpTooManyRedirects` in
-  [[errors-redirects]]);
+  [errors-redirects](errors-redirects.md));
 - a **replay guard**: events are dispatched at most once per observed id, so
   a server that resumes inclusive of `last-event-id` does not duplicate the
   last event.
@@ -389,7 +389,7 @@ ends the source cleanly; `EHttpStreamError` mid-body surfaces from
 
 ## Error model
 
-SSE reuses the exception hierarchy of [[errors-redirects]], with one
+SSE reuses the exception hierarchy of [errors-redirects](errors-redirects.md), with one
 SSE-specific type for the retry bound:
 
 | Condition | Error |
@@ -424,7 +424,7 @@ SSE-specific type for the retry bound:
   including splits inside a CRLF, inside a field name, inside a value, and
   across a multi-byte UTF-8 sequence) and assert an identical event
   sequence. This is the same "prove the assertion can fail" standard
-  [[testing-observability]] uses.
+  [testing-observability](testing-observability.md) uses.
 - **Pure parser cases:** comment-only keep-alive fires nothing but resets
   liveness; `id`/`retry`/`event` with no `data` fires nothing but updates
   state; blank-line dispatch removes exactly one trailing `\n`; `retry:`
@@ -441,11 +441,11 @@ SSE-specific type for the retry bound:
   serves `text/event-stream` and emits a scripted sequence (comment
   keep-alive, multi-line data, `event:`, `id:`, `retry:`), then closes; the
   example and one integration test consume it. This mirrors the opt-in
-  integration gate in [[testing-observability]].
+  integration gate in [testing-observability](testing-observability.md).
 
 ## Design decisions
 
-These choices are also indexed in [[open-questions]].
+These choices are also indexed in [open-questions](open-questions.md).
 
 1. **Reconnect policy.** It lives in `TSseReconnectLoop`, not in the
    transport. The loop reconnects after any clean end of stream or transient
