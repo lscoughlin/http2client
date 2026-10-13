@@ -12,18 +12,16 @@ related:
   - "[[client-api]]"
   - "[[transport]]"
   - "[[fpc-runtime]]"
-updated: 2026-10-09
+updated: 2026-10-13
 ---
 
 # Architecture
 
 ## Resolved multiplexing model
 
-The original sketch contained three statements that cannot all hold at once:
-the pool is capped by total connections, "when 4 leases go out it creates a
-new connection", *and* leases queue frames on the connection they are
-attached to. This design resolves them as follows and the rest of the design
-depends on it:
+The pool is capped by total connections and leases queue frames on the
+connection they are attached to. The model that reconciles the two, and on
+which the rest of the design depends, is:
 
 - **A lease is one HTTP/2 stream, not one TCP connection.** A single
   connection multiplexes many concurrent leases/streams.

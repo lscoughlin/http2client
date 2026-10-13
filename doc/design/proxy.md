@@ -18,7 +18,7 @@ related:
   - "[[errors-redirects]]"
   - "[[open-questions]]"
   - "[[toolchain]]"
-updated: 2026-10-12
+updated: 2026-10-13
 ---
 
 # Proxy Selection
@@ -240,7 +240,7 @@ a custom selector.
 
 ## Connection pooling
 
-The pool key for a direct route is the plain origin, exactly as before.
+The pool key for a direct route is the plain origin.
 A proxied route appends the proxy identity, `origin via [user@]host:port`
 (`origin via tls:[user@]host:port` for an `https://` proxy and
 `origin via socks5:[user@]host:port` for a SOCKS5 proxy), so:
@@ -362,9 +362,8 @@ for `ws` as well.
   that can return what is available instead of insisting on a full read says so
   through `IPartialReader`; the HTTP/1.1 codec reads through it, so a
   keep-alive connection is not held until the server closes it.
-- A socket factory injected with `WithSocketFactory` for tests predates
-  per-request routing and dials without a proxy, as it always has; the
-  selector is still consulted, so pool keys reflect the route, but the
+- A socket factory injected with `WithSocketFactory` for tests dials
+  without a proxy; the selector is still consulted, so pool keys reflect the route, but the
   injected factory ignores the proxy.
 
 ## mORMot2 as a reference

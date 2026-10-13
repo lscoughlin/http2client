@@ -7,14 +7,13 @@ tags:
   - verification
 status: done
 up: "[[http2client]]"
-updated: 2026-10-09
+updated: 2026-10-13
 ---
 
 # Toolchain and environment
 
-Locked, externally verified facts. Agents must not silently substitute
-tools; if something here is wrong, correct this file in the same change and
-note it.
+Locked, externally verified facts. The tools and revisions below are the
+ones the library is built and validated with.
 
 ## Compiler and platform
 
@@ -46,27 +45,27 @@ reproduce commands.
 | LibreSSL | API-compatible (`libssl` OpenSSL-1.1 symbol surface). **No separate backend**; document only. |
 
 **Decision:** `Http2.Tls` implements `IHttp2Socket` and ALPN on top of
-`mormot.lib.openssl11.pas`. Do not attempt ALPN through FPC's bundled
-`opensslsockets`. Vendor the mormot unit (or pin a checkout + revision) in
-S00 and record the exact revision used.
+`mormot.lib.openssl11.pas`; ALPN is not attempted through FPC's bundled
+`opensslsockets`. The mormot checkout is pinned to the revision recorded
+above.
 
 ## External tools
 
 | Tool | Status | Use |
 |---|---|---|
-| `brew` | present | install `nghttp2` CLI in S00. |
-| `libnghttp2` 1.70.0 | present (brew keg) | linked library; **the `nghttpd`/`nghttp` CLIs are not installed**. |
+| `brew` | present | installs the `nghttp2` CLI. |
+| `libnghttp2` 1.70.0 | present (brew keg) | linked library. |
 | `nghttpd`, `nghttp` | **installed** — nghttp2/1.70.0 at `/opt/homebrew/bin` | interop server (`nghttpd`) and differential oracle (`nghttp -nv`). |
 | `docker` | present (Rancher Desktop, `/Users/liamcoughlin/.rd/bin/docker`) | run the locally-built harness image. |
 | h2 harness image | **not published on any registry** (`docker pull nomadlabsinc/h2-client-test-harness` → `pull access denied … repository does not exist`). Source cloned to `third_party/h2-client-test-harness` (module `github.com/nomadlabsinc/h2-client-test-harness`, `go 1.24.4`); image is built locally with `docker build -t h2-test-harness .` (Dockerfile = `golang:1.24-alpine`, builds `/h2-client-test-harness` + `/h2-verifier`, entrypoint `/test-runner.sh`). |
-| `go` | **absent** | do not rely on `go run` for the harness — use Docker. |
+| `go` | **absent** | the harness runs through Docker, not `go run`. |
 | `node` v26.10.0, `npm` | present | legacy `http2/http2-test` only (best-effort). |
 | `make` | present (`/usr/bin/make`) | build. **No `cmake`** (absent). |
 | `task` (go-task) | present `3.54.0` (`/opt/homebrew/bin/task`) | the primary build/test entry point (`task build`, `task test`, `task examples`, `task validate:*`); `Makefile` remains a thin mirror. Note go-task's embedded shell (mvdan/sh) does **not** support `ulimit`. |
 | `openssl` CLI | present (3.6.5) | generate test certs. |
-| `h2spec` | absent | server-conformance only; optional appendix in S12. |
+| `h2spec` | absent | server-conformance only; optional appendix in [[validation]]. |
 
-## Bootstrap commands (S00 executes these)
+## Bootstrap commands
 
 ```sh
 # 1. Build toolchain check
@@ -76,7 +75,7 @@ fpc -iV                      # expect 3.2.4
 brew install nghttp2
 nghttpd --version            # expect 1.70.0
 
-# 3. TLS unit dependency — DONE: pinned checkout
+# 3. TLS unit dependency: pinned checkout
 git clone --depth 1 https://github.com/synopse/mORMot2.git third_party/mORMot2
 # revision 2ccea1a0e5d7be85bd3cf68e1fd70e9e603d09cc (recorded above).
 # Http2.Tls uses these unit dirs: third_party/mORMot2/src/{core,lib,net,crypt}
@@ -86,19 +85,18 @@ git clone --depth 1 https://github.com/synopse/mORMot2.git third_party/mORMot2
 docker build -t h2-test-harness third_party/h2-client-test-harness
 docker run --rm h2-test-harness --list   # lists the case ids
 
-# 5. Legacy reference (already cloned, do not gate on it)
+# 5. Legacy reference (best-effort, not a gate)
 #    http2/http2-test is draft-09 + plaintext + 2014 deps vs node v26.
 ```
 
 ## Constraints
 
-- **No Pascal source in plan files** and **no `cmake`**; use a Makefile with
-  `fpc` invocations.
+- There is **no `cmake`**; the build is a Makefile with `fpc` invocations.
 - Every build must `-Fu` the units dir and the vendored mormot dir.
-- Generated test certificates live in `test/certs/` and are not committed to
-  a vault (repo is not git anyway); regenerate with the openssl CLI.
-- Cite versions exactly as in the table when a story's acceptance depends on
-  them.
+- Generated test certificates live in `test/certs/`; they are regenerated with
+  the openssl CLI.
+- Versions are cited exactly as in the table wherever an acceptance result
+  depends on them.
 
 ## Lazarus package
 
@@ -154,21 +152,17 @@ lazbuild --opt=-Fu/tmp/lpkintf \
          --opt=-Fu$L/packager/registration http2client.lpk
 ```
 
-Verified: `83049 lines compiled`, all 13 units produced `.ppu`/`.o` in
-`lib/aarch64-darwin/`. A stock Lazarus matched to its FPC would not need the
-`--opt` workaround. (`Http2.Readers.pas` was added after that build and
-`Http2.Sse.pas` after that; re-running the recipe at 0.17.0 gives
-`85387 lines compiled` and 16 `Http2` units plus the auto-created
-`http2client` registration unit in `lib/aarch64-darwin/`.)
+Verified at 0.17.0: `85387 lines compiled`, with 16 `Http2` units plus the
+auto-created `http2client` registration unit in `lib/aarch64-darwin/`. A stock
+Lazarus matched to its FPC does not need the `--opt` workaround.
 
-When the note last counted: `make test` reports **648 tests, 0 errors, 0
-failures** (550 before [[websocket]]) and `make examples` builds
-eight programs.
+Last counted: `make test` reports **648 tests, 0 errors, 0 failures** and
+`make examples` builds eight programs.
 
 ## Example programs
 
-`examples/` holds six programs (`basic_get`, `post_text`, `json_request`,
-`xml_request`, `threaded_get`, `sse_stream`) — see `examples/README.md`.
+`examples/` holds eight programs (`basic_get`, `post_text`, `json_request`,
+`xml_request`, `threaded_get`, `sse_stream`, `websocket_echo`, `proxy_env`) — see `examples/README.md`.
 Build and run:
 
 ```sh
@@ -182,7 +176,7 @@ exported at runtime (the library loads OpenSSL dynamically); a threaded
 example additionally needs `{$IFDEF UNIX}cthreads,{$ENDIF}` first in its
 `uses` clause.
 
-## Prerequisites for a fresh clone (expanded)
+## Prerequisites for a fresh clone
 
 The pinned checkouts under `third_party/` are **not** committed (see
 `.gitignore`) — they are external, revision-pinned dependencies. To rebuild

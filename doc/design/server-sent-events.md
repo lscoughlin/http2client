@@ -19,24 +19,23 @@ related:
   - "[[fallback]]"
   - "[[testing-observability]]"
   - "[[open-questions]]"
-updated: 2026-10-09
+updated: 2026-10-13
 ---
 
 # Server-Sent Events
 
-This note brings **Server-Sent Events** (SSE) into scope. SSE is a
+This note describes **Server-Sent Events** (SSE) support. SSE is a
 one-way, long-lived HTTP response: the server holds the response body open
 and pushes `text/event-stream` events until the client disconnects or the
 server closes the stream.
 
-The client already speaks the transport SSE needs. What is missing is a
-**parser**, a **source/loop layer above `IHttpBodyStream`**, and — this is
-the load-bearing part — an **inactivity timeout** distinct from the existing
-per-request header timeout, because the shipped body read raises
-`EHttpTimeout` after `FTimeoutMs` of silence (`src/Http2.Stream.pas:1068`,
-default `30000` at `src/Http2.Stream.pas:476`). A live SSE stream is quiet
-between events, so under the current code every stream idle for more than the
-header timeout fails.
+SSE runs over the ordinary client transport. Three pieces sit on top of it: a
+**parser**, a **source/loop layer above `IHttpBodyStream`**, and an
+**inactivity timeout** distinct from the per-request header timeout. The last
+is load-bearing. A body read without a separate deadline raises `EHttpTimeout`
+after the lease's `FTimeoutMs` of silence (default `30000`, the header
+timeout), and a live SSE stream is quiet between events, so a stream idle for
+more than the header timeout would fail.
 
 ## Scope
 
@@ -46,10 +45,10 @@ SSE is a **reader layer**, not a transport mode:
 | --- | --- | --- |
 | Socket / TLS | `Http2.Tls` | unchanged |
 | Connection + thread | `Http2.Connection` | unchanged; supplies DATA frames and keeps the receive window open |
-| Stream lease / body | `Http2.Stream` | **extended**: body-read inactivity timeout + cancellation polling |
+| Stream lease / body | `Http2.Stream` | body-read inactivity timeout + cancellation polling |
 | Response | `Http2.Messages` (`IHttpResponse`, `IHttpBodyStream`) | the seam SSE reads from |
 | Codec | `Http2.Client` (HTTP/2), `Http2.Http1` (fallback) | HTTP/2 fully supported; HTTP/1.1 best-effort (see below) |
-| **SSE (new)** | `Http2.Sse` | parser, source, reconnect loop |
+| **SSE** | `Http2.Sse` | parser, source, reconnect loop |
 
 SSE is codec-agnostic on purpose: it consumes `IHttpResponse.Body` and
 therefore inherits HTTP/2 multiplexing (an SSE stream is one HTTP/2 stream
@@ -57,7 +56,7 @@ among others on a shared connection) and the HTTP/1.1 fallback (where the
 stream occupies the connection for its lifetime — see "Connection
 lifetime").
 
-**Supported scope (as implemented).** The parser, source and reconnect loop
+**Supported scope.** The parser, source and reconnect loop
 are codec-agnostic and run over either codec. The *transport guarantees*
 differ, and the difference is stated rather than papered over:
 
@@ -68,8 +67,7 @@ differ, and the difference is stated rather than papered over:
   on frame arrival, so an idle stream is never reaped and never stalls the
   connection.
 - **HTTP/1.1 fallback — best-effort.** `THttp1Connection.Create` sets
-  `FSocket.ReadTimeoutMs := ATimeoutMs` from the *header* timeout
-  (`src/Http2.Http1.pas:906`), and `THttp1BodyStream.Read` has no token and
+  `FSocket.ReadTimeoutMs := ATimeoutMs` from the *header* timeout, and `THttp1BodyStream.Read` has no token and
   no cancel path. So over the fallback an idle SSE stream is bounded by the
   socket read timeout and cannot be cancelled mid-read; the parser, event
   delivery and reconnect/resume still work. The fallback is off by default
@@ -91,9 +89,8 @@ An SSE request is `GET` with:
 | `last-event-id` | the last observed id | only on resume (see "Reconnection") |
 | `accept-encoding` | `identity` | **yes — see "Content coding"** |
 
-`Http2.Headers` already carries `HeaderAccept`, `HeaderCacheControl`,
-`HeaderAcceptEncoding`. The one missing constant is
-`HeaderLastEventId = 'last-event-id'`; it is added by the story.
+`Http2.Headers` carries `HeaderAccept`, `HeaderCacheControl`,
+`HeaderAcceptEncoding` and `HeaderLastEventId = 'last-event-id'`.
 
 ## Response validation
 
@@ -183,30 +180,22 @@ multi-byte sequence split across two `Feed` calls is held until complete.
 
 ## Timeouts and liveness
 
-**This is the reason SSE needs a transport change.** The shipped body read
-blocks on an internal frame queue with a deadline:
+**This is the reason SSE needs a transport-level body deadline.** A body
+read blocks on the lease's inbound frame queue with a deadline.
+`TStreamLease.FTimeoutMs` is set from the **header** timeout in
+`THttpConnection.AcquireCancellable` (`Lease.TimeoutMs := ATimeoutMs`) and
+defaults to `30000`. For a normal request that is correct — the whole body is
+expected promptly. For SSE it would be wrong: between events the stream is
+idle by design, so the 30 s header deadline would abort a healthy stream.
 
-```pascal
-// src/Http2.Stream.pas:1068 (ReadBody)
-if not PopInbound(Frame, FTimeoutMs) then ... raise EHttpTimeout
-```
-
-`FTimeoutMs` is set from the **header** timeout in
-`THttpConnection.AcquireCancellable` (`src/Http2.Client.pas:1600`,
-`Lease.TimeoutMs := ATimeoutMs`) and defaults to `30000`
-(`src/Http2.Stream.pas:476`). For a normal request that is correct — the
-whole body is expected promptly. For SSE it is wrong: between events the
-stream is idle by design, so the 30 s header deadline would abort a perfectly
-healthy stream.
-
-SSE therefore needs a **body read timeout separate from the header
+SSE therefore uses a **body read timeout separate from the header
 timeout**:
 
 | Setting | Applies to | Default | `0` means |
 | --- | --- | --- | --- |
 | `HeaderTimeoutMs` | until response HEADERS/status line | `30000` | `0` = default |
 | `IdleTimeoutMs` | reaping an unused pooled connection | `60000` | `0` = never reap |
-| **`BodyReadTimeoutMs`** (new) | each blocked body read on an SSE source | unset = fall back to `HeaderTimeoutMs`; SSE sets it to `0` | **`0` = wait indefinitely** |
+| **`BodyReadTimeoutMs`** | each blocked body read on an SSE source | unset = fall back to `HeaderTimeoutMs`; SSE sets it to `0` | **`0` = wait indefinitely** |
 
 The default for an SSE source is **wait indefinitely** (`0`): an abrupt
 "no event for N seconds" abort is a client policy the caller should opt into,
@@ -223,38 +212,31 @@ Independent liveness signals still work and are preferred:
 - A server may also send `retry:`; that is the reconnect delay, not a
   liveness bound.
 
-The story therefore adds a **body read timeout** to `TStreamLease`, set from
+`TStreamLease` therefore carries a **body read timeout**, set from
 `THttpRequest.WithSseReadTimeout` and threaded to the lease through
-`TStreamRequest.WithBodyReadTimeout`. A separate named field (not a reuse of
-`FTimeoutMs`) is required so header waiting and body waiting can differ, and
+`TStreamRequest.WithBodyReadTimeout`. It is a separate field from
+`FTimeoutMs` so header waiting and body waiting can differ, and
 `TStreamRequest.BodyReadTimeoutSet` distinguishes "no opinion, keep the
-historic header-timeout deadline" from "explicitly wait indefinitely".
+header-timeout deadline" from "explicitly wait indefinitely".
 
 ## Cancellation
 
-Read-side cancellation did not exist in the shipped code.
-`ICancellationToken` was polled only in the header-wait loop
-(`THttpConnection.AcquireCancellable`, `cCancelPollSliceMs = 20`); `ReadBody`
-had no token and no poll, so an SSE reader blocked on its inbound queue could
-not be interrupted by `Cancel`.
+A blocked body read observes the request's `ICancellationToken`. The
+header-wait loop (`THttpConnection.AcquireCancellable`,
+`cCancelPollSliceMs = 20`) and the body read share one token type and one
+slice length, so "cancelled" means the same thing at both points of an
+exchange.
 
-This is now implemented (it was a required story task, not a follow-up):
-
-- `ICancellationToken`/`TCancellationToken` moved from `Http2.Client` into
-  `src/Http2.Stream.pas`, so the lease's body read can poll the token without
-  a second, twin interface. `Http2.Client` re-exports them (its `uses` clause
-  already included `Http2.Stream`), so no caller broke.
-- `TStreamLease.ReadBody` no longer calls the generic
-  `PopInbound(Frame, FTimeoutMs)`; it calls `WaitForBodyFrame`, which honours
-  the request's body-read deadline and, when a token is present, polls it on
-  the `cReadCancelPollSliceMs = 20` slice.
+- `ICancellationToken`/`TCancellationToken` live in `src/Http2.Stream.pas`,
+  so the lease's body read polls the token directly. `Http2.Client`
+  re-exports them.
+- `TStreamLease.ReadBody` calls `WaitForBodyFrame`, which honours the
+  request's body-read deadline and, when a token is present, polls it on the
+  `cReadCancelPollSliceMs = 20` slice.
 - On a cancel the lease posts `RST_STREAM(CANCEL)`, releases the lease, and
   raises `EHttpStreamError('body read cancelled', StreamId, ecCancel)`. The
   stream is reset rather than orphaned, the same rule [[errors-redirects]]
   applies to a cancelled `Send`.
-- The header-wait and body-read paths now share one token type and one slice
-  constant, so "cancelled" means the same thing at both points of an
-  exchange.
 
 A caller's `Cancel` therefore unblocks a parked SSE read and half-closes the
 stream; `TSseReconnectLoop` stops when the source is closed or cancelled.
@@ -263,25 +245,23 @@ stream; `TSseReconnectLoop` stops when the source is closed or cancelled.
 
 A slow or paused SSE reader must not starve the connection. The receive
 window is replenished by the connection, not by the application read:
-`TConnection.TrackReceivedData` (`src/Http2.Connection.pas:1094`) credits
-the connection window and the per-stream window as each DATA frame arrives,
-and emits `WINDOW_UPDATE` in `cWindowUpdateBatchSize = 32768`-byte batches
-(`src/Http2.Connection.pas:28`). Because the credit is issued on frame
+`TConnection.TrackReceivedData` credits the connection window and the
+per-stream window as each DATA frame arrives, and emits `WINDOW_UPDATE` in
+`cWindowUpdateBatchSize = 32768`-byte batches. Because the credit is issued on frame
 arrival rather than on consumption, a draining SSE reader keeps the window
 open and the stream does not stall.
 
-The bound to state and test: the peer may have at most one batch of
+The bound: the peer may have at most one batch of
 unacknowledged bytes in flight per window before a `WINDOW_UPDATE` is due,
 and the lease's `FBodyPending` holds at most the frames the parser has not
-consumed yet. A **slow-consumer test** must assert the cadence: feed a large
-SSE body while reading slowly and confirm `WINDOW_UPDATE` still flows and the
-stream never deadlocks.
+consumed yet. A slow-consumer test asserts the cadence: it feeds a large SSE body while
+reading slowly and confirms `WINDOW_UPDATE` still flows and the stream never
+deadlocks.
 
 ## Connection lifetime and pool interaction
 
 - An open SSE lease counts as **one active stream**. The pool's idle reaper
-  skips a connection with `ActiveStreams > 0`
-  (`src/Http2.Client.pas:2075`), so an SSE stream is never reaped while it
+  skips a connection with `ActiveStreams > 0`, so an SSE stream is never reaped while it
   is open — correct, but it also means the stream **occupies one slot of
   `MaxStreamsPerConnection` for its whole life**, which can be hours.
 - Over **HTTP/2** that is one stream among many; the connection is shared.
@@ -292,15 +272,15 @@ stream never deadlocks.
   and gracefully closes connections (GOAWAY); the SSE read then fails with
   `EHttpConnectionClosed`. The source surfaces that as a terminal error
   (or, when the reconnect loop is enabled and the failure is transient, as a
-  reconnect trigger — see the open item).
+  reconnect trigger — see "Reconnection and resume").
 
 ## Content coding
 
-SSE is incompatible with transparent content decoding as implemented.
+SSE is incompatible with transparent content decoding.
 
 `WithAcceptEncoding` (see [[messages]]) sets `accept-encoding`; a response
 that answers with gzip or deflate is wrapped by `WrapDecodingResponse`
-(`src/Http2.Client.pas:1640`) so `Body` yields plain bytes. That wrapper
+so `Body` yields plain bytes. That wrapper
 **buffers to the coding's footer** before it can emit anything, which
 destroys the defining property of SSE — each event becomes readable only at
 stream end, at which point events are no longer "server-sent" in real time.
@@ -326,7 +306,7 @@ id.
 - an **echoed `last-event-id`** taken from the parser's `LastEventId`
   ('' means send nothing);
 - a **bounded retry count** mirroring the redirect idiom: `MaxRetries`
-  (default `10`, `0` = reconnect forever), exceeding which raises a new
+  (default `10`, `0` = reconnect forever), exceeding which raises
   `EHttpTooManySseRetries` (mirroring `EHttpTooManyRedirects` in
   [[errors-redirects]]);
 - a **replay guard**: events are dispatched at most once per observed id, so
@@ -377,7 +357,7 @@ type
   TSseReconnectLoop = class
   public
     /// NO observer argument: IHttp2Observer is frame/stream level, so one
-    /// event per message would be high-cardinality (open item 2)
+    /// event per message would be high-cardinality
     constructor Create(const AClient: IHttpClient;
       const ARequest: THttpRequest;
       const AMaxRetries: Integer = cSseDefaultMaxRetries);
@@ -397,11 +377,9 @@ Two consumption styles, matching the two the library already has:
 
 - **Pull** — `ReadEvent` blocks until an event or the stream end; the
   caller's thread loops. This is the primitive.
-- **Push** — not shipped. The design left open whether the source should
-  emit an observer event per parsed event; the implementation does not, so
-  "push" means a caller-owned thread that wraps `ReadEvent` (for a UI or a
-  queue). A callback channel is a possible later addition, not a second
-  parser.
+- **Push** — not provided. The source emits no observer event per parsed
+  event, so "push" means a caller-owned thread that wraps `ReadEvent` (for a
+  UI or a queue).
 
 `TSseSource` reads `IHttpResponse.Body` in chunks, feeds
 `TSseEventParser`, and buffers completed events in a bounded queue so a
@@ -411,8 +389,8 @@ ends the source cleanly; `EHttpStreamError` mid-body surfaces from
 
 ## Error model
 
-SSE reuses the existing hierarchy ([[errors-redirects]]); no new exception
-types except the retry bound:
+SSE reuses the exception hierarchy of [[errors-redirects]], with one
+SSE-specific type for the retry bound:
 
 | Condition | Error |
 | --- | --- |
@@ -421,27 +399,27 @@ types except the retry bound:
 | Idle body read past `BodyReadTimeoutMs` | `EHttpTimeout` |
 | Peer `RST_STREAM` / connection loss | `EHttpStreamError` / `EHttpConnectionError` |
 | Caller `Cancel` during a blocked read | `EHttpStreamError` (`ecCancel`) |
-| `MaxRetries` exceeded | `EHttpTooManySseRetries` (new) |
+| `MaxRetries` exceeded | `EHttpTooManySseRetries` |
 
 ## Unit layout
 
-| Unit | Status | Content |
-| --- | --- | --- |
-| `src/Http2.Sse.pas` | **new** | `TSseEvent`, `TSseEventParser`, `IHttpSseSource`, `TSseSource`, `TSseReconnectLoop`, `SseRequest` |
-| `src/Http2.Stream.pas` | extended | body read timeout + read-side cancellation |
-| `src/Http2.Client.pas` | extended | `WithSseReadTimeout` request setter; thread the token and the body deadline to the lease's body read |
-| `src/Http2.Headers.pas` | extended | `HeaderLastEventId` constant |
-| `src/Http2.pas` | extended | re-export `Http2.Sse` |
-| `test/Http2.Sse.Test.pas` | **new** | parser, validation, source, reconnect |
-| `examples/sse_stream.pas` | **new** | runnable demo against the test server |
-| `tools/validate/sse_server.py` | **new** | a minimal live SSE server for interop (see "Testing") |
+| Unit | Content |
+| --- | --- |
+| `src/Http2.Sse.pas` | `TSseEvent`, `TSseEventParser`, `IHttpSseSource`, `TSseSource`, `TSseReconnectLoop`, `SseRequest` |
+| `src/Http2.Stream.pas` | body read timeout + read-side cancellation |
+| `src/Http2.Client.pas` | `WithSseReadTimeout` request setter; threads the token and the body deadline to the lease's body read |
+| `src/Http2.Headers.pas` | `HeaderLastEventId` constant |
+| `src/Http2.pas` | re-exports `Http2.Sse` |
+| `test/Http2.Sse.Test.pas` | parser, validation, source, reconnect |
+| `examples/sse_stream.pas` | runnable demo against the test server |
+| `tools/validate/sse_server.py` | a minimal live SSE server for interop (see "Testing") |
 
 `Http2.Sse` joins the umbrella because, unlike `Http2.Readers`, it needs no
 `fcl-json`/`fcl-xml` dependency.
 
 ## Testing
 
-- **Parser unit tests** are the heart of this. Feed the WHATWG example byte
+- **Parser unit tests** are the core. They feed the WHATWG example byte
   stream, then re-feed it **sliced at every offset** (all chunk boundaries,
   including splits inside a CRLF, inside a field name, inside a value, and
   across a multi-byte UTF-8 sequence) and assert an identical event
@@ -465,24 +443,23 @@ types except the retry bound:
   example and one integration test consume it. This mirrors the opt-in
   integration gate in [[testing-observability]].
 
-## Resolved items
+## Design decisions
 
-These were open when the note was written and are settled in the shipped
-code (also indexed in [[open-questions]]).
+These choices are also indexed in [[open-questions]].
 
-1. **Reconnect after a transient GOAWAY.** Settled: the reconnect policy
-   lives in `TSseReconnectLoop`, not in the transport. It reconnects after
-   any clean end of stream or transient failure unless the caller closes it;
-   a protocol error (non-200, wrong content-type, non-identity coding) is
-   terminal and propagates. `EHttpTooManySseRetries` bounds the reconnects
-   (`AMaxRetries = 0` retries forever).
-2. **Observer cardinality for events.** Settled: SSE emits no per-event
-   observer event. `IHttp2Observer` stays frame/stream-level; per-message
-   observability belongs to the caller's own callback, because a chatty
-   stream would be high-cardinality noise.
-3. **SSE over the HTTP/1.1 fallback.** Settled: supported but best-effort,
-   not rejected. Liveness is bounded by the socket read timeout
-   (`THttp1Connection.Create` sets `FSocket.ReadTimeoutMs := ATimeoutMs`,
-   `src/Http2.Http1.pas:906`) and `THttp1BodyStream.Read` has no cancel path,
-   so an idle fallback stream cannot wait indefinitely and a blocked read
-   cannot be cancelled. HTTP/2 has no such limit.
+1. **Reconnect policy.** It lives in `TSseReconnectLoop`, not in the
+   transport. The loop reconnects after any clean end of stream or transient
+   failure unless the caller closes it; a protocol error (non-200, wrong
+   content-type, non-identity coding) is terminal and propagates.
+   `EHttpTooManySseRetries` bounds the reconnects (`AMaxRetries = 0` retries
+   forever).
+2. **Observer cardinality.** SSE emits no per-event observer event.
+   `IHttp2Observer` stays frame/stream-level; per-message observability
+   belongs to the caller's own callback, because a chatty stream would be
+   high-cardinality noise.
+3. **SSE over the HTTP/1.1 fallback.** Supported but best-effort, not
+   rejected. Liveness is bounded by the socket read timeout
+   (`THttp1Connection.Create` sets `FSocket.ReadTimeoutMs := ATimeoutMs`) and
+   `THttp1BodyStream.Read` has no cancel path, so an idle fallback stream
+   cannot wait indefinitely and a blocked read cannot be cancelled. HTTP/2
+   has no such limit.

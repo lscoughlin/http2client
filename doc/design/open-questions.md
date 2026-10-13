@@ -16,21 +16,20 @@ related:
   - "[[fallback]]"
   - "[[proxy]]"
   - "[[errors-redirects]]"
-updated: 2026-10-09
+updated: 2026-10-13
 ---
 
 # Open Questions
 
-Single source of truth for **unresolved** decisions. An item leaves this file
-when the shipped code settles it; the decision then lives in the note that
-owns the area (see "Settled decisions" for where each one went). Do not
-restate a settled decision here.
+Single source of truth for **unresolved** decisions. A settled decision lives
+in the note that owns the area (see "Settled decisions" for where each one
+is recorded) and is not restated here.
 
 ## Open
 
 1. The observer has no cleartext-warning event, so the security rule "log
-   one warning per cleartext origin" is not implemented — a cleartext
-   request is currently silent. See [[fallback]] and
+   one warning per cleartext origin" is not implemented, so a cleartext
+   request is silent. See [[fallback]] and
    [[testing-observability]].
 
 ## Settled decisions
@@ -43,7 +42,7 @@ Recorded in the owning note; listed here only as a lookup index.
 | Proxy: `CONNECT` tunnel only, no forwarding; `:authority`/`:scheme` unchanged | [[transport]], [[proxy]] |
 | Proxy: no forwarding mode; `socks5` / `socks5h` (RFC 1928, 1929) and `https://` proxies are supported, SOCKS4 is not | [[proxy]] |
 | Proxy route is chosen per request; selector > `WithProxy` > `WithAllProxy` > environment (`http_proxy`/`https_proxy`, then `all_proxy`); loopback always connects directly | [[proxy]] |
-| HTTP/1.1 fallback implemented, off by default (`WithHttp1Fallback`) | [[fallback]] |
+| HTTP/1.1 fallback is off by default (`WithHttp1Fallback`) | [[fallback]] |
 | Transparent retry: idempotent (no body writer) + `ecRefusedStream`/GOAWAY only | [[transport]] |
 | `ftPriority` is parsed but never sent | [[protocol]] |
 | Reader is a generic class `TResponseReader<T>` on FPC 3.2.4 | [[messages]], [[fpc-runtime]] |

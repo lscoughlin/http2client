@@ -15,7 +15,7 @@ related:
   - "[[fallback]]"
   - "[[proxy]]"
   - "[[open-questions]]"
-updated: 2026-10-08
+updated: 2026-10-13
 ---
 
 # Transport, Threads & Connection Lifecycle
@@ -33,7 +33,7 @@ Free Pascal 3.2.4 primitives (all choices below are probe-verified; see
   `TQueue<T>` (unit `Generics.Collections`), a `TCriticalSection`, and two
   `RTLEvent`s. `probe12.pas` compiles and runs it (a consumer thread drains
   100 items; sum = 5050), including a `Shutdown` that releases blocked
-  waiters. **It must be saved and restored as an interface**
+  waiters. **It is held as an interface**
   (`IBlockingQueue<T>`) so a thread and a caller can share one queue by
   refcount rather than by raw pointer.
 - `TCriticalSection` (unit `SyncObjs`) — the pool guard, and per-connection
@@ -46,7 +46,7 @@ Free Pascal 3.2.4 primitives (all choices below are probe-verified; see
   works (probe7).
 - `{$IFDEF UNIX}cthreads,{$ENDIF}` must precede threaded units in any
   program's `uses`; otherwise: `This binary has no thread support compiled
-  in ... Runtime error 232` (probe12 first run).
+  in ... Runtime error 232`.
 
 ```pascal
 {$mode delphi}
@@ -189,7 +189,7 @@ known safe.
 **Reconnect policy**: transparent retry on connection failure only for
 idempotent methods (no body writer), and only on `ecRefusedStream` or a
 `GOAWAY` that puts the stream above the last-stream-id; bounded by
-`cMaxTransparentRetries`. There is no per-request opt-in. See [[transport]].
+`cMaxTransparentRetries`. There is no per-request opt-in.
 
 ## TLS and ALPN
 
@@ -197,14 +197,14 @@ idempotent methods (no body writer), and only on `ecRefusedStream` or a
 - ALPN must offer `h2`. If the server does not select `h2`, the client
   raises `EHttpProtocolError` by default. It does not fall back to HTTP/1.1
   without the caller's consent. `NPN` is not required.
-- **In scope since 2026-10-06:** cleartext `h2c` (prior knowledge and
-  upgrade), cleartext HTTP/1.1 without a probe, and HTTP/1.1 fallback. Both are available when the caller enables
-  them. The default stays strict. See [[fallback]].
+- Cleartext `h2c` (prior knowledge and upgrade), cleartext HTTP/1.1 without
+  a probe, and HTTP/1.1 fallback are available when the caller enables them.
+  The default stays strict. See [[fallback]].
 - Certificate validation/trust configuration is a factory concern (hostname
   verification on by default).
 - Proxy: when a request is routed through a proxy (`WithProxy`, the proxy
   environment variables or an `IProxySelector`; see [[proxy]], including the
-  SOCKS5 variant), negotiate TLS/`h2` over a caller-supplied
+  SOCKS5 variant), TLS/`h2` is negotiated over a caller-supplied
   forward proxy via an HTTP `CONNECT` tunnel to the origin. The TCP
   connection goes to the proxy; the `CONNECT` is negotiated on the plain
   socket before TLS, so SNI, certificate verification and ALPN still target

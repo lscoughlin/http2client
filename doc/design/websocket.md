@@ -20,7 +20,7 @@ related:
   - "[[testing-observability]]"
   - "[[open-questions]]"
   - "[[toolchain]]"
-updated: 2026-10-12
+updated: 2026-10-13
 ---
 
 # WebSocket
@@ -69,7 +69,7 @@ begin
 | `IWebSocket` | the open conversation |
 | `TWebSocketRequest` | the request implementation: `Create(url, listener)` |
 
-`IHttpClient` gains an overload, `Send(const ARequest: IWebSocketRequest):
+`IHttpClient` has an overload, `Send(const ARequest: IWebSocketRequest):
 IWebSocket`. A class that implements `IHttpClient` itself has to add that
 method.
 

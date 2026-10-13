@@ -12,7 +12,7 @@ related:
   - "[[transport]]"
   - "[[messages]]"
   - "[[open-questions]]"
-updated: 2026-10-08
+updated: 2026-10-13
 ---
 
 # Protocol Layer
@@ -220,8 +220,9 @@ Rules:
   waits for `WINDOW_UPDATE`. This turns a slow reader into backpressure on
   `IBodyWriter` rather than unbounded buffering.
 - Receiving DATA consumes local windows; the client sends `WINDOW_UPDATE`
-  (connection and stream) as `Read` consumes bytes, so a slow consumer
-  throttles the peer.
+  (connection and stream) as DATA arrives, in batches (see
+  "Implementation note"), so the peer's windows stay open while a reader
+  drains.
 - `WINDOW_UPDATE` is batched: credit is returned once
   `TWindow.NeedsUpdate(Threshold)` is true, so small reads do not emit one
   frame per call.
@@ -244,20 +245,13 @@ flowchart TB
   end
 ```
 
-### Implementation note (S12 validation finding)
+### Implementation note
 
-`TFlowControl` was implemented and unit-tested but initially wired into
-**nothing** — `TWindow` existed but returned no credit: `TConnection`
-received DATA without ever returning window
-
-credit, so a body larger than the advertised 65535-byte window stalled once
-the peer's window hit zero — nghttpd simply stopped sending and the read
-raised `EHttpTimeout` (`timed out reading response body`). Interop case A.7
-(a 100 000-byte response) reproduces it.
-
-The connection layer now drives `TFlowControl`: `TrackReceivedData` accrues
+The connection layer drives `TFlowControl`: `TrackReceivedData` accrues
 receive credit on every inbound DATA frame, and `SendWindowUpdate` posts a
 WINDOW_UPDATE — connection level on stream 0, stream level on the lease's
 stream — once `cWindowUpdateBatchSize` (32768) bytes have accrued;
 `UnregisterStream` flushes the remainder. `ApplyPeerSettingsValue` adjusts
-every open stream by the `SETTINGS_INITIAL_WINDOW_SIZE` delta.
+every open stream by the `SETTINGS_INITIAL_WINDOW_SIZE` delta. Returning
+credit on arrival keeps a body larger than the advertised 65535-byte window
+flowing; interop case A.7 (a 100 000-byte response) exercises it.

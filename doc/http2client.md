@@ -7,27 +7,25 @@ tags:
   - design
   - moc
 status: done
-updated: 2026-10-09
+updated: 2026-10-13
 ---
 
 # HTTP/2 Client
 
-Design an Object Pascal HTTP/2 client.
+An Object Pascal HTTP/2 client.
 
 Target: **Free Pascal 3.2.4** (`{$mode delphi}`), advanced records +
 interfaces. Language claims are verified against FPC 3.2.4 — see
 [[fpc-runtime]] and the re-runnable probes under
 [`reference/fpc-verified/`](reference/fpc-verified/README.md).
 
-## Design model (resolved)
+## Design model
 
 A **lease is one HTTP/2 stream, not one TCP connection**. A single
 connection multiplexes many concurrent streams. `MaxConnectionsPerHost` caps
 concurrent **TCP connections to one authority** and `MaxTotalConnections` caps
 them **across all authorities**; `MaxStreamsPerConnection` (and the peer's
-`SETTINGS_MAX_CONCURRENT_STREAMS`) caps **concurrent requests**. This
-resolves the contradiction in the original sketch and the rest of the
-design depends on it. Details in [[architecture]].
+`SETTINGS_MAX_CONCURRENT_STREAMS`) caps **concurrent requests**. The rest of the design depends on this model. Details in [[architecture]].
 
 ```mermaid
 flowchart TB
@@ -61,7 +59,7 @@ flowchart TB
 
 | Note | Covers |
 | --- | --- |
-| [[validation]] | the S12 validation record: what is gate, what is oracle, the commands, and the results |
+| [[validation]] | the validation record: what is gate, what is oracle, the commands, and the results |
 | [[toolchain]] | locked, externally verified tool and library revisions |
 
 ## Quick start

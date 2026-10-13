@@ -106,7 +106,7 @@ Every test must pass. The task returns a non-zero exit code when a test fails.
 
 ## Validate
 
-The validation suite has four levels, plus two opt-in live gates. Each level
+The validation suite has four levels, plus four opt-in live gates. Each level
 has its own task.
 
 | Task | What it checks | Time |
@@ -190,7 +190,7 @@ Then the script compares the two outcomes. The verdicts are:
 
 The gate passes when there are zero WORSE rows.
 
-The last full sweep (2026-10-08) gave this result:
+The recorded full sweep gives this result:
 
 | Verdict | Count |
 |---|---|
@@ -203,9 +203,9 @@ The last full sweep (2026-10-08) gave this result:
 `PASS = MATCH + BETTER = 70; FAIL = WORSE = 0`.
 
 This is a **representative snapshot**, not a reproducible constant: individual
-rows move between runs within a few load-sensitive families, and the client's
-own fixes moved some of them (e.g. `8.1.2.2/2` went from `success` to
-`stream-error` once response `te` validation landed). What is stable is the
+rows move between runs within a few load-sensitive families, and they depend on
+the client's own validation (e.g. `8.1.2.2/2` is `stream-error` because the
+client validates response `te`). What is stable is the
 strictness level — **WORSE = 0** whenever the sweep runs alone.
 
 The script writes the table to `bin/validation-results.md`; the raw per-id
@@ -347,7 +347,7 @@ descendant (arrays, numbers, strings). A body that does not parse raises
 
 ## Examples
 
-The `examples/` directory has seven small programs. Build them all with:
+The `examples/` directory has eight small programs. Build them all with:
 
 ```sh
 make examples      # or: task examples
@@ -384,7 +384,7 @@ bin/websocket_echo ws://127.0.0.1:8601/echo hello   # tools/validate/ws_servers.
 | Path | Content |
 |---|---|
 | `src/` | The library units. |
-| `examples/` | Seven small, runnable programs. See [Examples](#examples). |
+| `examples/` | Eight small, runnable programs. See [Examples](#examples). |
 | `test/` | The unit suite, the mock socket, and the `h2probe` CLI. |
 | `tools/validate/` | The interop, sanity, and harness scripts. |
 | `bin/` | The build output. |
@@ -456,7 +456,7 @@ and to the raw sweep log at `[[harness-log]]`.
   claim depends on it.
 - `h2spec` is a server test tool. It does not apply to this client.
 - The cleartext warning is not wired to the observer: `IHttp2Observer` has
-  no cleartext event, so a cleartext request is currently silent. Tracked in
+  no cleartext event, so a cleartext request is silent. See
   `doc/design/open-questions.md` and `doc/design/fallback.md`.
 - Server-Sent Events are full-featured over HTTP/2. Over the HTTP/1.1
   fallback they are best-effort: an idle stream is bounded by the socket

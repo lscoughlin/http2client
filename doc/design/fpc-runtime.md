@@ -11,7 +11,7 @@ up: "[[http2client]]"
 related:
   - "[[architecture]]"
   - "[[transport]]"
-updated: 2026-10-08
+updated: 2026-10-13
 ---
 
 # FPC Runtime & Memory Model
@@ -62,9 +62,8 @@ Without `cthreads` the binary aborts at runtime with
 
 ## Verified Free Pascal facts
 
-These were compiled and run against the actual toolchain
-(`fpc 3.2.4`, `ppca64`, macOS/aarch64), and they contradict some of the
-prose in the original sketch. They drive the choices in this design.
+These facts are compiled and run against the actual toolchain
+(`fpc 3.2.4`, `ppca64`, macOS/aarch64). They drive the choices in this design.
 
 | Design assumption | FPC 3.2.4 result | Consequence |
 |---|---|---|
@@ -84,7 +83,7 @@ prose in the original sketch. They drive the choices in this design.
 Probe sources are preserved in
 [`reference/fpc-verified/`](../reference/fpc-verified/README.md) (see its
 README for the exact reproduce commands and expected pass/fail behavior),
-and were compiled with `fpc -O2`. The document's own API surface
+and are compiled with `fpc -O2`. The document's own API surface
 (`Http2.Client.pas` + `testclient.pas`) also compiles and runs there.
 
 ## Memory model and ARC in FPC

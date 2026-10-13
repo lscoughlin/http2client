@@ -12,7 +12,7 @@ related:
   - "[[architecture]]"
   - "[[protocol]]"
   - "[[transport]]"
-updated: 2026-10-08
+updated: 2026-10-13
 ---
 
 # Testing & Observability
@@ -139,8 +139,8 @@ The opt-in live gate (`task validate:websocket`) starts
 `tools/validate/ws_servers.py` and the proxy servers of `proxy_servers.py`,
 runs `Http2.WebSocketLive.Test` over `ws` and `wss`, directly and through an
 HTTP `CONNECT` proxy, an `https://` proxy and a SOCKS5 proxy, and then reads
-the servers' logs: every client frame carried the mask bit, the handshake
-headers were as required, the close codes and the route were as expected.
+the servers' logs: every client frame carries the mask bit, the handshake
+headers are as required, and the close codes and the route are as expected.
 `task validate:cleartext` runs a bodyless `GET`, `POST`, `DELETE` and `HEAD`
 under `ctUpgrade` and `ctHttp1` against `tools/validate/h1_counter_server.py`,
 an HTTP/1.1-only server that logs each request, and checks that each arrived

@@ -1,8 +1,6 @@
 ---
-title: "S12 — Validation against external suites"
-story-id: "12"
+title: "Validation against external suites"
 aliases:
-  - "S12"
   - "validation"
 tags:
   - http2client
@@ -10,29 +8,22 @@ tags:
   - validation
 status: validated
 up: "[[http2client]]"
-updated: 2026-10-09
+updated: 2026-10-13
 validation-results: "bin/validation-results.md"
 harness-log: "doc/verification/harness-run-full.log"
 ---
 
-> Story lineage: S12 closes the plan and was built on S10 and S11. The notes
-> for those earlier stories are not part of this repository. This record is
-> self-contained, so they are not required to read it.
-
-# S12 — Validation against external suites
+# Validation against external suites
 
 ## Goal
 
-Prove the compiler-built client against real HTTP/2 peers and RFC conformance
-harnesses. This story closes the plan: it decides what is gate, what is
-oracle, and what is legacy reference, and it records exact commands and
-results.
+The compiler-built client is proven against real HTTP/2 peers and RFC
+conformance harnesses. This record defines what is gate, what is oracle, and
+what is legacy reference, and it holds the exact commands and results.
 
 ## Why the suites are used this way
 
-The user named `http2/http2-test` and said "if reasonable" for the nghttp2
-work. Evidence changes how each is used — state this in the report, do not
-quietly substitute:
+Each suite is used according to what it can demonstrate:
 
 | Suite | Verdict | Reason |
 |---|---|---|
@@ -41,7 +32,7 @@ quietly substitute:
 | `http2/http2-test` | **Legacy reference + ported intents** | Draft-09 (`HTTP-draft-09/2.0`), plaintext `h2c`, 2014 deps (`http2 ~2.2.0`, `mocha ~1.15.1`) vs `node v26`; and the spec is TLS-only. Raw run is best-effort only. |
 | `h2spec` | **Optional appendix** | Server-conformance only; not applicable to a client. |
 
-## A. nghttpd interop (first real green)
+## A. nghttpd interop
 
 ```sh
 export OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib
@@ -66,14 +57,14 @@ cert**. `INTEROP_HTDOCS` (default `/tmp/nghttpd-root`) holds `index.html`
 | A.7 | Large response | flow-control `WINDOW_UPDATE` emitted, no stall |
 | A.8 | Server GOAWAY | in-flight streams above id retried/handled per policy |
 | A.9 | TLS ALPN | `SSL_get0_alpn_selected == h2`; an http/1.1-only server raises |
-| A.10 | h2c prior knowledge (S13) | a GET against `nghttpd --no-tls` returns `200` |
-| A.11 | h2c upgrade (S13) | a GET returns `101` then uses HTTP/2 |
-| A.12 | HTTP/1.1 fallback (S13) | a GET against an HTTP/1.1 server returns `200` |
-| A.13 | strict mode (S13) | a cleartext request raises `EHttpProtocolError` |
+| A.10 | h2c prior knowledge | a GET against `nghttpd --no-tls` returns `200` |
+| A.11 | h2c upgrade | a GET returns `101` then uses HTTP/2 |
+| A.12 | HTTP/1.1 fallback | a GET against an HTTP/1.1 server returns `200` |
+| A.13 | strict mode | a cleartext request raises `EHttpProtocolError` |
 
 Acceptance command: `make validate-interop` (wraps the above) exits 0.
 
-The S13 cases (A.10–A.13) need two cleartext servers, which `nghttpd`
+The cleartext cases (A.10–A.13) need two cleartext servers, which `nghttpd`
 cannot provide for the upgrade: `nghttpd` is HTTP/2-only, so it cannot
 answer an HTTP/1.1 `Upgrade` request. The script starts
 `httpd:2.4` (Apache, `mod_http2`) under docker instead. One container runs
@@ -89,28 +80,26 @@ false pass. A.10 uses the existing `nghttpd --no-tls` server on
 `INTEROP_PLAIN_PORT` (default 18480). When docker is unavailable, A.11 and
 A.12 report SKIP with that reason.
 
-**Result (2026-10-08): `PASS=13 FAIL=0 SKIP=1` → `RESULT: interop gate GREEN`.**
-A.1–A.7 and A.9–A.13 PASS; **A.8 is SKIP**. The S13 cases A.10–A.13
-(h2c prior knowledge, h2c upgrade, HTTP/1.1 fallback, strict-mode reject)
-were added after the first green; A.3 was closed by adding a
-`--body-writer` mode to `test/h2probe.pas` (`TChunkWriter`, 7-byte chunks)
-and a matching `run_probe ... --body-writer=...` case in `interop.sh`. A.7
-exposed and fixed a real client bug — see the S12 note below. A.8 has no
-nghttpd trigger to force a mid-flight GOAWAY; the same semantics are covered
-by unit tests (`TStreamLease.OnConnectionGoAway` sets
+**Result (verified 2026-10-08): `PASS=13 FAIL=0 SKIP=1` → `RESULT: interop gate GREEN`.**
+A.1–A.7 and A.9–A.13 PASS; **A.8 is SKIP**. A.3 runs through the
+`--body-writer` mode of `test/h2probe.pas` (`TChunkWriter`, 7-byte chunks) and
+a matching `run_probe ... --body-writer=...` case in `interop.sh`. A.7
+covers flow control: the connection layer returns window credit through
+`TFlowControl` (see the A.7 note below). A.8 has no nghttpd trigger to force a
+mid-flight GOAWAY; the same semantics are covered by unit tests
+(`TStreamLease.OnConnectionGoAway` sets
 `FRetryable := FStreamId > ALastStreamId`; `TestGoAwayNotifiesEveryStream`
 in `test/Http2.ConnectionLifecycle.Test.pas`).
 
 The cleartext and fallback paths these cases exercise are described in
 [[fallback]] (`src/Http2.Http1.pas`, `src/Http2.Client.pas`).
 
-**A.7 found a real bug: flow control was never wired.** `TFlowControl` was
-implemented and unit-tested but referenced by no runtime code, so the client
-never returned window credit after receiving DATA; a 100 KB response stalled
-at the 65535-byte initial window with `EHttpTimeout`. The fix lives in
+**A.7 and flow control.** `TFlowControl` is wired into the runtime: the
+connection returns window credit after receiving DATA, so a 100 KB response
+does not stall at the 65535-byte initial window. The logic lives in
 `src/Http2.Connection.pas` (`TrackReceivedData` / `SendWindowUpdate`, batched
 at `cWindowUpdateBatchSize = 32768`) and is documented in
-`doc/design/protocol.md` under "Implementation note (S12 validation finding)".
+`doc/design/protocol.md`.
 
 ## B. h2-client-test-harness (primary conformance)
 
@@ -157,8 +146,8 @@ so the case cannot be scored either way.
 
 ## C. http2/http2-test (ported intents)
 
-Port the **client** case intents into mock-socket unit tests (they map
-directly onto S11 scripts). Record the draft-09 divergences.
+The **client** case intents are ported into mock-socket unit tests. The
+draft-09 divergences are recorded below.
 
 | ID | Upstream case | Ported to |
 |---|---|---|
@@ -168,7 +157,7 @@ directly onto S11 scripts). Record the draft-09 divergences.
 | C.4 | `stream/data-when-*` / `rst-stream` | `test/Http2.Stream.Test.pas` — `TestRstMidBodySurfacesFromRead`, `TestReadAfterEofRaises`, `TestCleanupHappensExactlyOnce`; `test/Http2.ConnectionLifecycle.Test.pas` |
 | C.5 | `window-update-when-*` | `test/Http2.FlowControl.Test.pas` — `TestZeroIncrementUpdateRaisesProtocolError`, `TestUpdateOverflowRaisesFlowControlError`, `TestApplyUpdateAppliesDelta`, `TestInitialWindowDeltaAdjustsEveryOpenStream` |
 
-Intents verified present by grep on 2026-10-05 (C.1–C.5); each maps a
+Intents C.1–C.5 are present in the tests named; each maps a
 draft-09 client intent onto the equivalent RFC 7540/7541 unit test. The
 draft-09 wire details differ (different preface/ALPN, no mandatory TLS), so
 the *intent* is ported, not the bytes.
@@ -197,7 +186,7 @@ nghttp -nv --no-verify-peer https://127.0.0.1:18443/
 ```
 
 Both run against the same command line (`nghttpd -d /tmp/oracle-root 18443
-localhost.key localhost.crt`, `index.html` = 38 bytes) on 2026-10-05.
+localhost.key localhost.crt`, `index.html` = 38 bytes); verified 2026-10-05.
 
 | ID | Case | Result |
 |---|---|---|
@@ -208,14 +197,14 @@ localhost.key localhost.crt`, `index.html` = 38 bytes) on 2026-10-05.
 Note: `--trace-frames` is a probe-only diagnostic (`TFrameTraceObserver` in
 `test/h2probe.pas`); it is not part of the shipped client API.
 
-## Report (written to this file)
+## Report
 
-Record: toolchain versions, harness revision/image digest, the B results
-table, A command output summary, C port list, E comparison notes, and every
-skip with its reason. Update the `status:` front matter to `validated` only
-when A and B are green.
+This file records the toolchain versions, the harness revision and image
+digest, the B results table, the A command output summary, the C port list,
+the E comparison notes, and every skip with its reason. The `status:` front
+matter is `validated` while A and B are green.
 
-### Toolchain and suite revisions (2026-10-05)
+### Toolchain and suite revisions
 
 | Component | Version / revision |
 |---|---|
@@ -225,8 +214,7 @@ when A and B are green.
 | `h2-client-test-harness` image | `h2-test-harness`, digest `sha256:745149517ede…` |
 | `third_party/h2-client-test-harness` | git `0bc075c` |
 | Container runtime | Rancher Desktop `docker` (`~/.rd/bin/docker`) |
-| Unit suite (2026-10-05, at that revision) | 292 tests, 0 errors, 0 failures |
-| Unit suite (current) | 648 tests, 0 errors, 0 failures |
+| Unit suite | 648 tests, 0 errors, 0 failures |
 | Library units | 20 in `src/` (19 core + optional `Http2.Readers`) |
 | Example programs | 8 in `examples/` (`make examples`) |
 
@@ -253,7 +241,8 @@ header. A client that redials after a declined upgrade logs each request
 twice and fails this gate.
 
 Skips, each with its reason: **A.8** (no nghttpd GOAWAY trigger; covered by
-unit tests), **C.6** (draft-09 plaintext `h2c`; client is TLS-only), **D**
+unit tests), **C.6** (draft-09 plaintext `h2c`; the client implements the
+RFC 7540 cleartext paths, not the draft-09 dialect), **D**
 (h2spec is server-conformance only). No conformance claim rests on the
 draft-09 suite.
 
@@ -305,9 +294,8 @@ connection (`third_party/h2-client-test-harness/main.go`, single
 (`--keep-open-ms=200`), so the next container's host-forwarded port 8080 can
 receive that lingering socket and its one `Accept()` is consumed before the
 case's own frames are read — the client then sees a dead/idle peer and reports
-`success` or `conn-error` instead of the declared stream error. We did not
-change `--keep-open-ms` or the harness: both are load-bearing for other
-verdicts. Treat the sweep as a survey and per-id isolation as the tiebreaker.
+`success` or `conn-error` instead of the declared stream error. `--keep-open-ms` and the harness are left unchanged: both are
+load-bearing for other verdicts. Treat the sweep as a survey and per-id isolation as the tiebreaker.
 
 **Scoring rule.** The expected outcome class for every id is *declared* by the
 harness's own verifier sources, extracted by `tools/validate/extract_expectations.py`
@@ -345,38 +333,32 @@ the PING, and reporting `connection closed while reading frame header`
 HARNESS_IDS="4.1/1" bash tools/validate/harness.sh
 ```
 
-**A masked timeout found a real defect.** The sweep recorded `6.9/2` as
-`ours=timeout` with `RESULT=conn-error class=EHttpTimeout code=INTERNAL_ERROR`:
-the harness cannot emit its zero-increment WINDOW_UPDATE (Go rejects it), so it
-sends a `HEADERS(200)` frame and drops the connection — our client's *body read*
-then blocked until its own deadline. `TStreamLease.ReadBody` raised
-`EHttpTimeout` unconditionally when `PopInbound` returned `false`, but the
-inbound queue also shuts down when the stream fails, so a dead connection was
-reported as a slow peer and the failure was hidden from the transparent-retry
-path. `WaitForResponseHeader` already re-checked `FFailed` in exactly this
-case; `ReadBody` did not. Fixed in `src/Http2.Stream.pas` (commit `9b79847`)
-with the regression test `TestBlockedBodyReadSurfacesConnectionFailure`. After
-the fix, `HARNESS_IDS="6.9/2"` reports `ours=conn-error` (a CLASS-DIFF against
-the declared `stream-error`).
+**Dead connection during a body read.** The sweep records `6.9/2` as
+`ours=conn-error` (a CLASS-DIFF against the declared `stream-error`). The
+harness cannot emit its zero-increment WINDOW_UPDATE (Go rejects it), so it
+sends a `HEADERS(200)` frame and drops the connection. `TStreamLease.ReadBody`
+distinguishes a stream failure from a slow peer: when `PopInbound` returns
+`false` it re-checks `FFailed`, as `WaitForResponseHeader` does, so a dead
+connection surfaces as a connection error and reaches the transparent-retry
+path rather than appearing as `EHttpTimeout`. The test
+`TestBlockedBodyReadSurfacesConnectionFailure` covers this in
+`src/Http2.Stream.pas`.
 
-**A second real defect: the response `te` header.** The sweep first recorded
-`8.1.2.2/2` as `ours=success`. RFC 9113 section 8.2.2 allows the `te` field in
+**Response `te` header.** RFC 9113 section 8.2.2 allows the `te` field in
 HTTP/2 only with the value `trailers`, and a response that carries any other
-value is malformed. The client already rejected the other
-connection-specific fields (`ForbiddenHeaders` in `src/Http2.Headers.pas`) but
-never constrained `te`'s value, so it accepted `te: trailers, deflate`. Fixed
-in `src/Http2.Stream.pas` (commit `14657d9`) with the regression test
-`TestResponseTeHeaderMustBeTrailers`; `8.1.2.2/2` now reports
-`ours=stream-error` (verdict BETTER — the reference verifier cannot resolve the
-case).
+value is malformed. The client rejects the other connection-specific fields
+(`ForbiddenHeaders` in `src/Http2.Headers.pas`) and constrains `te` to
+`trailers` in `src/Http2.Stream.pas`; the test
+`TestResponseTeHeaderMustBeTrailers` covers it. `8.1.2.2/2` reports
+`ours=stream-error` (verdict BETTER, because the reference verifier cannot
+resolve the case).
 
 **CLASS-DIFF = 13** — both sides produced an error, at different levels
 (connection vs stream). RFC 7540 / RFC 9113 map the stream-state rules in
 section 5.1 to explicit levels, so where our client is the stricter
 (connection) level we keep it: a stricter level never lets a broken stream
 corrupt connection state. **Exactly which ids fall in this bucket is not fixed
-across revisions or even across runs** (see the method note): the count we
-observed is 13, but membership moves within the families below, so the rows are
+across revisions or even across runs** (see the method note): the count observed is 13, but membership moves within the families below, so the rows are
 grouped by *family* with the reasoning, not pinned to a run.
 
 | id | declaration | ours | justification |
@@ -392,7 +374,7 @@ grouped by *family* with the reasoning, not pinned to a run.
 | `8.1.2.1/3` | stream-error | conn-error (`PROTOCOL_ERROR`) | A pseudo-header field in trailers. We reject while decoding; the harness declares stream scope. RFC 9113 permits either level here; we keep connection scope because the forbidden field corrupts the header block. |
 | `8.1.2.2/1` | stream-error | conn-error (`PROTOCOL_ERROR`) | A connection-specific header field (`connection`) in a response. Same reasoning as `8.1.2.1/3`. |
 | `6.4/2` | stream-error | conn-error (`PROTOCOL_ERROR`) | END_STREAM on a stream the harness never opened. Section 5.1 makes a frame on an idle stream a connection error; the case declares stream scope. We are stricter, per the RFC. |
-| `6.9/2` | stream-error | conn-error (`INTERNAL_ERROR`) | The harness cannot emit its zero-increment WINDOW_UPDATE (Go rejects it), so it sends HEADERS(200) and drops the connection; we report the dead connection. See the worked example above — this row is what exposed the masked-timeout defect. |
+| `6.9/2` | stream-error | conn-error (`INTERNAL_ERROR`) | The harness cannot emit its zero-increment WINDOW_UPDATE (Go rejects it), so it sends HEADERS(200) and drops the connection; we report the dead connection. See the dead-connection note above. |
 
 Every CLASS-DIFF is therefore one of: (a) our client is *stricter* and acting
 per the explicit RFC section (4.2/2, 5.1/5, 6.3/2, 6.1/2, 6.4/2, 8.1.2.6/1,
@@ -405,23 +387,20 @@ malformed input is silently accepted. The gate therefore holds: **no WORSE**,
 and every divergence is a deliberate, RFC-grounded level choice rather than an
 unhandled case.
 
-Note the set is not fixed across revisions. `6.4/2` (RST_STREAM on an idle
-stream) was a CLASS-DIFF in the 2026-10-06 archive and is a **MATCH** at HEAD
-(the flow-control routing fix `a422cfb` and the pool split `026971e` changed
-which level our client reports); conversely `5.1/5` and `8.1.2.6/1` are
-CLASS-DIFFs only because the 2026-10-08 sweep scored against the declared
-expectation for the first time, and `8.1.2.2/2` moved from `success` (missing
-validation) through CLASS-DIFF to **BETTER** once the `te` value check landed.
-Compare the `ours=` column, not the verdict, when auditing a revision. For
-`5.1/5` and `8.1.2.6/1` the sweep recorded `ref=fail/unresolved`, so those rows
-are *declaration-only* divergences: the reference never demonstrated the
-declared outcome, and the only reason they score CLASS-DIFF rather than UNKNOWN
-is the declared-expectation rule above.
+The set is not fixed across revisions. `6.4/2` (RST_STREAM on an idle
+stream) is a **MATCH** at HEAD; `5.1/5` and `8.1.2.6/1` are CLASS-DIFFs
+because the sweep scores against the declared expectation; `8.1.2.2/2` is
+**BETTER** because of the `te` value check. Compare the `ours=` column, not the
+verdict, when auditing a revision. For `5.1/5` and `8.1.2.6/1` the sweep
+records `ref=fail/unresolved`, so those rows are *declaration-only*
+divergences: the reference never demonstrated the declared outcome, and the
+only reason they score CLASS-DIFF rather than UNKNOWN is the declared-expectation
+rule above.
 
 ## Sanity checks (non-vacuity)
 
-Before trusting A or B, prove the probe can fail. `tools/validate/h2probe-sanity.sh`
-(also `task validate:sanity`, seconds) runs five conditions and asserts a
+The probe is shown able to fail before A or B is trusted. `tools/validate/h2probe-sanity.sh`
+(also `task validate:sanity`, a few seconds) runs five conditions and asserts a
 distinct exit code for each outcome class:
 
 | # | Condition | Expected |
@@ -445,26 +424,26 @@ EOF: our probe can legitimately report either a stream error (exit 3) or a
 connection error (exit 2), and the harness's own reference verifier expects the
 connection error (`verifier/cases/http2/5_1_stream_states.go`). It is an
 accepted divergence (see the `5.1/2` row above), not a deterministic
-stream-error oracle, and using it here made the check flaky (roughly 1 run in
+stream-error oracle, and using it would make the check flaky (roughly 1 run in
 3). The fabricated peer instead sends a valid 200 response HEADERS *then*
 RST_STREAM and holds the socket open, so exit 3 is unambiguous. Non-vacuity
 against that peer is verified by mutation: remove the RST_STREAM write and the
 check fails (`exit=2`, header timeout) as it must.
 
 Readiness for a **single-accept** server (the h2-test-harness, the fabricated
-peer, `openssl s_server`) must be gated on a **log line**, never on a TCP
+peer, `openssl s_server`) is gated on a **log line**, never on a TCP
 connect. These servers call `Accept()` exactly once and exit; a connect-based
 probe (`nc -z`, `wait_port`, `port_open`) *is* a connection and would consume
 that accept, so the following real run fails with a spurious `connect ...
-failed` or TLS-handshake error. This is not theoretical: adding a `wait_port`
-check to `wait_harness_ready` turned nearly the whole harness sweep from
+failed` or TLS-handshake error. A `wait_port`
+check in `wait_harness_ready` would turn nearly the whole harness sweep from
 `ours=stream-error` into a false `ours=conn-error`. The residual host-forwarder
 race (the container logs `listening on` a moment before the ssh-forwarded host
 port exists, ~1 run in 20) is handled by retrying a bounded number of times on
 that specific connect failure inside `run_ours`, which is safe because it does
 not pre-connect.
 
-Recorded result (2026-10-07): `PASS=5 FAIL=0`, stable over twenty consecutive
+Last recorded result (2026-10-07): `PASS=5 FAIL=0`, stable over twenty consecutive
 runs; the mutation above flips check 2 to `FAIL exit=2`. Negative control: with
 a server that never opens its port, the script reports `PASS=4 FAIL=1`, names
 the cause as infrastructure, and exits 1.

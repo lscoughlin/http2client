@@ -15,13 +15,13 @@ related:
   - "[[client-api]]"
   - "[[errors-redirects]]"
   - "[[open-questions]]"
-updated: 2026-10-12
+updated: 2026-10-13
 ---
 
 # Cleartext h2c and HTTP/1.1 Fallback
 
-This note brings cleartext HTTP/2 (`h2c`) and HTTP/1.1 fallback into scope.
-It replaces the earlier decision in [[transport]] that both are out of scope.
+This note describes cleartext HTTP/2 (`h2c`) and HTTP/1.1 fallback, which
+the client supports when the caller enables them.
 
 ## Scope
 
@@ -40,8 +40,8 @@ The default stays strict. The client uses `h2` over TLS only. Cleartext and
 HTTP/1.1 fallback are off until the caller enables them. See "Factory
 surface".
 
-All five modes are implemented and covered by tests and interop cases
-A.10–A.13; see "Implementation status".
+All five modes are covered by tests and interop cases A.10–A.13; see
+"Implementation status".
 
 WebSocket connections ([[websocket]]) sit outside these modes. They always
 speak HTTP/1.1 for the opening handshake and take no part in the fallback and
@@ -82,7 +82,7 @@ result for the origin. See [[client-api]] for lease acquisition.
    empty ALPN result means HTTP/1.1.
 7. If ALPN is `http/1.1` or empty and fallback is off, raise
    `EHttpProtocolError`. The message names the selected protocol. This
-   matches test A.9 and story 05.4.
+   matches test A.9.
 8. If ALPN names an unknown protocol, raise `EHttpProtocolError`.
 
 ### `http` origins
@@ -161,9 +161,9 @@ or sent `GOAWAY` for it, so the request was never processed, and the method is
 idempotent (see [[transport]]).
 
 
-Rule: the client must not send a later SETTINGS frame that conflicts with
-the `HTTP2-Settings` value. The client must apply the `HTTP2-Settings`
-value as its first SETTINGS frame.
+Rule: the client does not send a later SETTINGS frame that conflicts with
+the `HTTP2-Settings` value. The client applies the `HTTP2-Settings` value as
+its first SETTINGS frame.
 
 ## HTTP/1.1 codec
 
@@ -174,8 +174,8 @@ this scope:
 - Headers: one `Host` header is mandatory. Header names are
   case-insensitive on the wire.
 - Header-size limit: the request head, the response head, and accumulated
-  chunked trailers are each bounded by `cHttp1MaxHeaderBytes = 64 * 1024`
-  (`src/Http2.Http1.pas:33`); exceeding it raises `EHttpProtocolError`
+  chunked trailers are each bounded by `cHttp1MaxHeaderBytes = 64 * 1024`;
+  exceeding it raises `EHttpProtocolError`
   (`ecProtocolError`).
 - Body: `Content-Length` or `Transfer-Encoding: chunked`.
 - Response: status line, headers, and body. The body uses
@@ -189,7 +189,7 @@ this scope:
 HTTP/1.1 has no multiplexing. One connection carries one request at a time.
 For HTTP/1.1 origins the client sets the effective stream limit to 1. The
 pool opens more connections when it needs more concurrency, bounded by
-`MaxConnectionsPerHost` and `MaxTotalConnections` (doc/design/client-api.md).
+`MaxConnectionsPerHost` and `MaxTotalConnections` (see [[client-api]]).
 
 The codec reuses the public surface. `IHttpClient.Send` and
 `IHttpResponse` do not change. Redirects, timeouts, cancellation, and the
@@ -198,7 +198,7 @@ observer apply to HTTP/1.1 in the same way. See [[errors-redirects]] and
 
 ## Factory surface
 
-The factory stays a pure value record. Each method returns a new record.
+The factory is a pure value record. Each method returns a new record.
 See [[client-api]].
 
 ```pascal
@@ -213,11 +213,11 @@ type
 
   THttpClientFactory = record
   private
-    // ... existing fields ...
+    // ... other fields ...
     FHttp1Fallback: Boolean;
     FClearTextPolicy: TClearTextPolicy;
   public
-    // ... existing methods ...
+    // ... other methods ...
 
     /// allow HTTP/1.1 when the peer does not offer h2 (https origins)
     function WithHttp1Fallback(const AEnable: Boolean): THttpClientFactory;
@@ -269,20 +269,21 @@ Anyone on the network path can read and change the traffic.
 
 Rules:
 
-1. The default rejects all cleartext requests. The caller must opt in.
-2. The client must log one warning for each cleartext origin. The observer
-   carries this event. See [[testing-observability]].
-3. The client must not send a request that carries a secret unless the
-   caller set the cleartext policy on purpose.
-4. The client must not fall back from `h2` to HTTP/1.1 without the caller's
+1. The default rejects all cleartext requests. The caller opts in.
+2. The client sends a request that carries a secret over cleartext only when
+   the caller set the cleartext policy on purpose.
+3. The client does not fall back from `h2` to HTTP/1.1 without the caller's
    consent. A silent fallback can hide a downgrade attack.
+
+The observer has no cleartext-warning event, so a cleartext request produces
+no warning; see "Known gaps".
 
 `ctHttp1` is a cleartext policy like the other two. It gives no
 confidentiality and no integrity, and the caller opts in to it on purpose.
 
 ## Implementation status
 
-All of the above is implemented:
+The table maps each area to its code and acceptance check:
 
 | Area | Where | Acceptance |
 | --- | --- | --- |
@@ -296,7 +297,7 @@ All of the above is implemented:
 | pool keys and limits | `TConnectionPool` selection | stream limit is 1 for HTTP/1.1; origins keep scheme apart |
 | interop A.10–A.13 | `test/h2probe.pas`, `tools/validate/interop.sh` | part of the green interop gate |
 
-The `http2/http2-test` legacy suite is draft-09 plaintext `h2c`; the prior
+The `http2/http2-test` suite speaks draft-09 plaintext `h2c`; the prior
 knowledge path gives that suite a code path to exercise.
 
 ## Validation
@@ -318,13 +319,10 @@ HTTP/1.1-only server that logs each request it receives. Every request appears
 in the log once. Under `ctHttp1` none carries an `Upgrade` header; under
 `ctUpgrade` each carries the probe once.
 
-Current result: `interop: PASS=13 FAIL=0 SKIP=1` → `interop gate GREEN`
+Result: `interop: PASS=13 FAIL=0 SKIP=1` → `interop gate GREEN`
 (see [[validation]]).
 
-## Open items
+## Known gaps
 
-1. The observer needs one new event kind for a cleartext warning. The name
-   is open. The security rule "log one warning for each cleartext origin"
-   (below) is **not yet implemented** — `IHttp2Observer` has no cleartext
-   event, so a cleartext request is currently silent. See
-   [[testing-observability]] and [[open-questions]].
+1. The observer has no cleartext-warning event, so a cleartext request is
+   silent. See [[testing-observability]] and [[open-questions]].

@@ -13,21 +13,12 @@ related:
   - "[[proxy]]"
   - "[[messages]]"
   - "[[open-questions]]"
-updated: 2026-10-08
+updated: 2026-10-13
 ---
 
 # Client API
 
 ## HttpClientFactory
-
-> **Original sketch (superseded):** the factory was described only as
-> `HttpClientFactory.WithMaxConnections(max:int=4)`,
-> `.WithFollowRedirects(follow=true)`, `.WithProxy(host,port)`, `.Build()`,
-> with the note that "when 4 leases go out it creates a new connection".
-> That last clause is wrong under the resolved model — see
-> [[architecture]]. The connection cap was later split into a per-authority
-> cap and a pool-wide cap, because a high-concurrency client needs to bound
-> each host tightly while still allowing many hosts.
 
 ```pascal
 type
@@ -116,9 +107,10 @@ rather open a few connections than expose very wide multiplexing should lower
 `MaxConnectionsPerHost` in the `1`–`4` range, e.g. `WithMaxConnectionsPerHost(2)`
 with `WithMaxTotalConnections(128)`.
 
-`WithMaxConnections(max)` is retained as a compatibility shim: it sets **both**
-caps to `max`, which is the historic meaning for a single-authority pool.
-Prefer `WithMaxConnectionsPerHost` / `WithMaxTotalConnections`.
+`WithMaxConnections(max)` is a shorthand: it sets **both** caps to `max`,
+which suits a single-authority pool. `WithMaxConnectionsPerHost` and
+`WithMaxTotalConnections` set each cap separately; a high-concurrency client
+uses them to bound each host tightly while still allowing many hosts.
 
 `WithProxy(host, port)` routes every dial that the no-proxy list does not
 exempt through an HTTP `CONNECT` tunnel to `host:port`; the tunnel is

@@ -12,7 +12,7 @@ related:
   - "[[client-api]]"
   - "[[protocol]]"
   - "[[open-questions]]"
-updated: 2026-10-09
+updated: 2026-10-13
 ---
 
 # Messages
@@ -98,8 +98,7 @@ begin
 end;
 ```
 
-**Syntax note (verified).** The original
-`Read( reader: ResponseReader<T>, <T> value)` was pseudo-syntax. FPC 3.2.4
+**Syntax note (verified).** FPC 3.2.4
 **cannot parse a generic method under `{$mode objfpc}`** — the probe
 `probe.pas` fails with `Syntax error, ";" expected but "<" found`, and
 adding `{$modeswitch genericmethods}` (`probe10.pas`) does not help. Under
@@ -178,10 +177,9 @@ type
   map. That is deliberate, but it makes `WithHeader` on a copy mutate the
   original as well — so any code that adds a header to a request it did not
   build itself must call `Clone` first. `Clone` copies the record and deep
-  copies the header map (every repeated value preserved). This was found
-  live: `TSseReconnectLoop` echoed `last-event-id` onto its caller's request
-  through a plain copy, so a later reconnect would resume from a stale id
-  ([[server-sent-events]]).
+  copies the header map (every repeated value preserved). `TSseReconnectLoop`
+  clones its request before echoing `last-event-id`, so the caller's request
+  is never modified ([[server-sent-events]]).
 - Pseudo-header mapping happens at encode time (`THttpRequest.ToStreamRequest`):
   `:method` ← method token, `:scheme` ← the URL scheme (`'http'` or
   `'https'`), `:path` ← path+query (`'/'` when empty), `:authority` ←
@@ -301,7 +299,7 @@ The client offers no coding by default. A caller opts in with
 `accept-encoding` header. When the response names a coding the client
 understands, the body is decoded transparently: the response is wrapped so
 that `Body` yields plain bytes, and the `content-encoding` header (with a
-`content-length` that no longer counts) is removed. Every reader therefore
+`content-length` that would not match the decoded bytes) is removed. Every reader therefore
 sees plain bytes, whether it is `ReadText`, `ReadAllBodyBytes`, or a typed
 reader.
 
@@ -340,7 +338,7 @@ hand-rolled loop.
 
 **Optional readers (`Http2.Readers`).**
 
-This unit is *outside* the 14-unit core. It is the only unit with an
+This unit is *outside* the core. It is the only unit with an
 `fcl-json`/`fcl-xml` dependency, so it is linked only when a caller names it
 in their `uses` clause.
 
