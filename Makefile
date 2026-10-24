@@ -5,7 +5,9 @@
 #   make          build the library units
 #   make test     build + run the fpcunit suite
 #   make examples compile the example programs into bin/
-#   make validate-sse  opt-in live SSE case against tools/validate/sse_server.py
+#   make validate-sse  opt-in live SSE cases (resume, and event gaps against a
+#                      server emitting at a known interval) against
+#                      tools/validate/sse_server.py
 #   make validate-proxy  opt-in live proxy gate against tools/validate/proxy_servers.py
 #   make validate-websocket  opt-in live WebSocket gate against tools/validate/ws_servers.py
 #   make validate-websocket-autobahn  Autobahn|Testsuite client run (needs Docker)
@@ -58,8 +60,8 @@ validate-harness:
 	bash tools/validate/harness.sh
 
 # Opt-in live SSE gate: tools/validate/sse-live.sh starts the reference
-# event-stream server on a private port, runs the live case, then stops the
-# server again. The default suite skips that case (SSE_TEST_URL unset), so
+# event-stream server on a private port, runs the live cases (delivery and
+# resume on /events, per-event gaps on /cadence), then stops the server again. The default suite skips that case (SSE_TEST_URL unset), so
 # this target is the only way it executes.
 validate-sse: all | $(BIN)
 	bash tools/validate/sse-live.sh

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# S14 live SSE gate: run the opt-in TSseLiveTest case against the reference
-# event-stream server in this directory.
+# Live SSE gate: run the opt-in TSseLiveTest cases (delivery and resume, and
+# the per-event gaps against a server emitting at a known interval) against the
+# reference event-stream server in this directory.
 #
 # The default unit suite skips the live case (SSE_TEST_URL unset), so this is
 # the only runner that executes it. It starts tools/validate/sse_server.py on a

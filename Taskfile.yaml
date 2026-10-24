@@ -134,7 +134,7 @@ tasks:
       - bash tools/validate/h2probe-sanity.sh
 
   validate:sse:
-    desc: 'S14 live SSE gate — run the opt-in case against tools/validate/sse_server.py'
+    desc: 'Live SSE gate — resume and per-event timing against tools/validate/sse_server.py'
     cmds:
       - bash tools/validate/sse-live.sh
 

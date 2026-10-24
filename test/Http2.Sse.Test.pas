@@ -20,7 +20,7 @@ uses
   SysUtils, Classes, SyncObjs, Generics.Collections, fpcunit, testregistry,
   Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack, Http2.Tls,
   Http2.Connection, Http2.Stream, Http2.Messages, Http2.Client, Http2.WebSocket,
-  Http2.Sse, Http2.MockSocket;
+  Http2.Sse, Http2.MockSocket, Http2.RequestObserver;
 
 type
   /// a body stream over a fixed byte array that hands out at most AChunk
@@ -210,13 +210,33 @@ type
     procedure TestSseStreamReturnsWindowCredit;
   end;
 
+  /// remembers how the one attempt it observes ended
+  TOutcomeObserver = class(TBaseRequestObserver)
+  private
+    FEnded: PRTLEvent;
+  public
+    Kind: TAttemptKind;
+    StreamId: Int64;
+    Outcome: THttpOutcome;
+    constructor Create;
+    destructor Destroy; override;
+    function OnAttemptStart(const A: THttpAttempt): IInterface; override;
+    procedure OnAttemptEnd(const AToken: IInterface;
+      const O: THttpOutcome); override;
+    /// bounded wait for the end
+    function WaitForEnd(const ATimeoutMs: Integer): Boolean;
+  end;
+
   /// the opt-in live case: skipped unless SSE_TEST_URL points at a
   /// tools/validate/sse_server.py instance (the same gate idiom the other
   /// live tests use). It proves the whole stack end to end: incremental
-  /// delivery, reconnect, last-event-id resume, and retry: adoption.
+  /// delivery, reconnect, last-event-id resume, and retry: adoption; and that
+  /// the per-event timing measured at the wire matches a server that emits at
+  /// a known interval.
   TSseLiveTest = class(TTestCase)
   published
     procedure TestLiveStreamDeliversEventsAndResumes;
+    procedure TestLiveEventGapsMatchTheServerInterval;
   end;
 
 implementation
@@ -1823,6 +1843,41 @@ begin
   end;
 end;
 
+{ TOutcomeObserver }
+
+constructor TOutcomeObserver.Create;
+begin
+  inherited Create;
+  FEnded := RTLEventCreate;
+end;
+
+destructor TOutcomeObserver.Destroy;
+begin
+  RTLEventDestroy(FEnded);
+  inherited Destroy;
+end;
+
+function TOutcomeObserver.OnAttemptStart(const A: THttpAttempt): IInterface;
+begin
+  Kind := A.Kind;
+  StreamId := A.StreamId;
+  Result := nil;
+end;
+
+procedure TOutcomeObserver.OnAttemptEnd(const AToken: IInterface;
+  const O: THttpOutcome);
+begin
+  Outcome := O;
+  Outcome.Error := nil;
+  RTLEventSetEvent(FEnded);
+end;
+
+function TOutcomeObserver.WaitForEnd(const ATimeoutMs: Integer): Boolean;
+begin
+  RTLEventWaitFor(FEnded, ATimeoutMs);
+  Result := Outcome.EndUs > 0;
+end;
+
 { TSseLiveTest }
 
 procedure TSseLiveTest.TestLiveStreamDeliversEventsAndResumes;
@@ -1893,6 +1948,68 @@ begin
   finally
     Client.Close;
     Seen.Free;
+  end;
+end;
+
+procedure TSseLiveTest.TestLiveEventGapsMatchTheServerInterval;
+const
+  cIntervalMs = 100;
+  cCount = 8;
+var
+  Url, Base: string;
+  F: THttpClientFactory;
+  Client: IHttpClient;
+  Obs: TOutcomeObserver;
+  ObsRef: IHttpClientObserver;
+  Loop: TSseReconnectLoop;
+  E: TSseEvent;
+  I: Integer;
+  MeanGapUs: Int64;
+begin
+  // opt-in like the case above: the server emits cCount events cIntervalMs
+  // apart on /cadence, and the gaps the client measured at the wire must match
+  // that interval within a generous tolerance for a loaded machine
+  Url := GetEnvironmentVariable('SSE_TEST_URL');
+  if Url = '' then
+    Exit;
+  Base := Url;
+  if (Length(Base) > 7) and (Copy(Base, Length(Base) - 6, 7) = '/events') then
+    SetLength(Base, Length(Base) - 7);
+  Url := Base + '/cadence?interval_ms=' + IntToStr(cIntervalMs) + '&count=' +
+    IntToStr(cCount);
+
+  Obs := TOutcomeObserver.Create;
+  ObsRef := Obs;
+  F := THttpClientFactory.Create.WithRequestObserver(ObsRef);
+  if Pos('http://', LowerCase(Url)) = 1 then
+    F := F.WithClearText(ctUpgrade).WithHttp1Fallback(True);
+  Client := F.Build;
+  try
+    Loop := TSseReconnectLoop.Create(Client, SseRequest(Url), 1);
+    try
+      for I := 1 to cCount do
+        AssertTrue('event ' + IntToStr(I), Loop.Next(E));
+      AssertEquals('the last event', 'tick ' + IntToStr(cCount), E.Data);
+      Loop.Close;
+    finally
+      Loop.Free;
+    end;
+    AssertTrue('the attempt ended', Obs.WaitForEnd(5000));
+    AssertTrue('the attempt is an SSE attempt', Obs.Kind = akSse);
+    AssertTrue('and belongs to a loop', Obs.StreamId <> 0);
+    AssertEquals('every event was counted', cCount, Obs.Outcome.MessagesIn);
+    MeanGapUs := Obs.Outcome.SumGapUs div (cCount - 1);
+    AssertTrue('mean gap near the interval: ' + IntToStr(MeanGapUs) + ' us',
+      (MeanGapUs >= (cIntervalMs - 10) * 1000) and
+      (MeanGapUs <= (cIntervalMs + 40) * 1000));
+    AssertTrue('no stall beyond the interval: ' +
+      IntToStr(Obs.Outcome.MaxGapUs) + ' us',
+      Obs.Outcome.MaxGapUs <= (cIntervalMs + 150) * 1000);
+    AssertTrue('the stream lasted about (count - 1) intervals',
+      Obs.Outcome.LastMessageUs - Obs.Outcome.FirstMessageUs >=
+        Int64(cCount - 1) * (cIntervalMs - 10) * 1000);
+  finally
+    Client.Close;
   end;
 end;
 

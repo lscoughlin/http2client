@@ -7,6 +7,11 @@ data, a named event, `id`, `retry`, and a multi-byte UTF-8 sequence split
 across writes), then closes the stream so a reconnecting client can resume
 with `last-event-id`.
 
+A second mode, GET /cadence?interval_ms=N&count=K, emits K numbered events N
+milliseconds apart (each written and flushed on its own), then closes. It is
+the fixture for the per-event timing check: a client measuring the gaps
+between events at the wire should see about N ms between them.
+
 Usage:
     python3 tools/validate/sse_server.py [--port 8port] [--rounds 3]
 
@@ -23,8 +28,10 @@ it. This is the opt-in live gate described in doc/design/server-sent-events.md
 """
 
 import argparse
+import socket
 import sys
 import time
+from urllib.parse import parse_qs, urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -65,7 +72,38 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):        # keep the console readable
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
+    def do_cadence(self, query):
+        """K events, interval_ms apart, one write each, then close."""
+        params = parse_qs(query)
+        interval = int(params.get("interval_ms", ["100"])[0]) / 1000.0
+        count = int(params.get("count", ["8"])[0])
+        sys.stderr.write("GET %s interval=%.3fs count=%d\n"
+                         % (self.path, interval, count))
+        # small writes with pauses must leave the host at once, not wait for
+        # an ACK of the previous one
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream; charset=utf-8")
+        self.send_header("cache-control", "no-store")
+        self.send_header("connection", "close")
+        self.end_headers()
+        self.wfile.flush()
+        try:
+            for i in range(1, count + 1):
+                self.wfile.write(
+                    ("id: %d\ndata: tick %d\n\n" % (i, i)).encode("utf-8"))
+                self.wfile.flush()
+                if i < count:
+                    time.sleep(interval)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        self.close_connection = True
+
     def do_GET(self):
+        parts = urlsplit(self.path)
+        if parts.path == "/cadence":
+            self.do_cadence(parts.query)
+            return
         if self.path.split("?")[0] != "/events":
             self.send_response(404)
             self.send_header("content-length", "0")
