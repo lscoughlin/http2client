@@ -502,6 +502,15 @@ begin
   Result := (e = ESysEAGAIN) or (e = ESysEWOULDBLOCK);
 end;
 
+/// a blocking socket with SO_RCVTIMEO/SO_SNDTIMEO reports an expired deadline
+// as SSL_ERROR_WANT_READ/WANT_WRITE; errno is not a reliable witness on its
+// own (Linux), so the SSL error counts as well
+function SslTimedOut(const AErr: Integer): Boolean;
+begin
+  Result := SocketTimedOut or (AErr = SSL_ERROR_WANT_READ) or
+    (AErr = SSL_ERROR_WANT_WRITE);
+end;
+
 function SocketReadFully(AFd, ACount, ATimeoutMs: Integer;
   var ABuffer): Integer;
 var
@@ -1335,16 +1344,18 @@ begin
       r := HandshakeConnect(FSsl);
     end;
     if r <> 1 then
-      if (not FStreamMode) and SocketTimedOut then
+    begin
+      err := LastSslError(FSsl, r);
+      if (not FStreamMode) and SslTimedOut(err) then
         raise EHttpTimeout.CreateFmt('TLS handshake timed out after %d ms',
           [FConnectTimeoutMs])
       else
       begin
-        err := LastSslError(FSsl, r);
         RaiseIfClientAuthRejected(err);
         raise EHttpConnectionError.CreateFmt(
           'TLS handshake failed (SSL_get_error=%d)', [err]);
       end;
+    end;
     Alpn := SelectedAlpnBytes(FSsl);
     // strict mode still fails when the peer does not select "h2" (interop
     // A.9); a fallback dial skips the check and reports the name instead
@@ -1531,7 +1542,7 @@ begin
          ((err = SSL_ERROR_SYSCALL) and (n = 0)) or
          (FStreamMode and FEofFed and (err = SSL_ERROR_SSL)) then
         Exit // clean close_notify, or peer closed the transport without one
-      else if (not FStreamMode) and SocketTimedOut then
+      else if (not FStreamMode) and SslTimedOut(err) then
         raise EHttpTimeout.CreateFmt('TLS read timed out after %d ms',
           [FReadTimeoutMs])
       else
@@ -1576,7 +1587,7 @@ begin
       end
       else if FStreamMode and (err = SSL_ERROR_WANT_WRITE) then
         BioFlush
-      else if (not FStreamMode) and SocketTimedOut then
+      else if (not FStreamMode) and SslTimedOut(err) then
         raise EHttpTimeout.CreateFmt('TLS write timed out after %d ms',
           [FWriteTimeoutMs])
       else
@@ -1621,7 +1632,7 @@ begin
        ((err = SSL_ERROR_SYSCALL) and (n = 0)) or
        (FStreamMode and FEofFed and (err = SSL_ERROR_SSL)) then
       Exit(0)
-    else if (not FStreamMode) and SocketTimedOut then
+    else if (not FStreamMode) and SslTimedOut(err) then
       raise EHttpTimeout.CreateFmt('TLS read timed out after %d ms',
         [FReadTimeoutMs])
     else
