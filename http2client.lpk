@@ -22,7 +22,7 @@
         </SyntaxOptions>
       </Parsing>
     </CompilerOptions>
-    <Files Count="20">
+    <Files Count="22">
       <Item1>
         <Filename Value="src/Http2.pas"/>
         <UnitName Value="Http2"/>
@@ -103,6 +103,14 @@
         <Filename Value="src/Http2.WebSocketClient.pas"/>
         <UnitName Value="Http2.WebSocketClient"/>
       </Item20>
+      <Item21>
+        <Filename Value="src/Http2.Clock.pas"/>
+        <UnitName Value="Http2.Clock"/>
+      </Item21>
+      <Item22>
+        <Filename Value="src/Http2.RequestObserver.pas"/>
+        <UnitName Value="Http2.RequestObserver"/>
+      </Item22>
     </Files>
     <RequiredPkgs Count="1">
       <Item1>

@@ -53,7 +53,7 @@ flowchart TB
 | [errors-redirects](design/errors-redirects.md) | exception hierarchy, timeouts, cancellation, redirects |
 | [server-sent-events](design/server-sent-events.md) | Server-Sent Events: event-stream parser, SSE source, reconnect/resume, body-read timeout |
 | [testing-observability](design/testing-observability.md) | test seams, `fpcunit`, `IHttp2Observer` |
-| [request-observability](design/request-observability.md) | request-level observer: trace-context injection, attempt lifecycle, wire-stamped timing, SSE and WebSocket coverage, pool statistics (proposed) |
+| [request-observability](design/request-observability.md) | request-level observer: trace-context injection, attempt lifecycle, wire-stamped timing, SSE and WebSocket coverage, pool statistics (plain-request lifecycle and pool statistics built; the rest proposed) |
 | [open-questions](design/open-questions.md) | single source of truth for unresolved decisions |
 
 ## Verification

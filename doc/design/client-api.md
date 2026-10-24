@@ -38,6 +38,8 @@ type
     FCACertFile: string;                   // trust anchor bundle
     FInsecure: Boolean;                    // skip certificate verification
     FObserver: IHttp2Observer;
+    FRequestObservers: TArray<IHttpClientObserver>;
+    FLogger: IHttpLogger;
     FHttp1Fallback: Boolean;
     FClearTextPolicy: TClearTextPolicy;
   public
@@ -63,11 +65,13 @@ type
     function WithHttp1Fallback(const AEnable: Boolean = True): THttpClientFactory;
     function WithClearText(const APolicy: TClearTextPolicy): THttpClientFactory;
     function WithObserver(const AObserver: IHttp2Observer): THttpClientFactory;
+    function WithRequestObserver(const AObserver: IHttpClientObserver): THttpClientFactory;
+    function WithLogger(const ALogger: IHttpLogger): THttpClientFactory;
     function Build: IHttpClient;
     // read-only accessors: MaxConnections, MaxConnectionsPerHost,
     // MaxTotalConnections, MaxStreamsPerConnection, FollowRedirects,
     // MaxRedirects, ConnectTimeoutMs, HeaderTimeoutMs, IdleTimeoutMs,
-    // CACertFile, Http1Fallback, Observer
+    // CACertFile, Http1Fallback, Observer, RequestObservers, Logger
   end;
 ```
 
@@ -139,6 +143,20 @@ points certificate verification at a specific trust bundle;
 `WithInsecureTls` disables verification (test/development only, never a
 default). `WithObserver` installs an `IHttp2Observer` for connection,
 stream, and frame-level events — see [testing-observability](testing-observability.md).
+
+`WithRequestObserver` installs an `IHttpClientObserver`, the request-level
+seam above `IHttp2Observer`. Each call adds an observer: start callbacks run in
+registration order and end callbacks in reverse. An observer is told when each
+attempt (a request, a redirect hop, a transparent retry) starts, receives the
+response headers, a redirect or a retry, and is told once when the attempt
+ends, which is when the body finishes or the response is released. It may
+inject headers into each attempt through `THttpAttempt.Headers`; the request
+the caller built is never modified. `THttpRequest.WithContext` attaches an
+opaque object that reaches the observer in `THttpAttempt.Context` on every
+attempt. A client with no request observer pays one nil check per `Send`.
+`WithLogger` installs an `IHttpLogger`, which receives a warning when an
+observer raises (the exception is otherwise swallowed). The full contract is
+in [request-observability](request-observability.md).
 
 ### TLS and trust
 

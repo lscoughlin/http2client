@@ -118,6 +118,13 @@ An observer is passive and must not block: callbacks fire on the connection
 thread. Observers are attached per connection as it is opened, so a single
 observer instance sees every connection the client creates.
 
+`IHttp2Observer` has no request context. The request-level seam,
+`IHttpClientObserver` installed with `WithRequestObserver`, reports attempts
+instead of frames; see [request-observability](request-observability.md). The
+tests for it use `TRecordingRequestObserver` in `Http2.RequestObserver.Test`, a
+sibling of `TRecordingObserver` that records the attempts, the outcomes and the
+order of the callbacks.
+
 ## WebSocket tests
 
 `Http2.WebSocket.Test` covers the pure unit: the RFC 6455 section 5.7 frames

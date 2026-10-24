@@ -6,7 +6,7 @@ tags:
   - http2client
   - design
   - observability
-status: proposed
+status: partial
 up: "[http2client](../http2client.md)"
 related:
   - "[testing-observability](testing-observability.md)"
@@ -29,6 +29,20 @@ turns them into spans, instruments and log lines.
 [`IHttp2Observer`](testing-observability.md) stays as it is. It is the
 transport-level seam (connections, streams, frames) and has no request
 context. This note adds the request-level seam above it.
+
+## Status
+
+Built: the monotonic clock (`Http2.Clock`), the observer vocabulary
+(`Http2.RequestObserver`), `WithContext`, header injection, the factory and
+logger surface, the attempt lifecycle for plain requests over HTTP/2, h2c and
+HTTP/1.1 (start, response headers, redirect, retry, end), and the pool
+statistics snapshot.
+
+Not built yet: wire arrival stamps (`TFrame.ArrivedUs`, `IStampedBodyStream`),
+the per-message observer (`IHttpMessageObserver`) and the message aggregates
+of `THttpOutcome` (they stay zero), Server-Sent Events and WebSocket
+attempts (`akSse` and `akWebSocket` are declared but only `akRequest` is
+produced), and the WebSocket outcome fields.
 
 ## Goals
 
@@ -321,8 +335,13 @@ sequenceDiagram
 ```
 
 For a redirect, `OnAttemptEnd` for the finished hop fires before the next
-hop's `OnAttemptStart`, and its body (which the client discards) is complete
-by then. For the final hop it fires when the body ends.
+hop's `OnAttemptStart`. The client discards the body of a redirect response
+without reading it, so a hop whose body was not empty ends with
+`Abandoned = True`; a hop with an empty body ends clean. For the final hop it
+fires when the body ends.
+
+For a transparent retry the order is `OnRetry`, `OnAttemptEnd` for the refused
+attempt (with the stream error), then `OnAttemptStart` for the retry.
 
 ### Per hop
 
@@ -341,6 +360,12 @@ The library therefore clones before each attempt and hands the observer an
 
 ## Attempt end
 
+A response whose body is already complete when `Send` returns (a `HEAD`
+response, `204`, `304`, or an `END_STREAM` on the headers) has nothing left to
+read, so its attempt ends right after `OnResponseHeaders`. `BytesOut` and
+`BytesIn` count request and response body payload bytes, not framing or
+headers.
+
 `OnAttemptEnd` fires after the response is finalized, so `BytesIn`,
 `EndUs`, the message aggregates and any late error are known:
 
@@ -354,6 +379,14 @@ A response or socket that is never read to its end and never released holds
 its attempt open. Release (the response's last reference being dropped, or
 `Close`) ends it with `Abandoned = True`. This is documented behaviour: a
 leaked response is a leaked span.
+
+The codecs report the end through a per-attempt hook carried on the request
+(`IExchangeObserver` in `Http2.Stream`): the HTTP/2 lease and the HTTP/1.1 body
+stream each call it at most once, on body EOF, a failed read, a reset,
+a connection failure or release. The HTTP/2 lease only records an end that
+happens under the pooled connection's lock and delivers it after the lock is
+released. An end that arrives before `Send` has reported the response headers
+is held until it has, so `OnAttemptEnd` never precedes `OnResponseHeaders`.
 
 A once-latch guards `OnAttemptEnd`. The latch is taken under the owning
 object's lock; the callback itself runs outside every lock, as the

@@ -363,6 +363,41 @@ The snapshot is a copy: it holds no reference into the pool, and it is all
 zeros once the client is closed. Take one snapshot per polling cycle and read
 every gauge from it. See `doc/design/request-observability.md`.
 
+### Request observers
+
+`WithRequestObserver` installs an observer that sees every attempt (a request,
+a redirect hop, a transparent retry), injects headers into it and is told when
+it ends. Derive from `TBaseRequestObserver` and override what you need:
+
+```pascal
+type
+  TTraceObserver = class(TBaseRequestObserver)
+    function OnAttemptStart(const A: THttpAttempt): IInterface; override;
+    procedure OnAttemptEnd(const AToken: IInterface;
+      const O: THttpOutcome); override;
+  end;
+
+function TTraceObserver.OnAttemptStart(const A: THttpAttempt): IInterface;
+begin
+  // a fresh value per attempt; the caller's request is not touched
+  A.Headers.SetValue('traceparent', NewTraceParent(A.Context));
+  Result := nil;
+end;
+
+Client := THttpClientFactory.Create
+  .WithRequestObserver(TTraceObserver.Create)
+  .Build;
+Response := Client.Send(THttpRequest.Create(hmGet, Url).WithContext(ParentSpan));
+```
+
+`OnAttemptEnd` fires once per attempt, when the body ends, fails or the
+response is released (an unread response reports `Abandoned`). The outcome
+carries the status, protocol, whether the connection was reused, byte counts
+and timings. A callback runs outside every library lock, must not block, and
+is swallowed and reported to `WithLogger` if it raises. A response that is
+never read and never released keeps its attempt open. See
+`doc/design/request-observability.md`.
+
 ## Examples
 
 The `examples/` directory has eight small programs. Build them all with:
