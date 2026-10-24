@@ -46,7 +46,9 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 HOST="${MTLS_REAL_HOST:-lscoughlin@liam-rzbox.local}"
 
 if [ "${MTLS_REAL_LOCAL:-0}" != 1 ] && [ "$HOST" != local ]; then
-  DIR="${HTTP2_REMOTE_DIR:-http2client-ci}"
+  # the remote tree remote-run.sh uses for this checkout (same derivation)
+  DIR="${HTTP2_REMOTE_DIR:-http2client-ci/run-$(printf '%s' "$ROOT" | cksum | cut -d' ' -f1)}"
+  export HTTP2_REMOTE_DIR="$DIR"
   # copies the tree (and builds the dev image if the host has none)
   "$ROOT/tools/container/remote-run.sh" "$HOST" true || exit 2
   exec ssh "$HOST" "cd $DIR/src && MTLS_REAL_LOCAL=1 MTLS_REAL_BASE=${MTLS_REAL_BASE:-9440} \
