@@ -17,7 +17,8 @@ interface
 
 uses
   SysUtils, Classes, SyncObjs, Generics.Collections,
-  Http2.Errors, Http2.Frames, Http2.Tls, Http2.Observer, Http2.FlowControl;
+  Http2.Errors, Http2.Frames, Http2.Tls, Http2.Observer, Http2.FlowControl,
+  Http2.Clock;
 
 const
   /// connection-level receive window we advertise (RFC 7540 section 6.9.2)
@@ -574,6 +575,9 @@ begin
         Break;
       try
         Frame := ReadFrame(FSockStream, FPeerMaxFrameSize);
+        // the wire stamp: taken before validation and routing, and carried
+        // with the frame through the stream's queue to the consumer
+        Frame.ArrivedUs := NowUs;
         // RFC 7540 structural rules the decoder cannot enforce on its own:
         // frame-type/stream-id pairing, mandatory payload sizes, zero
         // WINDOW_UPDATE increments. A violation is a connection error.

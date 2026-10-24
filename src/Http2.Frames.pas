@@ -61,6 +61,10 @@ type
   TFrame = record
     Header: TFrameHeader;
     Payload: TBytes;
+    /// microseconds on the Http2.Clock clock at which the connection's reader
+    /// thread finished reading this frame; meaningful only on received frames
+    /// and never serialized.  0 on every frame built locally.
+    ArrivedUs: Int64;
     /// build a frame, filling Header.Length from Payload
     class function Create(const AFrameType: TFrameType; const AFlags: TFrameFlags;
       const AStreamId: LongWord; const APayload: TBytes): TFrame; static;
@@ -263,6 +267,7 @@ begin
   Result.Header.StreamId := AStreamId and MaxStreamId;
   Result.Payload := APayload;
   Result.Header.Length := Length(APayload);
+  Result.ArrivedUs := 0;
 end;
 
 function TFrame.DataLength: LongWord;
@@ -694,6 +699,7 @@ begin
   SetLength(Hdr, FrameHeaderSize);
   ReadExact(AStream, Hdr[0], FrameHeaderSize, 'frame header');
   Result.Header := TFrameHeader.ReadFrom(Hdr);
+  Result.ArrivedUs := 0;
   if Result.Header.Length > AMaxFrameSize then
     raise EHttpProtocolError.Create(Format(
       'frame length %d exceeds SETTINGS_MAX_FRAME_SIZE %d',

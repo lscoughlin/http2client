@@ -400,7 +400,7 @@ type
 
   /// IHttpBodyStream facade over a lease body that holds the pooled
   /// connection's critical section, serializing HPACK decode across streams
-  TGuardedBody = class(TInterfacedObject, IHttpBodyStream)
+  TGuardedBody = class(TInterfacedObject, IHttpBodyStream, IStampedBodyStream)
   private
     FInner: IHttpBodyStream;
     FLock: TCriticalSection;
@@ -410,6 +410,9 @@ type
       const ALock: TCriticalSection; const ALease: TStreamLease = nil);
     function Read(var ABuffer; const ACount: LongInt): LongInt;
     function Eof: Boolean;
+    /// the stamp of the last Read's frame (0 when the inner body is not
+    /// stamped)
+    function LastReadArrivedUs: Int64;
   end;
 
   /// the concrete response: typed status/headers plus a streamed body. It
@@ -1232,6 +1235,8 @@ type
     FHeadersUs: Int64;
     // an end reported before Send armed the tracker
     FEndAbandoned: Boolean;
+    // the body chunk arrivals the codec reported with the end
+    FArrivals: TArrivalStats;
     FEndBytesIn: Int64;
     FEndBytesOut: Int64;
     FEndHasError: Boolean;
@@ -1354,6 +1359,15 @@ begin
     O.BytesOut := FBytesOut;
   O.RequestSentUs := FRequestSentUs;
   O.HeadersUs := FHeadersUs;
+  if FArrivals.Count > 0 then
+  begin
+    // stamps are absolute clock values; the outcome is relative to the start
+    O.FirstMessageUs := FArrivals.FirstUs - FStartUs;
+    O.LastMessageUs := FArrivals.LastUs - FStartUs;
+    O.MessagesIn := FArrivals.Count;
+    O.MaxGapUs := FArrivals.MaxGapUs;
+    O.SumGapUs := FArrivals.SumGapUs;
+  end;
   O.EndUs := NowUs - FStartUs;
   try
     FObserver.OnAttemptEnd(FToken, O);
@@ -1429,6 +1443,7 @@ end;
 
 procedure TAttemptTracker.ExchangeEnded(const AEnd: TExchangeEnd);
 begin
+  FArrivals := AEnd.Arrivals;
   if InterlockedCompareExchange(FArmed, 0, 0) = 1 then
   begin
     // armed: report with the live exception
@@ -2033,6 +2048,16 @@ end;
 function TGuardedBody.Eof: Boolean;
 begin
   Result := FInner.Eof;
+end;
+
+function TGuardedBody.LastReadArrivedUs: Int64;
+var
+  Stamped: IStampedBodyStream;
+begin
+  if Supports(FInner, IStampedBodyStream, Stamped) then
+    Result := Stamped.LastReadArrivedUs
+  else
+    Result := 0;
 end;
 
 { THttpResponse }

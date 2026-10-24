@@ -9,9 +9,22 @@ unit Http2.Clock;
 
 interface
 
+type
+  /// a replacement clock, see SetNowUsHook
+  TNowUsFunc = function: Int64;
+
 /// microseconds on a monotonic clock with an arbitrary origin; only
 /// differences between two reads are meaningful
 function NowUs: Int64;
+
+/// make NowUs answer from AHook instead of the system clock, so a test can
+/// script arrival stamps exactly.  The hook is called from any thread and
+/// must be thread-safe.  Pass nil, or call ResetNowUsHook, to restore the
+/// real clock.
+procedure SetNowUsHook(const AHook: TNowUsFunc);
+
+/// restore the system clock
+procedure ResetNowUsHook;
 
 implementation
 
@@ -21,6 +34,9 @@ uses
   {$ELSE}
   , BaseUnix, Unix
   {$ENDIF};
+
+var
+  GNowUsHook: TNowUsFunc = nil;
 
 {$IFDEF DARWIN}
 type
@@ -35,24 +51,18 @@ function mach_timebase_info(var AInfo: TMachTimebaseInfo): LongInt; cdecl;
 var
   GTimebase: TMachTimebaseInfo;
 
-function NowUs: Int64;
+function SystemNowUs: Int64;
 begin
   // ticks * numer / denom is nanoseconds; Apple silicon runs 125/3
   Result := Int64((mach_absolute_time * GTimebase.Numer) div GTimebase.Denom
     div 1000);
 end;
 
-initialization
-  GTimebase.Numer := 1;
-  GTimebase.Denom := 1;
-  mach_timebase_info(GTimebase);
-  if GTimebase.Denom = 0 then
-    GTimebase.Denom := 1;
 {$ELSE}
 const
   cClockMonotonic = 1;   // CLOCK_MONOTONIC on Linux and the BSDs
 
-function NowUs: Int64;
+function SystemNowUs: Int64;
 var
   TS: TTimeSpec;
 begin
@@ -60,6 +70,36 @@ begin
     Exit(Int64(GetTickCount64) * 1000);
   Result := Int64(TS.tv_sec) * 1000000 + TS.tv_nsec div 1000;
 end;
+{$ENDIF}
+
+function NowUs: Int64;
+var
+  Hook: TNowUsFunc;
+begin
+  Hook := GNowUsHook;
+  if Assigned(Hook) then
+    Result := Hook()
+  else
+    Result := SystemNowUs;
+end;
+
+procedure SetNowUsHook(const AHook: TNowUsFunc);
+begin
+  GNowUsHook := AHook;
+end;
+
+procedure ResetNowUsHook;
+begin
+  GNowUsHook := nil;
+end;
+
+{$IFDEF DARWIN}
+initialization
+  GTimebase.Numer := 1;
+  GTimebase.Denom := 1;
+  mach_timebase_info(GTimebase);
+  if GTimebase.Denom = 0 then
+    GTimebase.Denom := 1;
 {$ENDIF}
 
 end.

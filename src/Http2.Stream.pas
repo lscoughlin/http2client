@@ -78,6 +78,31 @@ type
     function Data: TBytes;
   end;
 
+  /// the arrival aggregates of the body chunks one exchange delivered.  A
+  /// chunk is the bytes of one frame (HTTP/2) or one transport read
+  /// (HTTP/1.1); stamps are absolute Http2.Clock microseconds.
+  TArrivalStats = record
+    /// stamps of the first and the last chunk; 0 when none arrived
+    FirstUs, LastUs: Int64;
+    Count: Int64;
+    /// the largest and the summed gap between consecutive chunk stamps
+    MaxGapUs, SumGapUs: Int64;
+    /// record the arrival of one more chunk stamped AArrivedUs
+    procedure Note(const AArrivedUs: Int64);
+  end;
+
+  /// a body stream that can say when the bytes of its last Read arrived
+  // - each Read returns bytes of exactly one chunk (one DATA frame, or one
+  //   transport read on HTTP/1.1), so one Read maps to one stamp.  Consumers
+  //   test Supports(Body, IStampedBodyStream) after a Read.
+  IStampedBodyStream = interface
+    ['{7D1E5A02-3B94-4C6F-8E21-5A0C9B3D6F11}']
+    /// the arrival stamp, in microseconds on the Http2.Clock clock, of the
+    /// chunk that supplied the bytes returned by the last Read; 0 before any
+    /// Read returned bytes
+    function LastReadArrivedUs: Int64;
+  end;
+
   /// how one exchange ended, as the codec saw it
   TExchangeEnd = record
     /// borrowed for the duration of the call; nil on a clean end
@@ -86,6 +111,8 @@ type
     Abandoned: Boolean;
     /// body payload bytes sent and received on the wire
     BytesOut, BytesIn: Int64;
+    /// when the body chunks arrived on the wire
+    Arrivals: TArrivalStats;
   end;
 
   /// the per-attempt hook a codec reports to (doc/design/
@@ -181,13 +208,14 @@ type
   TStreamLease = class;
 
   /// IHttpBodyStream view of a lease's response body
-  TIStreamBody = class(TInterfacedObject, IHttpBodyStream)
+  TIStreamBody = class(TInterfacedObject, IHttpBodyStream, IStampedBodyStream)
   private
     FLease: TStreamLease;   // weak reference: the lease owns this object
   public
     constructor Create(const ALease: TStreamLease);
     function Read(var ABuffer; const ACount: LongInt): LongInt;
     function Eof: Boolean;
+    function LastReadArrivedUs: Int64;
   end;
 
   /// one request/response exchange. Implements IConnectionStream so the
@@ -224,6 +252,11 @@ type
     // body assembly
     FBodyPending: TBytes;
     FBodyPendingOfs: Integer;
+    /// the wire stamp of the frame in FBodyPending, taken from the frame
+    FBodyArrivedUs: Int64;
+    /// the stamp of the frame that supplied the last ReadBody
+    FLastReadArrivedUs: Int64;
+    FArrivals: TArrivalStats;
     FBodyEof: Boolean;
     FBodyEofObserved: Boolean;
     /// total DATA bytes received on this stream, compared against a declared
@@ -357,6 +390,8 @@ type
     property Retryable: Boolean read FRetryable;
     /// True when the owner calls DeliverEnd itself, after releasing its lock
     property DeferDelivery: Boolean read FDeferDelivery write FDeferDelivery;
+    /// the wire stamp of the frame that supplied the last ReadBody
+    property LastReadArrivedUs: Int64 read FLastReadArrivedUs;
     /// request body bytes emitted as DATA so far
     property BytesSent: Int64 read FBytesSent;
   end;
@@ -508,6 +543,27 @@ begin
   Result.Exchange := AExchange;
 end;
 
+{ TArrivalStats }
+
+procedure TArrivalStats.Note(const AArrivedUs: Int64);
+var
+  Gap: Int64;
+begin
+  if Count = 0 then
+    FirstUs := AArrivedUs
+  else
+  begin
+    Gap := AArrivedUs - LastUs;
+    if Gap < 0 then
+      Gap := 0;
+    if Gap > MaxGapUs then
+      MaxGapUs := Gap;
+    Inc(SumGapUs, Gap);
+  end;
+  LastUs := AArrivedUs;
+  Inc(Count);
+end;
+
 { TIStreamBody }
 
 constructor TIStreamBody.Create(const ALease: TStreamLease);
@@ -530,6 +586,11 @@ end;
 function TIStreamBody.Eof: Boolean;
 begin
   Result := FLease.BodyEof;
+end;
+
+function TIStreamBody.LastReadArrivedUs: Int64;
+begin
+  Result := FLease.LastReadArrivedUs;
 end;
 
 { TCancellationToken }
@@ -1213,6 +1274,9 @@ begin
       ecStreamClosed);
   FBodyPending := ExtractDataPayload(AFrame);
   FBodyPendingOfs := 0;
+  // the stamp belongs to the frame: this runs on the consumer's thread, long
+  // after the reader thread saw the frame, so the clock is never read here
+  FBodyArrivedUs := AFrame.ArrivedUs;
   Inc(FBodyReceived, Length(FBodyPending));
   FResponseState := rsBodyOpen;
   if AFrame.IsEndStream then
@@ -1280,6 +1344,11 @@ begin
       N := ACount;
       if N > Avail then
         N := Avail;
+      // a Read never spans two frames, so it maps to exactly one stamp; the
+      // first Read of a frame is one more arrival
+      if FBodyPendingOfs = 0 then
+        FArrivals.Note(FBodyArrivedUs);
+      FLastReadArrivedUs := FBodyArrivedUs;
       Move(FBodyPending[FBodyPendingOfs], P^, N);
       Inc(FBodyPendingOfs, N);
       if FBodyEof and (FBodyPendingOfs >= Length(FBodyPending)) and
@@ -1411,6 +1480,7 @@ begin
   Info.Abandoned := AAbandoned;
   Info.BytesIn := FBodyReceived;
   Info.BytesOut := FBytesSent;
+  Info.Arrivals := FArrivals;
   Info.Error := nil;
   E := nil;
   case AReason of

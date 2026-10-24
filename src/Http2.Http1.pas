@@ -23,7 +23,8 @@ interface
 
 uses
   SysUtils, Classes, Generics.Collections,
-  Http2.Errors, Http2.Headers, Http2.Tls, Http2.Stream, Http2.Messages;
+  Http2.Errors, Http2.Headers, Http2.Tls, Http2.Stream, Http2.Messages,
+  Http2.Clock;
 
 const
   /// ceiling for the whole response head (status line + all header fields),
@@ -51,12 +52,31 @@ type
     FBuf: TBytes;
     FPos: Integer;
     FEnd: Integer;
+    /// which transport read delivered which buffered bytes: entry I covers
+    /// the bytes up to (not including) offset FStampEnd[I] since the previous
+    /// entry, and arrived at FStampUs[I]
+    FStampEnd: array of Integer;
+    FStampUs: array of Int64;
+    FStampSeq: array of Int64;
+    FStampCount: Integer;
+    FLastReadUs: Int64;
+    FLastReadSeq: Int64;
+    FFillCount: Int64;
+    /// drop the entries for bytes already consumed
+    procedure TrimStamps;
     /// pull another transport buffer into FBuf; False at end of stream
     function Fill: Boolean;
   public
     constructor Create(const ASocket: IHttp2Socket);
-    /// read up to ACount bytes; 0 only at end of stream
+    /// read up to ACount bytes; 0 only at end of stream.  A call returns bytes
+    /// of one transport read only, so LastReadUs names its arrival.
     function ReadBytes(var ABuffer; const ACount: Integer): Integer;
+    /// the stamp of the transport read that delivered the bytes of the last
+    /// ReadBytes
+    property LastReadUs: Int64 read FLastReadUs;
+    /// which transport read that was, counted from 1; tells two reads with
+    /// equal stamps apart
+    property LastReadSeq: Int64 read FLastReadSeq;
     /// read exactly ACount bytes; shorter only when the peer closed early
     function ReadExact(var ABuffer; const ACount: Integer): Integer;
     /// read one CRLF- or LF-terminated line, stripping the terminator.  False
@@ -76,7 +96,8 @@ type
   /// an IHttpBodyStream over a response body.  Chunked decoding is pull-based
   /// (a chunk is decoded as the caller reads it), so a large body is not
   /// buffered whole.
-  THttp1BodyStream = class(TInterfacedObject, IHttpBodyStream)
+  THttp1BodyStream = class(TInterfacedObject, IHttpBodyStream,
+    IStampedBodyStream)
   private
     FReader: TBufferedReader;
     FFraming: TBodyFraming;
@@ -91,6 +112,9 @@ type
     FBytesIn: Int64;
     FBytesOut: Int64;
     FEnded: LongInt;
+    FLastReadUs: Int64;         // arrival stamp of the last Read's bytes
+    FLastReadSeq: Int64;        // which transport read that was
+    FArrivals: TArrivalStats;
     procedure EndExchange(const AError: Exception; const AAbandoned: Boolean);
     function ReadFramed(var ABuffer; const ACount: LongInt): LongInt;
     procedure ReadTrailers;
@@ -103,6 +127,7 @@ type
       const ATrailers: IHttpHeaders);
     function Read(var ABuffer; const ACount: LongInt): LongInt;
     function Eof: Boolean;
+    function LastReadArrivedUs: Int64;
     /// report the end of this body (EOF, a failed read or release) to AExchange
     /// exactly once; ABytesOut is the request body size for the report
     procedure AttachExchange(const AExchange: IExchangeObserver;
@@ -304,6 +329,29 @@ begin
   FBuf := nil;
   FPos := 0;
   FEnd := 0;
+  FStampCount := 0;
+  FLastReadUs := 0;
+  FLastReadSeq := 0;
+  FFillCount := 0;
+end;
+
+procedure TBufferedReader.TrimStamps;
+var
+  Drop, I: Integer;
+begin
+  // an entry is spent once the read position has passed its end
+  Drop := 0;
+  while (Drop < FStampCount) and (FStampEnd[Drop] <= FPos) do
+    Inc(Drop);
+  if Drop = 0 then
+    Exit;
+  for I := Drop to FStampCount - 1 do
+  begin
+    FStampEnd[I - Drop] := FStampEnd[I];
+    FStampUs[I - Drop] := FStampUs[I];
+    FStampSeq[I - Drop] := FStampSeq[I];
+  end;
+  Dec(FStampCount, Drop);
 end;
 
 function TBufferedReader.Fill: Boolean;
@@ -311,10 +359,14 @@ var
   N: Integer;
   Tmp: TBytes;
   PR: IPartialReader;
+  Stamp: Int64;
 begin
   // compact the consumed prefix so the buffer does not grow without bound
   if FPos > 0 then
   begin
+    TrimStamps;
+    for N := 0 to FStampCount - 1 do
+      Dec(FStampEnd[N], FPos);
     if FEnd > FPos then
       Move(FBuf[FPos], FBuf[0], FEnd - FPos);
     Dec(FEnd, FPos);
@@ -328,12 +380,25 @@ begin
     N := PR.ReadSome(Tmp[0], cHttp1ReadBufferSize)
   else
     N := FSocket.Read(Tmp[0], cHttp1ReadBufferSize);
+  // the arrival stamp: taken as soon as the transport read returns
+  Stamp := NowUs;
   if N <= 0 then
     Exit(False);
   if FEnd + N > Length(FBuf) then
     SetLength(FBuf, FEnd + N);
   Move(Tmp[0], FBuf[FEnd], N);
   Inc(FEnd, N);
+  if FStampCount = Length(FStampEnd) then
+  begin
+    SetLength(FStampEnd, FStampCount + 4);
+    SetLength(FStampUs, FStampCount + 4);
+    SetLength(FStampSeq, FStampCount + 4);
+  end;
+  Inc(FFillCount);
+  FStampSeq[FStampCount] := FFillCount;
+  FStampEnd[FStampCount] := FEnd;
+  FStampUs[FStampCount] := Stamp;
+  Inc(FStampCount);
   Result := True;
 end;
 
@@ -356,6 +421,16 @@ begin
   N := FEnd - FPos;
   if N > ACount then
     N := ACount;
+  // stay inside the transport read that delivered the first byte, so the
+  // bytes returned share one arrival stamp
+  TrimStamps;
+  if FStampCount > 0 then
+  begin
+    if N > FStampEnd[0] - FPos then
+      N := FStampEnd[0] - FPos;
+    FLastReadUs := FStampUs[0];
+    FLastReadSeq := FStampSeq[0];
+  end;
   P := @ABuffer;
   Move(FBuf[FPos], P^, N);
   Inc(FPos, N);
@@ -520,7 +595,7 @@ begin
   N := ACount;
   if Int64(N) > FRemaining then
     N := Integer(FRemaining);
-  Result := FReader.ReadExact(PByte(@ABuffer)^, N);
+  Result := FReader.ReadBytes(PByte(@ABuffer)^, N);
   if Result <= 0 then
     raise EHttpProtocolError.Create('truncated response body',
       ecStreamClosed);
@@ -543,7 +618,7 @@ begin
       N := ACount;
       if Int64(N) > FChunkRemaining then
         N := Integer(FChunkRemaining);
-      Result := FReader.ReadExact(PByte(@ABuffer)^, N);
+      Result := FReader.ReadBytes(PByte(@ABuffer)^, N);
       if Result <= 0 then
         raise EHttpProtocolError.Create('truncated chunked body',
           ecStreamClosed);
@@ -608,6 +683,7 @@ begin
   Info.Abandoned := AAbandoned;
   Info.BytesIn := FBytesIn;
   Info.BytesOut := FBytesOut;
+  Info.Arrivals := FArrivals;
   try
     FExchange.ExchangeEnded(Info);
   except
@@ -632,7 +708,15 @@ begin
     end;
   end;
   if Result > 0 then
+  begin
     Inc(FBytesIn, Result);
+    // each transport read is one chunk: a Read continuing the same read is
+    // not another arrival
+    if FReader.LastReadSeq <> FLastReadSeq then
+      FArrivals.Note(FReader.LastReadUs);
+    FLastReadSeq := FReader.LastReadSeq;
+    FLastReadUs := FReader.LastReadUs;
+  end;
   if FDone then
     EndExchange(nil, False);
 end;
@@ -661,6 +745,11 @@ begin
     FObservedEof := True;
     Result := 0;
   end;
+end;
+
+function THttp1BodyStream.LastReadArrivedUs: Int64;
+begin
+  Result := FLastReadUs;
 end;
 
 function THttp1BodyStream.Eof: Boolean;
