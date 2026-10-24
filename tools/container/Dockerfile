@@ -24,6 +24,10 @@ RUN set -eux; \
     /usr/local/bin/fpcmkcfg -d basepath=/usr/local/lib/fpc/current -o /etc/fpc.cfg; \
     rm -rf /tmp/fpcsrc; \
     /usr/local/bin/fpc -iV
+# tools the gate scripts call; kept after the compiler layer so adding one
+# reuses the cached build
+RUN apt-get update && apt-get install -y --no-install-recommends netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
 ENV PATH=/usr/local/bin:$PATH
 ENV FPC=/usr/local/bin/fpc
 ENV FPC_UNITS=/usr/local/lib/fpc/current/units/x86_64-linux

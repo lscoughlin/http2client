@@ -194,3 +194,30 @@ make && make test
 `OPENSSL_LIBPATH` must be exported for any binary that loads TLS (the
 Makefile does this). Verified on this machine: `docker run --rm
 h2-test-harness --list` lists **146** case ids, matching the harness README.
+
+## Linux x86_64 (container)
+
+`tools/container/Dockerfile` builds a dev image with Free Pascal 3.2.4-rc2
+(built from the `release_3_2_4_rc2` source tag; no Linux binary or release
+tag exists), OpenSSL 3.0.13, `nghttpd` 1.59 and Python 3.12 on Ubuntu 24.04.
+`tools/container/remote-run.sh HOST COMMAND...` copies the tree to a Docker
+host and runs the command in that image, building the image only when it is
+missing. Verified on Ubuntu 24.04 x86_64:
+
+| Check | Result |
+|---|---|
+| `make test` | 884 tests, 0 errors, 0 failures |
+| `make validate-mtls` | PASS |
+| `make validate-sse`, `validate-websocket`, `validate-cleartext` | PASS |
+| `make validate-proxy` | PASS, all 10 cases |
+| `make validate-interop` | 11 pass, 0 fail, 3 skipped (A.8, and A.11/A.12 which need Apache in Docker) |
+
+Not run on Linux: the Autobahn client run, the harness sweep and any load or
+overhead measurement.
+
+Linux differences the code handles: `clock_gettime` is declared in
+`Http2.Clock`; SIGPIPE is ignored in `Http2.Tls` because there is no
+`SO_NOSIGPIPE`; and an expired socket deadline is recognised from OpenSSL's
+want-read or want-write result as well as `errno`. The live-gate servers set
+`TCP_NODELAY`, because Nagle plus the client's delayed ACK adds about 40 ms to
+the timed WebSocket cases.
