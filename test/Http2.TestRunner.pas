@@ -25,7 +25,7 @@ uses
   Http2.WebSocket.Test, Http2.WebSocketClient.Test, Http2.WebSocketLive.Test,
   Http2.WebSocketObservability.Test,
   Http2.PoolStats.Test, Http2.RequestObserver.Test, Http2.ObserverAdapters.Test,
-  Http2.ClientCert.Test, Http2.MutualTls.Test;
+  Http2.ClientCert.Test, Http2.MutualTls.Test, Http2.SigPipe.Test;
 
 type
   TTestProbe = class(TTestCase)

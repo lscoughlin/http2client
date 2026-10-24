@@ -19,7 +19,7 @@ interface
 uses
   SysUtils, Classes, Sockets, ssockets, BaseUnix,
   mormot.core.base, mormot.core.os, mormot.lib.openssl11,
-  Http2.Errors, Http2.Proxy, Http2.Socks, Http2.ClientCert;
+  Http2.Errors, Http2.Proxy, Http2.Socks, Http2.ClientCert, Http2.SigPipe;
 
 const
   /// the single ALPN protocol this client offers in strict mode (RFC 7540
@@ -552,7 +552,7 @@ begin
   Result := 0;
   while Result < ACount do
   begin
-    n := fpSend(AFd, base + Result, ACount - Result, 0);
+    n := fpSend(AFd, base + Result, ACount - Result, cMsgNoSignal);
     if n > 0 then
       Inc(Result, n)
     else if SocketTimedOut then
@@ -779,6 +779,7 @@ begin
           [DialHost, DialPort, E.Message]);
   end;
   FHandle := FSocket.Handle;
+  FSocket.WriteFlags := cMsgNoSignal;
   FConnected := True;
   opt := 1;
 {$IFDEF DARWIN}
@@ -1193,8 +1194,15 @@ begin
 end;
 
 function TTlsSocket.HandshakeConnect(const ASsl: PSSL): Integer;
+var
+  Shield: TSigPipeShield;
 begin
-  Result := SSL_connect(ASsl);
+  SigPipeShieldEnter(Shield);
+  try
+    Result := SSL_connect(ASsl);
+  finally
+    SigPipeShieldLeave(Shield);
+  end;
 end;
 
 function TTlsSocket.SelectedAlpnBytes(const ASsl: PSSL): TBytes;
@@ -1272,19 +1280,41 @@ end;
 
 function TTlsSocket.SslReadBytes(const ASsl: PSSL; const ABuffer: Pointer;
   const ACount: Integer): Integer;
+var
+  Shield: TSigPipeShield;
 begin
-  Result := SSL_read(ASsl, ABuffer, ACount);
+  // a read can write too (alerts, TLS 1.3 key updates)
+  SigPipeShieldEnter(Shield);
+  try
+    Result := SSL_read(ASsl, ABuffer, ACount);
+  finally
+    SigPipeShieldLeave(Shield);
+  end;
 end;
 
 function TTlsSocket.SslWriteBytes(const ASsl: PSSL; const ABuffer: Pointer;
   const ACount: Integer): Integer;
+var
+  Shield: TSigPipeShield;
 begin
-  Result := SSL_write(ASsl, ABuffer, ACount);
+  SigPipeShieldEnter(Shield);
+  try
+    Result := SSL_write(ASsl, ABuffer, ACount);
+  finally
+    SigPipeShieldLeave(Shield);
+  end;
 end;
 
 procedure TTlsSocket.SslShutdown(const ASsl: PSSL);
+var
+  Shield: TSigPipeShield;
 begin
-  SSL_shutdown(ASsl);
+  SigPipeShieldEnter(Shield);
+  try
+    SSL_shutdown(ASsl);
+  finally
+    SigPipeShieldLeave(Shield);
+  end;
 end;
 
 function TTlsSocket.GetSocketFd: Integer;
@@ -1910,13 +1940,5 @@ begin
       ecProtocolError);
   end;
 end;
-
-{$IFDEF LINUX}
-initialization
-  // Linux has no SO_NOSIGPIPE and OpenSSL writes the descriptor with write(),
-  // so a write to a peer that has closed would kill the process with SIGPIPE;
-  // ignored, the write fails with EPIPE and the connection reports it
-  fpSignal(SIGPIPE, SignalHandler(SIG_IGN));
-{$ENDIF}
 
 end.
