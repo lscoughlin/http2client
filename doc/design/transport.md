@@ -212,10 +212,11 @@ idempotent methods (no body writer), and only on `ecRefusedStream` or a
   verification on by default).
 - Client identity: when the factory holds a client certificate, `TTlsSocket`
   installs its leaf, chain and key on the per-dial context before the
-  handshake, on the TLS dial to an origin when the route is direct (including
-  the HTTP/1.1-only dial and the fallback dial) and on the TLS leg to an
-  `https` proxy when it is not; the origin leg inside a tunnel presents none,
-  and an `http` or `socks5` proxy presents it nowhere. A server that rejects it surfaces as `EHttpTlsClientAuthError`
+  handshake, on every TLS dial to an origin (direct, through a tunnel, the
+  HTTP/1.1-only dial and the fallback dial) and never on the leg to an
+  `https` proxy. That leg takes the separate proxy identity, and the origin
+  never sees it. The origin identity is the request's, else the selector's,
+  else the client's. A server that rejects it surfaces as `EHttpTlsClientAuthError`
   (on the handshake under TLS 1.2, on the first read under TLS 1.3), which is
   final: it is not retried and does not trigger the HTTP/1.1 fallback. See
   [mtls](mtls.md).

@@ -253,7 +253,9 @@ A proxied route appends the proxy identity, `origin via [user@]host:port`
 
 Because each route is a separate pool bucket, `MaxConnectionsPerHost` counts
 connections **per origin and route** (and, with a client identity selector
-installed, per identity: see [mtls](mtls.md)). `MaxTotalConnections` still
+installed or a request carrying its own identity, per origin identity: see
+[mtls](mtls.md); the proxy identity is fixed per client and never varies the
+key). `MaxTotalConnections` still
 bounds the whole pool.
 
 ## TLS to the proxy
@@ -266,14 +268,14 @@ inside the tunnel, so a proxied `https` request carries two TLS layers.
   the origin's, using the trust settings of the client (`WithCACertFile`,
   `WithInsecureTls`).
 - No ALPN is offered to the proxy; the `CONNECT` exchange is HTTP/1.1.
-- A proxy that requires a client certificate is answered with the client
-  identity (`WithClientIdentity`, or the selector's answer for the proxy's
-  host and port). The identity is presented on this leg only: the origin's TLS
-  inside the tunnel presents no certificate. A cleartext origin through an
-  `https://` proxy still presents the identity on the proxy leg. A SOCKS5 or
-  plain `http://` proxy has no TLS leg, so the identity is presented nowhere
-  on those routes and an origin that requires a client certificate cannot be
-  reached through them. See [mtls](mtls.md).
+- A proxy that requires a client certificate is answered with
+  `WithProxyClientIdentity`. That identity is presented on this leg only: the
+  origin's TLS inside the tunnel presents the origin identity (the fixed
+  identity or the selector's answer), never the proxy identity, and the proxy
+  never receives the origin identity. A cleartext origin through an `https://`
+  proxy still uses the proxy identity on the proxy leg. A SOCKS5 or plain
+  `http://` proxy has no TLS leg. The identity is explicit: it is not read from
+  the proxy environment variables. See [mtls](mtls.md).
 - `Proxy-Authorization` travels inside the encrypted leg, so credentials are
   not exposed to the network between client and proxy.
 - A handshake failure with the proxy raises `EHttpConnectionError` and names

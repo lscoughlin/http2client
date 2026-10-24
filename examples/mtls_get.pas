@@ -8,14 +8,17 @@
 //          origin port with a selector that reads the files at each dial (so a
 //          replaced file is presented by the next new connection), in place of
 //          the certificate arguments
-//          MTLS_PROXY=[http:|https:]port routes every request through a proxy
-//          on localhost:port (https unless told otherwise).  The one identity
-//          (the certificate arguments, or the selector's answer for the
-//          proxy's port) goes to an https proxy only; the origin inside the
-//          tunnel never sees it, and an http proxy gets it nowhere
-// - shows: WithClientCertificateFiles, WithClientIdentitySelector, the
-//   identity applying to an https proxy and not to the origin behind it, a
-//   bad identity failing at Build, and the
+//          MTLS_PROXY=port routes every request through an https proxy on
+//          localhost:port (MTLS_PROXY_KIND=http makes it an HTTP CONNECT
+//          proxy); MTLS_PROXY_CERT and MTLS_PROXY_KEY are the identity an
+//          https proxy requires (never sent to the origin; the origin
+//          identity reaches the origin through either kind)
+//          MTLS_REQUEST_CERT and MTLS_REQUEST_KEY attach one identity to each
+//          request (the origin identity for that request: it wins over the
+//          selector and the certificate arguments, goes through any proxy to
+//          the origin only, and is dropped on a redirect to another origin)
+// - shows: WithClientCertificateFiles, WithClientIdentitySelector,
+//   WithProxyClientIdentity, a per-request WithClientIdentity, a bad identity failing at Build, and the
 //   distinct EHttpTlsClientAuthError when the server rejects the certificate.
 program example_mtls_get;
 
@@ -38,7 +41,7 @@ type
   end;
 
   /// every request goes through one proxy
-  TFixedProxy = class(TInterfacedObject, IProxySelector)
+  TFixedHttpsProxy = class(TInterfacedObject, IProxySelector)
   private
     FProxy: IProxy;
   public
@@ -127,13 +130,13 @@ begin
     Copy(Value, P + 1, MaxInt));
 end;
 
-constructor TFixedProxy.Create(const AKind: TProxyKind; const APort: Word);
+constructor TFixedHttpsProxy.Create(const AKind: TProxyKind; const APort: Word);
 begin
   inherited Create;
   FProxy := TProxy.Create(AKind, 'localhost', APort);
 end;
 
-function TFixedProxy.SelectProxy(const AUri: string): IProxy;
+function TFixedHttpsProxy.SelectProxy(const AUri: string): IProxy;
 begin
   Result := FProxy;
 end;
@@ -142,8 +145,8 @@ var
   Factory: THttpClientFactory;
   Urls: TStringList;
   UrlIndex: Integer;
-  SelectSpec, ProxySpec: string;
-  ProxyKind: TProxyKind;
+  SelectSpec, ProxyPort, ProxyCert, ProxyKey, ReqCert, ReqKey: string;
+  ReqId: IClientIdentity;
   Client: IHttpClient;
   Response: IHttpResponse;
   Listener: TFirstText;
@@ -167,28 +170,32 @@ begin
   // HTTP/1.1 is accepted as well as HTTP/2, so any server will do
   Factory := THttpClientFactory.Create.WithHttp1Fallback(True);
   SelectSpec := GetEnvironmentVariable('MTLS_SELECT');
-  ProxySpec := GetEnvironmentVariable('MTLS_PROXY');
+  ProxyPort := GetEnvironmentVariable('MTLS_PROXY');
+  ProxyCert := GetEnvironmentVariable('MTLS_PROXY_CERT');
+  ProxyKey := GetEnvironmentVariable('MTLS_PROXY_KEY');
+  ReqCert := GetEnvironmentVariable('MTLS_REQUEST_CERT');
+  ReqKey := GetEnvironmentVariable('MTLS_REQUEST_KEY');
+  ReqId := nil;
   if SelectSpec <> '' then
     Factory := Factory.WithClientIdentitySelector(TFileSelector.Create(SelectSpec))
   else if ParamStr(2) <> '-' then
     Factory := Factory.WithClientCertificateFiles(ParamStr(2), ParamStr(3),
       Passphrase);
-  if ProxySpec <> '' then
-  begin
-    ProxyKind := pkHttps;
-    if Pos('http:', ProxySpec) = 1 then
-    begin
-      ProxyKind := pkHttp;
-      Delete(ProxySpec, 1, Length('http:'));
-    end
-    else if Pos('https:', ProxySpec) = 1 then
-      Delete(ProxySpec, 1, Length('https:'));
-    Factory := Factory.WithProxySelector(
-      TFixedProxy.Create(ProxyKind, Word(StrToInt(ProxySpec))));
-  end;
+  if ProxyPort <> '' then
+    if GetEnvironmentVariable('MTLS_PROXY_KIND') = 'http' then
+      Factory := Factory.WithProxySelector(
+        TFixedHttpsProxy.Create(pkHttp, Word(StrToInt(ProxyPort))))
+    else
+      Factory := Factory.WithProxySelector(
+        TFixedHttpsProxy.Create(pkHttps, Word(StrToInt(ProxyPort))));
   if CaFile <> '' then
     Factory := Factory.WithCACertFile(CaFile);
   try
+    if ProxyCert <> '' then
+      Factory := Factory.WithProxyClientIdentity(
+        TClientIdentity.FromPemFiles(ProxyCert, ProxyKey));
+    if ReqCert <> '' then
+      ReqId := TClientIdentity.FromPemFiles(ReqCert, ReqKey);
     // an unreadable file, a wrong passphrase, a key that does not match the
     // certificate and an expired certificate all fail here, not on the request
     Client := Factory.Build;
@@ -211,7 +218,7 @@ begin
           Listener := TFirstText.Create;
           ListenerRef := Listener;
           Socket := Client.Send(TWebSocketRequest.Create(Urls[UrlIndex],
-            ListenerRef).WithAutoRequest);
+            ListenerRef).WithAutoRequest.WithClientIdentity(ReqId));
           if Listener.Done.WaitFor(5000) = wrSignaled then
             WriteLn('message: ', Listener.Text)
           else
@@ -220,7 +227,8 @@ begin
         end
         else
         begin
-          Response := Client.Send(THttpRequest.Create(hmGet, Urls[UrlIndex]));
+          Response := Client.Send(THttpRequest.Create(hmGet, Urls[UrlIndex])
+            .WithClientIdentity(ReqId));
           WriteLn('status: ', Response.StatusCode);
           WriteLn('body bytes: ', Length(ReadText(Response)));
         end;

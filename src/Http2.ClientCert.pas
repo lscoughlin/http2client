@@ -17,11 +17,12 @@ interface
 uses
   SysUtils, Classes, DateUtils,
   mormot.core.base, mormot.lib.openssl11,
-  Http2.Errors;
+  Http2.Errors, Http2.IdentityHandle;
 
 type
   /// a loaded identity; immutable once built, safe to share between threads
-  IClientIdentity = interface
+  IClientIdentity = interface(IClientIdentityHandle)
+    ['{A95ED48F-1477-44CC-B93D-CC0BC7FE1D98}']
     function GetSubject: string;
     function GetFingerprint: string;
     function GetNotAfter: TDateTime;
@@ -41,7 +42,7 @@ type
   end;
 
   /// chooses the identity for a TLS dial to an origin (doc/design/mtls.md,
-  /// "Selector").  Select is called once per new
+  /// "Selector and proxy identity").  Select is called once per new
   /// connection, on the dialling thread and outside the pool lock, never for a
   /// request that reuses a pooled connection.  nil presents no certificate.
   /// An implementation may be called from several threads at once and must

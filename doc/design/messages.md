@@ -159,6 +159,7 @@ type
     function WithAcceptEncoding(const AValue: string): THttpRequest;
     function WithBody(const ABody: THttpBody): THttpRequest;
     function WithBodyWriter(const AWriter: IBodyWriter): THttpRequest;
+    function WithClientIdentity(const AIdentity: IClientIdentity): THttpRequest;
     function Clone: THttpRequest;
     function Url: string;
     function Method: THttpMethod;
@@ -171,6 +172,8 @@ type
 - `WithMethodToken` is the escape hatch for extension verbs. The token is
   validated and **uppercased** before it reaches HPACK; a lowercase method
   on the wire is a protocol error.
+- `WithClientIdentity` attaches the origin identity for mutual TLS to this
+  request; see [mtls](mtls.md) "Per-request identity".
 - `FBody` and `FBodyWriter` are mutually exclusive: `FBodyWriter` wins and
   `FBody.IsSet=False` is required; setting both raises.
 - `FHeaders` is an interface, so copying a `THttpRequest` shares the header
