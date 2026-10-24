@@ -90,6 +90,9 @@ type
     constructor Create(const ASpecs: TArray<TRespSpec>);
     destructor Destroy; override;
     procedure SetAutoRespond(const AValue: Boolean);
+    /// queue a frame for the client to read, as if it had just arrived from
+    /// the peer
+    procedure InjectFrame(const AFrame: TFrame);
     function RequestCount: Integer;
     function RequestAt(const AIndex: Integer): TReqRecord;
     function WrittenFrames: TArray<TFrame>;
@@ -253,6 +256,16 @@ begin
   FLock.Acquire;
   try
     FAutoRespond := AValue;
+  finally
+    FLock.Release;
+  end;
+end;
+
+procedure TFakeFrameSocket.InjectFrame(const AFrame: TFrame);
+begin
+  FLock.Acquire;
+  try
+    AppendInLocked(FrameBytes(AFrame));
   finally
     FLock.Release;
   end;
