@@ -699,6 +699,10 @@ type
     /// the fingerprint the last dial to a pool key presented, so a request
     /// finds its connections without calling the selector; guarded by FLock
     FIdentityKeys: TDictionary<string, string>;
+    /// origins (route included) whose selector is being asked right now by one
+    /// request, so a concurrent request waits for that dial instead of asking
+    /// again; guarded by FLock
+    FSelecting: TDictionary<string, Boolean>;
     /// the TCP+TLS-or-cleartext dial for ARequest's scheme (fallback on https,
     /// the policy on http); out AProtocol names the negotiated wire protocol.
     /// Uses the extended ICleartextSocketFactory contract when the factory
@@ -748,9 +752,24 @@ type
     procedure AddPendingLocked(const AOrigin: string; const ADelta: Integer);
     function ListFor(const AOrigin: string): TList<IPooledConnection>;
     function PickEligible(const AOrigin: string): IPooledConnection;
-    /// can a new connection be opened for AOrigin? False when the origin is
-    /// already at MaxConnectionsPerHost, or the pool is at MaxTotalConnections.
-    function CanOpenNew(const AOrigin: string): Boolean;
+    /// the origin and route part of a pool key, without the identity suffix
+    class function BaseOfKey(const AKey: string): string; static;
+    /// connections to the origin and route ABase across every identity
+    function CountForBase(const ABase: string): Integer;
+    /// the oldest idle connection to ABase whose key is not AKey (another
+    /// identity), or nil
+    function FindEvictable(const AKey, ABase: string;
+      out AList: TList<IPooledConnection>): IPooledConnection;
+    /// drain AConn and drop it from the pool, freeing its cap slot
+    procedure Evict(const AList: TList<IPooledConnection>;
+      const AConn: IPooledConnection);
+    /// can a new connection be opened for the key AKey?  The per-host cap
+    /// counts the origin and route across all identities, so False when that
+    /// origin is at MaxConnectionsPerHost or the pool is at
+    /// MaxTotalConnections.  AEvict True makes room by closing the oldest idle
+    /// connection of another identity to the same origin when a cap is
+    /// reached; False only asks whether that would be needed.
+    function CanOpenNew(const AKey: string; const AEvict: Boolean): Boolean;
     procedure Register(const AOrigin: string;
       const AConn: IPooledConnection);
   public
@@ -1964,6 +1983,24 @@ begin
         'the client identity selector failed for %s:%d: %s',
         [AHost, APort, E.Message]);
   end;
+  // an expired answer is refused before anything is dialled; the message
+  // names the expiry, never key material
+  if (Result <> nil) and (Result.NotAfter < LocalTimeToUniversal(Now)) then
+    raise EHttpTlsConfigError.CreateFmt(
+      'the client identity selector returned a certificate for %s:%d that ' +
+      'expired on %s UTC',
+      [AHost, APort, FormatDateTime('yyyy-mm-dd hh:nn:ss', Result.NotAfter)]);
+end;
+
+/// raise EHttpTlsConfigError when an identity (or selector) is configured but
+/// AFactory, an injected socket factory, cannot present identities
+procedure RequireIdentityFactory(const AFactory: IHttp2SocketFactory;
+  const AWhat: string);
+begin
+  if not Supports(AFactory, IIdentitySocketFactory) then
+    raise EHttpTlsConfigError.CreateFmt(
+      '%s, but the injected socket factory cannot present a client identity ' +
+      '(it does not implement IIdentitySocketFactory)', [AWhat]);
 end;
 
 /// raise EHttpTlsConfigError when a request's own identity has expired, before
@@ -2657,6 +2694,14 @@ begin
   if FIdentityError <> '' then
     raise EHttpTlsConfigError.Create(FIdentityError);
   Factory := FSocketFactory;
+  // an injected factory that cannot present identities would drop them
+  // silently: refuse the combination
+  if FIdentity <> nil then
+    RequireIdentityFactory(Factory, 'a client identity is configured');
+  if FIdentitySelector <> nil then
+    RequireIdentityFactory(Factory, 'a client identity selector is configured');
+  if FProxyIdentity <> nil then
+    RequireIdentityFactory(Factory, 'a proxy client identity is configured');
   if FIdentity <> nil then
     if FIdentity.NotAfter < LocalTimeToUniversal(Now) then
       raise EHttpTlsConfigError.CreateFmt(
@@ -2667,7 +2712,7 @@ begin
       raise EHttpTlsConfigError.CreateFmt(
         'the proxy client certificate expired on %s UTC',
         [FormatDateTime('yyyy-mm-dd hh:nn:ss', FProxyIdentity.NotAfter)]);
-  // an injected transport factory is the test seam and is left alone; with a
+  // an injected transport factory that presents identities is left alone; with a
   // selector installed the fixed identity is nil and each dial is handed the
   // selector's answer instead
   if ((FIdentity <> nil) or (FProxyIdentity <> nil) or
@@ -3299,6 +3344,7 @@ begin
   FCreatedAt := TDictionary<Pointer, QWord>.Create;
   FPending := TDictionary<string, Integer>.Create;
   FIdentityKeys := TDictionary<string, string>.Create;
+  FSelecting := TDictionary<string, Boolean>.Create;
   FFactory := AFactory;
   FObserver := AObserver;
   FMaxConnectionsPerHost := AMaxConnectionsPerHost;
@@ -3333,6 +3379,7 @@ begin
   FCreatedAt.Free;
   FPending.Free;
   FIdentityKeys.Free;
+  FSelecting.Free;
   FLock.Free;
   inherited Destroy;
 end;
@@ -3435,11 +3482,92 @@ begin
   end;
 end;
 
-function TConnectionPool.CanOpenNew(const AOrigin: string): Boolean;
+class function TConnectionPool.BaseOfKey(const AKey: string): string;
+var
+  P: Integer;
 begin
-  Result := (not FClosed) and
-            (ListFor(AOrigin).Count < FMaxConnectionsPerHost) and
+  P := Pos(' id=', AKey);
+  if P = 0 then
+    Result := AKey
+  else
+    Result := Copy(AKey, 1, P - 1);
+end;
+
+function TConnectionPool.CountForBase(const ABase: string): Integer;
+var
+  Key: string;
+begin
+  Result := 0;
+  for Key in FByOrigin.Keys do
+    if BaseOfKey(Key) = ABase then
+      Inc(Result, FByOrigin[Key].Count);
+end;
+
+function TConnectionPool.FindEvictable(const AKey, ABase: string;
+  out AList: TList<IPooledConnection>): IPooledConnection;
+var
+  Key: string;
+  L: TList<IPooledConnection>;
+  C: IPooledConnection;
+  Born, BestBorn: QWord;
+begin
+  Result := nil;
+  AList := nil;
+  BestBorn := High(QWord);
+  for Key in FByOrigin.Keys do
+  begin
+    if (Key = AKey) or (BaseOfKey(Key) <> ABase) then
+      Continue;
+    L := FByOrigin[Key];
+    for C in L do
+    begin
+      if C.ActiveStreams > 0 then
+        Continue;
+      if not FCreatedAt.TryGetValue(C.Key, Born) then
+        Born := 0;
+      if (Result = nil) or (Born < BestBorn) then
+      begin
+        Result := C;
+        AList := L;
+        BestBorn := Born;
+      end;
+    end;
+  end;
+end;
+
+procedure TConnectionPool.Evict(const AList: TList<IPooledConnection>;
+  const AConn: IPooledConnection);
+begin
+  AConn.Drain;                       // closes now, since it is idle
+  FIdleSince.Remove(AConn.Key);
+  FCreatedAt.Remove(AConn.Key);
+  AList.Remove(AConn);
+  Dec(FTotalConnections);
+end;
+
+function TConnectionPool.CanOpenNew(const AKey: string;
+  const AEvict: Boolean): Boolean;
+var
+  Base: string;
+  Victim: IPooledConnection;
+  VictimList: TList<IPooledConnection>;
+begin
+  if FClosed then
+    Exit(False);
+  Base := BaseOfKey(AKey);
+  Result := (CountForBase(Base) < FMaxConnectionsPerHost) and
             (FTotalConnections < FMaxTotalConnections);
+  if Result then
+    Exit;
+  // a cap is reached: an idle connection of another identity to this origin
+  // gives its slot to the new identity (the cap protects the server, so the
+  // origin never holds more than the cap across identities)
+  Victim := FindEvictable(AKey, Base, VictimList);
+  if Victim = nil then
+    Exit(False);
+  if AEvict then
+    Evict(VictimList, Victim);
+  Result := True;
 end;
 
 function TConnectionPool.DialFor(const AHost: string; const APort: Word;
@@ -3707,9 +3835,10 @@ var
   Waiting, Opened: Boolean;
   Protocol: TNegotiatedProtocol;
   Key, PendingKey, Remembered, Fingerprint: string;
-  Selecting, Resolved, NeedSelect, Fixed: Boolean;
+  Selecting, Resolved, NeedSelect, Fixed, Marked, Deferred: Boolean;
   Identity: IClientIdentity;
 begin
+  Marked := False;
   Deadline := GetTickCount64 + QWord(AHeaderTimeoutMs);
   Waiting := False;
   PendingKey := AOrigin;
@@ -3740,8 +3869,16 @@ begin
       First := nil;
       Opened := False;
       NeedSelect := False;
+      Deferred := False;
       FLock.Acquire;
       try
+        // back from asking the selector: this request now dials (or parks),
+        // so a concurrent request may stop waiting for it
+        if Marked then
+        begin
+          FSelecting.Remove(AOrigin);
+          Marked := False;
+        end;
         // with a selector the key carries the fingerprint: the one the
         // selector just answered, else the one the last dial here presented,
         // so a reused connection never asks the selector again
@@ -3765,12 +3902,23 @@ begin
         ReapClosed;
         ReapIdleLocked;
         Conn := PickEligible(Key);
-        if (Conn = nil) and CanOpenNew(Key) then
+        if (Conn = nil) and CanOpenNew(Key, not (Selecting and not Resolved)) then
         begin
           if Selecting and not Resolved then
+          begin
             // a dial is needed: ask the selector outside the lock, then come
-            // back and key the new connection by its answer
-            NeedSelect := True
+            // back and key the new connection by its answer.  While another
+            // request is already asking for this origin, wait for its dial
+            // to publish a connection (or fail) instead of asking again
+            if FSelecting.ContainsKey(AOrigin) then
+              Deferred := True
+            else
+            begin
+              NeedSelect := True;
+              FSelecting.Add(AOrigin, True);
+              Marked := True;
+            end;
+          end
           else
           begin
             // the one transport-selection point: TLS vs cleartext and the
@@ -3788,7 +3936,7 @@ begin
         // PoolStats can report the queue
         // (a caller about to ask the selector is not parked: it goes straight
         // round again)
-        if not NeedSelect then
+        if not (NeedSelect or Deferred) then
           if (Conn <> nil) or (First <> nil) then
           begin
             if Waiting then
@@ -3893,11 +4041,14 @@ begin
       end;
     end;
   finally
-    if Waiting then
+    if Waiting or Marked then
     begin
       FLock.Acquire;
       try
-        AddPendingLocked(PendingKey, -1);
+        if Marked then
+          FSelecting.Remove(AOrigin);
+        if Waiting then
+          AddPendingLocked(PendingKey, -1);
       finally
         FLock.Release;
       end;
@@ -4181,6 +4332,9 @@ begin
   if ARequest.Url = '' then
     raise EHttpProtocolError.Create('request URL is empty', ecProtocolError);
   CheckRequestIdentity(ARequest.ClientIdentity);
+  if (ARequest.ClientIdentity <> nil) and
+     (SchemeOfUrl(ARequest.Url) = 'https') then
+    RequireIdentityFactory(FFactory, 'the request carries a client identity');
   FLock.Acquire;
   try
     if FClosed then
@@ -4379,6 +4533,8 @@ begin
     Supports(ARequest.ClientIdentity, IClientIdentity, ReqId);
   CheckRequestIdentity(ReqId);
   WsParseUrl(ARequest.Url, Secure, Host, Port, Target, Authority);
+  if Secure and (ReqId <> nil) then
+    RequireIdentityFactory(FFactory, 'the request carries a client identity');
   // the session is one attempt: it starts before anything is dialled, and
   // whatever fails below ends it with that failure
   Tracker := nil;

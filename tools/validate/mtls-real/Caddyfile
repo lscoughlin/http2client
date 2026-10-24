@@ -1,0 +1,33 @@
+# Caddy for tools/validate/mtls-real.sh: require_and_verify against the fixture
+# CA, the client subject echoed by a placeholder.  The script substitutes the
+# ports: @P12@ HTTP/2 + TLS 1.2, @P13@ HTTP/2 + TLS 1.3, @P1H@ HTTP/1.1 +
+# TLS 1.3.
+{
+	auto_https off
+	admin off
+	servers 127.0.0.1:@P1H@ {
+		protocols h1
+	}
+}
+
+(mtls) {
+	bind 127.0.0.1
+	tls /certs/server.crt /certs/server.key {
+		protocols {args[0]} {args[0]}
+		client_auth {
+			mode require_and_verify
+			trust_pool file /certs/ca.crt
+		}
+	}
+	respond "dn={http.request.tls.client.subject} proto={http.request.proto} tls={http.request.tls.version}"
+}
+
+https://localhost:@P12@ {
+	import mtls tls1.2
+}
+https://localhost:@P13@ {
+	import mtls tls1.3
+}
+https://localhost:@P1H@ {
+	import mtls tls1.3
+}

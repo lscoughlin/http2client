@@ -154,9 +154,14 @@ one from PEM files; `Build` raises `EHttpTlsConfigError` for an identity that
 cannot be used, and a server that refuses the certificate raises
 `EHttpTlsClientAuthError`. `WithClientIdentitySelector` asks an
 `IClientIdentitySelector` for the identity of each new TLS connection (once per
-dial, outside the pool lock), which gives a different identity per origin and
-certificate rotation; with it installed the pool key carries the identity
-fingerprint. `WithProxyClientIdentity` answers an `https://` proxy that
+dial, outside the pool lock, with an expired answer refused before dialling),
+which gives a different identity per origin and certificate rotation; with it
+installed the pool key carries the identity fingerprint, while
+`MaxConnectionsPerHost` still counts the origin across identities and an idle
+connection of another identity is closed to make room at a cap.
+An identity or selector with an injected `WithSocketFactory` that cannot
+present identities (no `IIdentitySocketFactory`) raises `EHttpTlsConfigError`
+at `Build`, or at `Send` for a request identity. `WithProxyClientIdentity` answers an `https://` proxy that
 requires a client certificate, and the identity goes to that proxy only; the
 origin identity goes to the origin on every route. A request can carry its own
 origin identity with `THttpRequest.WithClientIdentity` (and

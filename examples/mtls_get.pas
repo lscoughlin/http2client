@@ -17,6 +17,9 @@
 //          request (the origin identity for that request: it wins over the
 //          selector and the certificate arguments, goes through any proxy to
 //          the origin only, and is dropped on a redirect to another origin)
+//          MTLS_PRINT_BODY=1 also prints each response body on one `body:`
+//          line, so a server that echoes the client certificate subject can be
+//          checked (tools/validate/mtls-real.sh)
 // - shows: WithClientCertificateFiles, WithClientIdentitySelector,
 //   WithProxyClientIdentity, a per-request WithClientIdentity, a bad identity failing at Build, and the
 //   distinct EHttpTlsClientAuthError when the server rejects the certificate.
@@ -152,7 +155,7 @@ var
   Listener: TFirstText;
   ListenerRef: IWebSocketListener;
   Socket: IWebSocket;
-  CaFile, Passphrase: string;
+  CaFile, Passphrase, BodyText: string;
 begin
   if ParamCount < 3 then
   begin
@@ -230,13 +233,17 @@ begin
           Response := Client.Send(THttpRequest.Create(hmGet, Urls[UrlIndex])
             .WithClientIdentity(ReqId));
           WriteLn('status: ', Response.StatusCode);
-          WriteLn('body bytes: ', Length(ReadText(Response)));
+          BodyText := ReadText(Response);
+          WriteLn('body bytes: ', Length(BodyText));
+          if GetEnvironmentVariable('MTLS_PRINT_BODY') = '1' then
+            WriteLn('body: ', StringReplace(Trim(BodyText), #10, ' ', [rfReplaceAll]));
         end;
     except
       on E: EHttpTlsClientAuthError do
       begin
         // the server refused our certificate; retrying cannot change that
-        WriteLn(StdErr, 'server rejected the client certificate: ', E.Alert);
+        WriteLn(StdErr, 'server rejected the client certificate: ', E.Alert,
+          ' (', E.Message, ')');
         Halt(3);
       end;
       on E: EHttpError do

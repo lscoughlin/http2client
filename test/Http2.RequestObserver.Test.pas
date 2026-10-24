@@ -694,7 +694,8 @@ begin
   Sleep(10);      // the sleep is the thing measured, not a wait on a thread
   B := NowUs;
   AssertTrue('at least 9 ms elapsed', B - A >= 9000);
-  AssertTrue('at most 50 ms elapsed', B - A <= 50000);
+  // a loaded host can oversleep; the bound only has to separate ms from s
+  AssertTrue('well under a second elapsed', B - A <= 1000000);
 end;
 
 { TRequestContextTest }

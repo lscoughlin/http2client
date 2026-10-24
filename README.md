@@ -367,8 +367,14 @@ Client := THttpClientFactory.Create
   .Build;
 ```
 
-The pool keeps connections that used different identities apart; connections
-that used a replaced certificate serve until they close. The selector is asked
+The pool keeps connections that used different identities apart, but
+`MaxConnectionsPerHost` counts an origin across identities: connections that
+used a replaced certificate serve until they close, and an idle one is closed
+to make room when the cap is reached. A busy connection is never closed for
+that. An answer from the selector whose certificate has expired fails the dial
+with `EHttpTlsConfigError` before anything is dialled. A client built with
+`WithSocketFactory` and an identity, a selector or a proxy identity raises
+`EHttpTlsConfigError` at `Build` unless the factory can present identities. The selector is asked
 with the origin's host and port on every route, direct or through a tunnel.
 The identity given with `WithProxyClientIdentity` goes to an `https://` proxy
 only, and the origin identity never goes to the proxy.
@@ -386,7 +392,7 @@ Resp := Client.Send(THttpRequest.Create(hmGet, 'https://billing.example/')
 Connections that used different request identities never share a connection. A
 redirect to the same origin keeps the request identity; a redirect to another
 origin drops it. `Send` raises `EHttpTlsConfigError` before dialling when the
-identity has expired.
+identity has expired, or when an injected socket factory cannot present it.
 
 ### Text, JSON, and XML helpers
 

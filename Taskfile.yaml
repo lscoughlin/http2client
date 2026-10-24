@@ -173,6 +173,11 @@ tasks:
     cmds:
       - bash tools/validate/mtls-live.sh
 
+  validate:mtls-real:
+    desc: 'Live mutual TLS gate against nginx, Apache httpd and Caddy (Docker host; MTLS_REAL_HOST)'
+    cmds:
+      - bash tools/validate/mtls-real.sh
+
   validate:proxy:real:
     desc: 'Real-proxy gate — Apache httpd and Squid in containers on a Docker host (PROXY_REAL_HOST)'
     cmds:
