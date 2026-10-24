@@ -2275,7 +2275,6 @@ procedure TConnectionPool.Register(const AOrigin: string;
 begin
   ListFor(AOrigin).Add(AConn);
   Inc(FTotalConnections);
-  FCreatedAt.AddOrSetValue(AConn.Key, GetTickCount64);
   MarkUsed(AConn);
 end;
 
@@ -2320,6 +2319,8 @@ end;
 
 procedure TConnectionPool.MarkUsed(const C: IPooledConnection);
 begin
+  // the first use is registration, which stamps the connection's age
+  FCreatedAt.TryAdd(C.Key, GetTickCount64);
   FIdleSince.AddOrSetValue(C.Key, GetTickCount64);
 end;
 
