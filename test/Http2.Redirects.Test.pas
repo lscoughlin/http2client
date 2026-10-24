@@ -33,11 +33,21 @@ type
     Body: TBytes;
     EndStream: Boolean;
     RstCode: THttp2ErrorCode;
+    /// optional response headers ('' = none)
+    ContentType: string;
+    ContentEncoding: string;
+    /// the body DATA frame does not carry END_STREAM, so the stream stays open
+    BodyOpen: Boolean;
   end;
 
 /// a response with :status (+ optional location header and body)
 function HdrSpec(const AStatus: string; const ALocation: string = '';
   const ABody: TBytes = nil; const AEndStream: Boolean = True): TRespSpec;
+/// ASpec with a content-type (and an optional content-encoding) header
+function WithContentType(const ASpec: TRespSpec; const AType: string;
+  const AEncoding: string = ''): TRespSpec;
+/// ASpec whose body frame leaves the stream open
+function WithOpenBody(const ASpec: TRespSpec): TRespSpec;
 /// a RST_STREAM response
 function RstSpec(const ACode: THttp2ErrorCode): TRespSpec;
 /// a 200 response head that stays open, then RST_STREAM
@@ -174,6 +184,23 @@ begin
   Result.Body := ABody;
   Result.EndStream := AEndStream;
   Result.RstCode := ecNoError;
+  Result.ContentType := '';
+  Result.ContentEncoding := '';
+  Result.BodyOpen := False;
+end;
+
+function WithOpenBody(const ASpec: TRespSpec): TRespSpec;
+begin
+  Result := ASpec;
+  Result.BodyOpen := True;
+end;
+
+function WithContentType(const ASpec: TRespSpec; const AType: string;
+  const AEncoding: string): TRespSpec;
+begin
+  Result := ASpec;
+  Result.ContentType := AType;
+  Result.ContentEncoding := AEncoding;
 end;
 
 function RstSpec(const ACode: THttp2ErrorCode): TRespSpec;
@@ -184,6 +211,9 @@ begin
   Result.Body := nil;
   Result.EndStream := True;
   Result.RstCode := ACode;
+  Result.ContentType := '';
+  Result.ContentEncoding := '';
+  Result.BodyOpen := False;
 end;
 
 function HdrRstSpec(const ACode: THttp2ErrorCode): TRespSpec;
@@ -384,6 +414,20 @@ begin
     Block[1].Value := Spec.Location;
     Block[1].Sensitive := False;
   end;
+  if Spec.ContentType <> '' then
+  begin
+    SetLength(Block, Length(Block) + 1);
+    Block[High(Block)].Name := 'content-type';
+    Block[High(Block)].Value := Spec.ContentType;
+    Block[High(Block)].Sensitive := False;
+  end;
+  if Spec.ContentEncoding <> '' then
+  begin
+    SetLength(Block, Length(Block) + 1);
+    Block[High(Block)].Name := 'content-encoding';
+    Block[High(Block)].Value := Spec.ContentEncoding;
+    Block[High(Block)].Sensitive := False;
+  end;
   Enc := FRespCodec.Encode(Block);
   if Spec.Kind = rkHeadersThenRst then
   begin
@@ -397,7 +441,8 @@ begin
   else
   begin
     AppendInLocked(FrameBytes(BuildHeadersFrame(AStreamId, Enc, True, False)));
-    AppendInLocked(FrameBytes(BuildDataFrame(AStreamId, Spec.Body, True)));
+    AppendInLocked(FrameBytes(BuildDataFrame(AStreamId, Spec.Body,
+      not Spec.BodyOpen)));
   end;
 end;
 
