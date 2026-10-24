@@ -866,6 +866,8 @@ begin
 end;
 
 procedure TStreamLease.Start;
+var
+  Err: EHttpError;
 begin
   if FStarted then
     raise EHttpProtocolError.Create('stream lease already started',
@@ -878,7 +880,13 @@ begin
   FRegistered := True;     // before registering: the connection may fail us at once
   FConnection.RegisterStream(FStreamId, Self);
   if FFailed then
-    raise MakeStreamError;
+  begin
+    // the connection was already dead: the stream must not stay in its map
+    // (ReleaseLease is idempotent, and the failure callback usually ran it)
+    Err := MakeStreamError;
+    ReleaseLease;
+    raise Err;
+  end;
   try
     SendHeaders;
     if FLocalState = lsHeadersSent then
