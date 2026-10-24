@@ -45,6 +45,9 @@ type
     FRelease: PRTLEvent;
     FDone: PRTLEvent;
     FRaised: Boolean;
+    /// set just before FDone is signalled; the thread itself may not have
+    /// returned from Execute yet, so TThread.Finished is not the signal
+    FCompleted: Boolean;
   protected
     procedure Execute; override;
   public
@@ -199,6 +202,7 @@ begin
     FRaised := True;
     RTLEventSetEvent(FGot);
   end;
+  FCompleted := True;
   RTLEventSetEvent(FDone);
 end;
 
@@ -210,8 +214,10 @@ end;
 
 function THoldWorker.WaitDone(const ATimeoutMs: Integer): Boolean;
 begin
+  // the event is the signal: Finished turns true only after Execute has
+  // returned, which can be a moment after the event was set
   RTLEventWaitFor(FDone, ATimeoutMs);
-  Result := Finished;
+  Result := FCompleted;
 end;
 
 procedure THoldWorker.Release;
