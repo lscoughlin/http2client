@@ -104,7 +104,8 @@ type
     procedure WriteTracked(const AFrame: TFrame);
     procedure CheckPingKeepAlive;
     procedure HandlePingAck(const APayload: TBytes);
-    procedure Fail(const AMessage: string; const ACode: THttp2ErrorCode);
+    procedure Fail(const AMessage: string; const ACode: THttp2ErrorCode;
+      const AClientAuthAlert: string = '');
   public
     constructor Create(AConn: TConnection);
   end;
@@ -150,6 +151,7 @@ type
     FHighestStreamId: LongWord;
     FError: string;
     FErrorCode: THttp2ErrorCode;
+    FClientAuthAlert: string;
     FClosed: Boolean;
     FReadPollMs: Integer;
     FPingIntervalMs: Integer;
@@ -240,7 +242,15 @@ type
     /// record a peer GOAWAY; stops new streams, marks higher ids retryable
     procedure MarkGoAway(const ALastStreamId: LongWord);
     /// move to a failed state and unblock every waiter (thread-internal seam)
-    procedure FailWith(const AMessage: string; const ACode: THttp2ErrorCode);
+    // - AClientAuthAlert is the TLS alert name when the server rejected the
+    //   client certificate (doc/design/mtls.md), '' otherwise
+    procedure FailWith(const AMessage: string; const ACode: THttp2ErrorCode;
+      const AClientAuthAlert: string = '');
+    /// the error to raise to a caller of a connection that has failed: an
+    /// EHttpTlsClientAuthError when the server rejected the client
+    /// certificate, else an EHttpConnectionError with the recorded message
+    function FailureError(const AMessage: string;
+      const ACode: THttp2ErrorCode): EHttpError;
     /// record peer SETTINGS under the connection lock (thread-internal seam)
     procedure ApplyPeerSettingsValue(const ASettings: TConnectionSettings);
     /// record the peer's SETTINGS ACK (thread-internal seam)
@@ -557,6 +567,15 @@ begin
   FSockStream := TSocketStream.Create(FSocket);
 end;
 
+/// the TLS alert name when E is a client-certificate rejection, else ''
+function ClientAuthAlertOf(const E: Exception): string;
+begin
+  if E is EHttpTlsClientAuthError then
+    Result := EHttpTlsClientAuthError(E).Alert
+  else
+    Result := '';
+end;
+
 procedure TConnectionThread.Execute;
 var
   Frame: TFrame;
@@ -592,7 +611,7 @@ begin
           Continue;                 // idle poll: loop back to outbound work
         on E: EHttpError do
         begin
-          Fail(E.Message, E.ErrorCode);
+          Fail(E.Message, E.ErrorCode, ClientAuthAlertOf(E));
           Break;
         end;
       end;
@@ -600,7 +619,8 @@ begin
     DrainOutbound;                  // flush anything pending after Terminate
   except
     on E: Exception do
-      Fail(E.ClassName + ': ' + E.Message, ecInternalError);
+      Fail(E.ClassName + ': ' + E.Message, ecInternalError,
+        ClientAuthAlertOf(E));
   end;
 end;
 
@@ -756,10 +776,10 @@ begin
 end;
 
 procedure TConnectionThread.Fail(const AMessage: string;
-  const ACode: THttp2ErrorCode);
+  const ACode: THttp2ErrorCode; const AClientAuthAlert: string);
 begin
   if FConn <> nil then
-    TConnection(FConn).FailWith(AMessage, ACode);
+    TConnection(FConn).FailWith(AMessage, ACode, AClientAuthAlert);
 end;
 
 { TConnection }
@@ -986,15 +1006,27 @@ end;
 
 procedure TConnection.RegisterStream(const AStreamId: LongWord;
   const AStream: IConnectionStream);
+var
+  Failed: Boolean;
+  Msg: string;
+  Code: THttp2ErrorCode;
 begin
   FLock.Acquire;
   try
     FStreams.AddOrSetValue(AStreamId, AStream);
     FFlowControl.OpenStream(AStreamId);
+    Failed := FState = csClosed;
+    Msg := FError;
+    Code := FErrorCode;
   finally
     FLock.Release;
   end;
   EmitStreamOpen(AStreamId);
+  // a connection that failed before this stream registered missed the
+  // fan-out in FailWith and would never answer it: fail the stream now
+  // instead of leaving it to the header timeout
+  if Failed then
+    AStream.OnConnectionFailed(Msg, Code);
 end;
 
 procedure TConnection.UnregisterStream(const AStreamId: LongWord);
@@ -1058,7 +1090,7 @@ begin
 end;
 
 procedure TConnection.FailWith(const AMessage: string;
-  const ACode: THttp2ErrorCode);
+  const ACode: THttp2ErrorCode; const AClientAuthAlert: string);
 var
   Snapshot: TArray<IConnectionStream>;
   S: IConnectionStream;
@@ -1070,6 +1102,7 @@ begin
       FState := csClosed;
       FError := AMessage;
       FErrorCode := ACode;
+      FClientAuthAlert := AClientAuthAlert;
     end;
     Snapshot := FStreams.Values.ToArray;
   finally
@@ -1083,6 +1116,17 @@ begin
   for S in Snapshot do
     S.OnConnectionFailed(AMessage, ACode);
   EmitConnectionClose(AMessage, ACode);
+end;
+
+function TConnection.FailureError(const AMessage: string;
+  const ACode: THttp2ErrorCode): EHttpError;
+begin
+  // FClientAuthAlert is written once, by FailWith, before the state becomes
+  // csClosed, so a caller that has seen the failure may read it without FLock
+  if FClientAuthAlert <> '' then
+    Result := EHttpTlsClientAuthError.Create(AMessage, FClientAuthAlert)
+  else
+    Result := EHttpConnectionError.Create(AMessage, ACode);
 end;
 
 procedure TConnection.TouchActivity;
@@ -1246,7 +1290,7 @@ begin
       // reason rather than sleeping out the deadline
       if FClosed or (FState = csClosed) then
         if FError <> '' then
-          raise EHttpConnectionError.Create(FError, FErrorCode)
+          raise FailureError(FError, FErrorCode)
         else
           raise EHttpConnectionClosed.Create(
             'connection closed while waiting for send credit');

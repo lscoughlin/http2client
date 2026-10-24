@@ -1,0 +1,1369 @@
+/// Mutual TLS tests against an in-process OpenSSL server (doc/design/mtls.md)
+// - the server requires a client certificate (SSL_VERIFY_PEER with
+//   FAIL_IF_NO_PEER_CERT, trust store = the fixture CA) and pins TLS 1.2 or
+//   1.3, so both ways a rejection surfaces are exercised: the handshake fails
+//   (1.2) or the first read fails after the handshake "succeeded" (1.3).
+// - it answers one canned HTTP/2 or HTTP/1.1 exchange, an event stream or a
+//   WebSocket upgrade, so the whole client path runs; a small tunnel proxy
+//   (CONNECT, SOCKS5, TLS to the proxy) covers the routed dials.
+// - the fixtures come from tools/validate/make-mtls-certs.sh.
+unit Http2.MutualTls.Test;
+
+{$mode delphi}{$H+}
+{$modeswitch advancedrecords}
+{$modeswitch typehelpers}
+{$interfaces com}
+
+interface
+
+uses
+  SysUtils, Classes, SyncObjs, Sockets, BaseUnix, fpcunit, testregistry,
+  mormot.core.base, mormot.core.os, mormot.lib.openssl11,
+  Http2.Errors, Http2.ClientCert, Http2.Proxy, Http2.Tls, Http2.Messages,
+  Http2.Stream,
+  Http2.Client,
+  Http2.Sse, Http2.WebSocket, Http2.RequestObserver,
+  Http2.RequestObserver.Test;
+
+type
+  TMtlsKind = (mkH2, mkHttp1, mkSse, mkWebSocket, mkPlain);
+
+  /// the ALPN protocol the server selects when the client offers it
+  TAlpnChoice = record
+    Len: Byte;
+    Name: array[0..15] of AnsiChar;
+  end;
+
+  TMtlsServer = class(TThread)
+  private
+    FListenFd: Integer;
+    FCtx: PSSL_CTX;
+    FKind: TMtlsKind;
+    FAlpn: TAlpnChoice;
+    FPort: Word;
+    procedure Serve(const AFd: Integer);
+    procedure ServeTls(const AFd: Integer);
+  protected
+    procedure Execute; override;
+  public
+    /// TCP connections accepted, handshakes completed and refused
+    Connections, Handshakes, Refused, Requests: Integer;
+    /// subject of the last client certificate the server accepted
+    LastSubject: string;
+    constructor Create(const AKind: TMtlsKind; const AVersion: Integer);
+    destructor Destroy; override;
+    procedure Stop;
+    property Port: Word read FPort;
+  end;
+
+  TTunnelMode = (tmConnect, tmSocks5, tmHttps);
+
+  /// forwards one connection at a time to the origin port; for tmHttps the
+  /// client leg is TLS and the proxy notes whether a certificate was offered
+  TTunnelProxy = class(TThread)
+  private
+    FListenFd: Integer;
+    FCtx: PSSL_CTX;
+    FMode: TTunnelMode;
+    FOriginPort: Word;
+    FPort: Word;
+    procedure Handle(const AFd: Integer);
+  protected
+    procedure Execute; override;
+  public
+    Tunnels: Integer;
+    SawClientCert: Boolean;
+    constructor Create(const AMode: TTunnelMode; const AOriginPort: Word);
+    destructor Destroy; override;
+    procedure Stop;
+    property Port: Word read FPort;
+  end;
+
+  /// routes every request, loopback included, through one proxy
+  TFixedSelector = class(TInterfacedObject, IProxySelector)
+  private
+    FProxy: IProxy;
+  public
+    constructor Create(const AKind: TProxyKind; const APort: Word);
+    function SelectProxy(const AUri: string): IProxy;
+  end;
+
+  TWsRecorder = class(TWebSocketListener)
+  private
+    FEvent: TEvent;
+  public
+    Text: string;
+    constructor Create;
+    destructor Destroy; override;
+    procedure OnText(const ASocket: IWebSocket; const AText: string;
+      const ALast: Boolean); override;
+    function WaitText(const AMs: Integer): Boolean;
+  end;
+
+  TMutualTlsTest = class(TTestCase)
+  private
+    FServer: TMtlsServer;
+    FProxy: TTunnelProxy;
+    function StartServer(const AKind: TMtlsKind;
+      const AVersion: Integer): TMtlsServer;
+    function Url(const AScheme: string = 'https'): string;
+    function GoodIdentity: IClientIdentity;
+    function NewClient(const AIdentity: IClientIdentity;
+      const AFallback: Boolean = False): IHttpClient;
+    function Fetch(const AClient: IHttpClient; out ABody: string): Integer;
+    function AlertOfFetch(const AClient: IHttpClient): string;
+    procedure RunAccepts(const AKind: TMtlsKind; const AVersion: Integer;
+      const AFallback: Boolean);
+    procedure RunSse(const AVersion: Integer);
+    procedure RunWebSocket(const AVersion: Integer);
+    procedure RunNoIdentity(const AKind: TMtlsKind; const AVersion: Integer;
+      const AFallback: Boolean; const AExpected: string);
+    procedure RunWrongCa(const AVersion: Integer);
+    procedure RunExpiredOnTheWire(const AVersion: Integer;
+      const AExpected: string);
+    procedure RunTunnel(const AMode: TTunnelMode; const AVersion: Integer);
+    function ProbeAlert(const AVersion: Integer;
+      const AIdentity: IClientIdentity; const AKind: TMtlsKind): string;
+  protected
+    procedure TearDown; override;
+  published
+    // accepted identity, TLS 1.2 and 1.3
+    procedure TestHttp2WithTheIdentityTls12;
+    procedure TestHttp2WithTheIdentityTls13;
+    procedure TestHttp11FallbackWithTheIdentityTls12;
+    procedure TestHttp11FallbackWithTheIdentityTls13;
+    procedure TestSseWithTheIdentityTls12;
+    procedure TestSseWithTheIdentityTls13;
+    procedure TestWssWithTheIdentityTls12;
+    procedure TestWssWithTheIdentityTls13;
+    procedure TestPkcs12IdentityIsAccepted;
+    // rejection, TLS 1.2 and 1.3
+    procedure TestNoIdentityIsRejectedOnceTls12;
+    procedure TestNoIdentityIsRejectedOnceTls13;
+    procedure TestNoIdentityOverHttp11IsRejectedTls13;
+    procedure TestNoIdentityWithFallbackOnDoesNotFallBackTls13;
+    procedure TestNoIdentityOnWssIsRejectedTls13;
+    procedure TestWrongCaIsRejectedTls12;
+    procedure TestWrongCaIsRejectedTls13;
+    procedure TestExpiredIsRejectedOnTheWireTls12;
+    procedure TestExpiredIsRejectedOnTheWireTls13;
+    procedure TestRejectionIsNotRetried;
+    // routed dials
+    procedure TestConnectTunnelPresentsTheIdentityTls13;
+    procedure TestSocks5TunnelPresentsTheIdentityTls13;
+    procedure TestHttpsProxyLegNeverSeesTheIdentityTls13;
+    // every dial helper
+    procedure TestEveryDialHelperPresentsTheIdentity;
+    procedure TestEveryTlsSocketConstructionCarriesTheIdentity;
+    // other
+    procedure TestCleartextIgnoresTheIdentity;
+    procedure TestLogLineHasSubjectAndFingerprintButNoSecrets;
+  end;
+
+implementation
+
+const
+  cPass = 'mtls-test-pass';
+  cTls12 = TLS1_2_VERSION;
+  cTls13 = TLS1_3_VERSION;
+
+function Fixture(const AName: string): string;
+begin
+  Result := ExtractFilePath(ParamStr(0)) + '../test/certs/mtls/' + AName;
+  if FileExists(Result) then
+    Exit;
+  Result := 'test/certs/mtls/' + AName;
+end;
+
+{ one accepted connection, TLS or plain }
+
+type
+  TConn = record
+    Ssl: PSSL;
+    Fd: Integer;
+  end;
+
+function ConnRead(const C: TConn; var ABuf; const N: Integer): Integer;
+begin
+  if C.Ssl <> nil then
+    Result := SSL_read(C.Ssl, @ABuf, N)
+  else
+    Result := fpRecv(C.Fd, @ABuf, N, 0);
+  if Result < 0 then
+    Result := 0;
+end;
+
+procedure ConnWrite(const C: TConn; const ABuf; const N: Integer);
+var
+  Sent, R: Integer;
+begin
+  Sent := 0;
+  while Sent < N do
+  begin
+    if C.Ssl <> nil then
+      R := SSL_write(C.Ssl, PByte(@ABuf) + Sent, N - Sent)
+    else
+      R := fpSend(C.Fd, PByte(@ABuf) + Sent, N - Sent, 0);
+    if R <= 0 then
+      Exit;
+    Inc(Sent, R);
+  end;
+end;
+
+procedure ConnWriteText(const C: TConn; const AText: AnsiString);
+begin
+  if AText <> '' then
+    ConnWrite(C, AText[1], Length(AText));
+end;
+
+function ConnReadFull(const C: TConn; var ABuf; const N: Integer): Boolean;
+var
+  Got, R: Integer;
+begin
+  Got := 0;
+  while Got < N do
+  begin
+    R := ConnRead(C, (PByte(@ABuf) + Got)^, N - Got);
+    if R <= 0 then
+      Exit(False);
+    Inc(Got, R);
+  end;
+  Result := True;
+end;
+
+function ConnReadHead(const C: TConn): AnsiString;
+var
+  B: Byte;
+begin
+  Result := '';
+  while ConnRead(C, B, 1) = 1 do
+  begin
+    Result := Result + AnsiChar(B);
+    if (Length(Result) >= 4) and
+       (Copy(Result, Length(Result) - 3, 4) = #13#10#13#10) then
+      Exit;
+    if Length(Result) > 16384 then
+      Exit;
+  end;
+end;
+
+procedure SetTimeouts(const AFd: Integer; const AMs: Integer);
+var
+  Tv: TTimeVal;
+  One: Integer;
+begin
+  // a write to a connection the client already closed must not kill the run
+  One := 1;
+  fpSetSockOpt(AFd, SOL_SOCKET, SO_NOSIGPIPE, @One, SizeOf(One));
+  Tv.tv_sec := AMs div 1000;
+  Tv.tv_usec := (AMs mod 1000) * 1000;
+  fpSetSockOpt(AFd, SOL_SOCKET, SO_RCVTIMEO, @Tv, SizeOf(Tv));
+  fpSetSockOpt(AFd, SOL_SOCKET, SO_SNDTIMEO, @Tv, SizeOf(Tv));
+end;
+
+function ListenOnLoopback(out APort: Word): Integer;
+var
+  Addr: TSockAddr;
+  Len: LongInt;
+begin
+  Result := fpsocket(AF_INET, SOCK_STREAM, 0);
+  FillChar(Addr, SizeOf(Addr), 0);
+  Addr.sin_family := AF_INET;
+  Addr.sin_port := htons(0);
+  Addr.sin_addr.s_addr := htonl($7F000001);
+  fpbind(Result, @Addr, SizeOf(Addr));
+  fplisten(Result, 8);
+  Len := SizeOf(Addr);
+  fpgetsockname(Result, @Addr, @Len);
+  APort := ntohs(Addr.sin_port);
+end;
+
+function WaitReadable(const AFd: Integer; const AMs: Integer): Boolean;
+var
+  P: TPollFd;
+begin
+  P.fd := AFd;
+  P.events := POLLIN;
+  P.revents := 0;
+  Result := fpPoll(@P, 1, AMs) > 0;
+end;
+
+type
+  TAlpnSelectCb = function(ssl: PSSL; out_: PPByte; outlen: PByte;
+    in_: PByte; inlen: Cardinal; arg: Pointer): Integer; cdecl;
+  TSetAlpnSelectCb = procedure(ctx: PSSL_CTX; cb: TAlpnSelectCb;
+    arg: Pointer); cdecl;
+
+function ResolveSslProc(const AName: PAnsiChar): Pointer;
+var
+  Dir: string;
+  Lib: TLibHandle;
+begin
+  Result := nil;
+  Dir := GetEnvironmentVariable('OPENSSL_LIBPATH');
+  if Dir <> '' then
+    Dir := IncludeTrailingPathDelimiter(Dir);
+  Lib := LibraryOpen(Dir + LIB_SSL3);
+  if Lib <> 0 then
+    Result := LibraryResolve(Lib, AName);
+end;
+
+/// picks the server's configured protocol when the client offered it
+function AlpnSelect(ssl: PSSL; out_: PPByte; outlen: PByte; in_: PByte;
+  inlen: Cardinal; arg: Pointer): Integer; cdecl;
+var
+  Choice: ^TAlpnChoice;
+  P: PByte;
+  Left: Cardinal;
+  L: Byte;
+begin
+  Choice := arg;
+  P := in_;
+  Left := inlen;
+  while Left > 0 do
+  begin
+    L := P^;
+    if (L = Choice^.Len) and (Left > L) and
+       (CompareByte((P + 1)^, Choice^.Name[0], L) = 0) then
+    begin
+      out_^ := PByte(@Choice^.Name[0]);
+      outlen^ := L;
+      Exit(SSL_TLSEXT_ERR_OK);
+    end;
+    if Left < Cardinal(L) + 1 then
+      Break;
+    Dec(Left, Cardinal(L) + 1);
+    Inc(P, Integer(L) + 1);
+  end;
+  Result := SSL_TLSEXT_ERR_NOACK;
+end;
+
+{ TMtlsServer }
+
+constructor TMtlsServer.Create(const AKind: TMtlsKind; const AVersion: Integer);
+var
+  SetCb: TSetAlpnSelectCb;
+  Name: AnsiString;
+begin
+  FKind := AKind;
+  FListenFd := ListenOnLoopback(FPort);
+  FCtx := SSL_CTX_new(TLS_server_method());
+  SSL_CTX_use_certificate_file(FCtx, PUtf8Char(UTF8String(Fixture('server.crt'))),
+    SSL_FILETYPE_PEM);
+  SSL_CTX_use_PrivateKey_file(FCtx, PUtf8Char(UTF8String(Fixture('server.key'))),
+    SSL_FILETYPE_PEM);
+  SSL_CTX_load_verify_locations(FCtx,
+    PUtf8Char(UTF8String(Fixture('ca.crt'))), nil);
+  SSL_CTX_set_verify(FCtx,
+    SSL_VERIFY_PEER or SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nil);
+  if AVersion <> 0 then
+  begin
+    SSL_CTX_set_min_proto_version(FCtx, AVersion);
+    SSL_CTX_set_max_proto_version(FCtx, AVersion);
+  end;
+  // ALPN: h2 for the HTTP/2 server, http/1.1 for the HTTP/1.1 kinds
+  if AKind = mkH2 then
+    Name := 'h2'
+  else
+    Name := 'http/1.1';
+  FAlpn.Len := Length(Name);
+  Move(Name[1], FAlpn.Name[0], Length(Name));
+  SetCb := ResolveSslProc('SSL_CTX_set_alpn_select_cb');
+  if Assigned(SetCb) and (AKind <> mkPlain) then
+    SetCb(FCtx, AlpnSelect, @FAlpn);
+  inherited Create(False);
+end;
+
+destructor TMtlsServer.Destroy;
+begin
+  if FCtx <> nil then
+    SSL_CTX_free(FCtx);
+  if FListenFd >= 0 then
+    fpClose(FListenFd);
+  inherited Destroy;
+end;
+
+procedure TMtlsServer.Stop;
+begin
+  Terminate;
+  WaitFor;
+end;
+
+procedure TMtlsServer.Execute;
+var
+  Fd: Integer;
+begin
+  while not Terminated do
+  begin
+    if not WaitReadable(FListenFd, 50) then
+      Continue;
+    Fd := fpAccept(FListenFd, nil, nil);
+    if Fd < 0 then
+      Continue;
+    InterlockedIncrement(Connections);
+    SetTimeouts(Fd, 3000);
+    try
+      Serve(Fd);
+    except
+      // a failed exchange is visible to the client as an error
+    end;
+    fpClose(Fd);
+  end;
+end;
+
+procedure TMtlsServer.Serve(const AFd: Integer);
+var
+  C: TConn;
+  Head: AnsiString;
+begin
+  if FKind <> mkPlain then
+  begin
+    ServeTls(AFd);
+    Exit;
+  end;
+  C.Ssl := nil;
+  C.Fd := AFd;
+  Head := ConnReadHead(C);
+  if Head <> '' then
+  begin
+    InterlockedIncrement(Requests);
+    ConnWriteText(C, 'HTTP/1.1 200 OK'#13#10'Content-Length: 2'#13#10 +
+      'Connection: close'#13#10#13#10'ok');
+  end;
+end;
+
+procedure TMtlsServer.ServeTls(const AFd: Integer);
+var
+  C: TConn;
+  Peer: PX509;
+  Head, Key: AnsiString;
+  P: Integer;
+  Hdr: array[0..8] of Byte;
+  Payload: array of Byte;
+  Len: Integer;
+  Sid: LongWord;
+  Resp: array[0..8] of Byte;
+  Preface: array[0..23] of Byte;
+  Buf: array[0..255] of Byte;
+  Closed: Boolean;
+
+  procedure H2Frame(const AType, AFlags: Byte; const AStream: LongWord;
+    const APayload: array of Byte);
+  var
+    F: array of Byte;
+    I: Integer;
+  begin
+    SetLength(F, 9 + Length(APayload));
+    F[0] := 0;
+    F[1] := Length(APayload) shr 8;
+    F[2] := Length(APayload) and $FF;
+    F[3] := AType;
+    F[4] := AFlags;
+    F[5] := AStream shr 24;
+    F[6] := (AStream shr 16) and $FF;
+    F[7] := (AStream shr 8) and $FF;
+    F[8] := AStream and $FF;
+    for I := 0 to High(APayload) do
+      F[9 + I] := APayload[I];
+    ConnWrite(C, F[0], Length(F));
+  end;
+
+begin
+  C.Fd := AFd;
+  C.Ssl := SSL_new(FCtx);
+  SSL_set_fd(C.Ssl, AFd);
+  try
+    if SSL_accept(C.Ssl) <> 1 then
+    begin
+      InterlockedIncrement(Refused);
+      // the alert is already sent; read what the client wrote after its
+      // handshake before closing, so the close does not reset the connection
+      // and take the alert with it
+      fpShutdown(AFd, SHUT_WR);
+      SetTimeouts(AFd, 300);
+      while fpRecv(AFd, @Buf[0], SizeOf(Buf), 0) > 0 do;
+      Exit;
+    end;
+    InterlockedIncrement(Handshakes);
+    Peer := SSL_get_peer_certificate(C.Ssl);
+    if Peer <> nil then
+    begin
+      LastSubject := string(Peer^.SubjectName);
+      X509_free(Peer);
+    end;
+    case FKind of
+      mkH2:
+        begin
+          if not ConnReadFull(C, Preface[0], SizeOf(Preface)) then
+            Exit;
+          H2Frame(4, 0, 0, []);                 // our SETTINGS (empty)
+          while ConnReadFull(C, Hdr[0], 9) do
+          begin
+            Len := (Hdr[0] shl 16) or (Hdr[1] shl 8) or Hdr[2];
+            Sid := (LongWord(Hdr[5] and $7F) shl 24) or (LongWord(Hdr[6]) shl 16) or
+              (LongWord(Hdr[7]) shl 8) or Hdr[8];
+            SetLength(Payload, Len);
+            if (Len > 0) and (not ConnReadFull(C, Payload[0], Len)) then
+              Exit;
+            case Hdr[3] of
+              4: if (Hdr[4] and 1) = 0 then
+                   H2Frame(4, 1, 0, []);        // ACK the client's SETTINGS
+              1: begin                          // HEADERS: answer 200 'ok'
+                   InterlockedIncrement(Requests);
+                   H2Frame(1, 4, Sid, [$88]);
+                   H2Frame(0, 1, Sid, [Ord('o'), Ord('k')]);
+                 end;
+              7: Exit;                          // GOAWAY
+            end;
+          end;
+        end;
+      mkHttp1:
+        begin
+          Head := ConnReadHead(C);
+          if Head <> '' then
+          begin
+            InterlockedIncrement(Requests);
+            ConnWriteText(C, 'HTTP/1.1 200 OK'#13#10'Content-Length: 2'#13#10 +
+              'Connection: close'#13#10#13#10'ok');
+          end;
+        end;
+      mkSse:
+        begin
+          Head := ConnReadHead(C);
+          if Head <> '' then
+          begin
+            InterlockedIncrement(Requests);
+            ConnWriteText(C, 'HTTP/1.1 200 OK'#13#10 +
+              'Content-Type: text/event-stream'#13#10 +
+              'Connection: close'#13#10#13#10'data: hello'#10#10);
+          end;
+        end;
+      mkWebSocket:
+        begin
+          Head := ConnReadHead(C);
+          P := Pos('sec-websocket-key:', LowerCase(Head));
+          if P = 0 then
+            Exit;
+          Key := Trim(Copy(Head, P + 18, Pos(#13, Copy(Head, P, MaxInt)) - 19));
+          InterlockedIncrement(Requests);
+          ConnWriteText(C, 'HTTP/1.1 101 Switching Protocols'#13#10 +
+            'Upgrade: websocket'#13#10'Connection: Upgrade'#13#10 +
+            'Sec-WebSocket-Accept: ' + AnsiString(WsComputeAccept(string(Key))) +
+            #13#10#13#10 + #$81#$05'hello');
+          // answer the client's close frame, then end
+          Closed := False;
+          while (not Closed) and ConnReadFull(C, Resp[0], 2) do
+          begin
+            Len := Resp[1] and $7F;
+            if (Resp[1] and $80) <> 0 then
+              ConnReadFull(C, Buf[0], 4);
+            if (Len > 0) and (Len < 126) then
+              ConnReadFull(C, Buf[0], Len);
+            if (Resp[0] and $0F) = 8 then
+            begin
+              ConnWriteText(C, #$88#$00);
+              Closed := True;
+            end;
+          end;
+        end;
+    end;
+    SSL_shutdown(C.Ssl);
+  finally
+    SSL_free(C.Ssl);
+  end;
+end;
+
+{ TTunnelProxy }
+
+constructor TTunnelProxy.Create(const AMode: TTunnelMode;
+  const AOriginPort: Word);
+begin
+  FMode := AMode;
+  FOriginPort := AOriginPort;
+  FListenFd := ListenOnLoopback(FPort);
+  if AMode = tmHttps then
+  begin
+    FCtx := SSL_CTX_new(TLS_server_method());
+    SSL_CTX_use_certificate_file(FCtx,
+      PUtf8Char(UTF8String(Fixture('server.crt'))), SSL_FILETYPE_PEM);
+    SSL_CTX_use_PrivateKey_file(FCtx,
+      PUtf8Char(UTF8String(Fixture('server.key'))), SSL_FILETYPE_PEM);
+    // ask for a certificate and trust the fixture CA, so one offered to the
+    // proxy would be seen (and verified) rather than abort the handshake
+    SSL_CTX_load_verify_locations(FCtx,
+      PUtf8Char(UTF8String(Fixture('ca.crt'))), nil);
+    SSL_CTX_set_verify(FCtx, SSL_VERIFY_PEER, nil);
+  end;
+  inherited Create(False);
+end;
+
+destructor TTunnelProxy.Destroy;
+begin
+  if FCtx <> nil then
+    SSL_CTX_free(FCtx);
+  if FListenFd >= 0 then
+    fpClose(FListenFd);
+  inherited Destroy;
+end;
+
+procedure TTunnelProxy.Stop;
+begin
+  Terminate;
+  WaitFor;
+end;
+
+procedure TTunnelProxy.Execute;
+var
+  Fd: Integer;
+begin
+  while not Terminated do
+  begin
+    if not WaitReadable(FListenFd, 50) then
+      Continue;
+    Fd := fpAccept(FListenFd, nil, nil);
+    if Fd < 0 then
+      Continue;
+    SetTimeouts(Fd, 3000);
+    try
+      Handle(Fd);
+    except
+      // the client sees the tunnel break
+    end;
+    fpClose(Fd);
+  end;
+end;
+
+procedure TTunnelProxy.Handle(const AFd: Integer);
+var
+  C: TConn;
+  Origin: Integer;
+  Addr: TSockAddr;
+  Head: AnsiString;
+  B: array[0..255] of Byte;
+  Buf: array[0..16383] of Byte;
+  N, I: Integer;
+  Peer: PX509;
+  Fds: array[0..1] of TPollFd;
+  Ready: Boolean;
+begin
+  C.Fd := AFd;
+  C.Ssl := nil;
+  try
+    if FMode = tmHttps then
+    begin
+      C.Ssl := SSL_new(FCtx);
+      SSL_set_fd(C.Ssl, AFd);
+      if SSL_accept(C.Ssl) <> 1 then
+        Exit;
+      Peer := SSL_get_peer_certificate(C.Ssl);
+      if Peer <> nil then
+      begin
+        SawClientCert := True;
+        X509_free(Peer);
+      end;
+    end;
+    if FMode = tmSocks5 then
+    begin
+      // greeting, then the CONNECT request: both consumed, target ignored
+      if not ConnReadFull(C, B[0], 2) then
+        Exit;
+      if not ConnReadFull(C, B[2], B[1]) then
+        Exit;
+      B[0] := 5;
+      B[1] := 0;
+      ConnWrite(C, B[0], 2);
+      if not ConnReadFull(C, B[0], 4) then
+        Exit;
+      case B[3] of
+        1: N := 4;
+        4: N := 16;
+      else
+        begin
+          if not ConnReadFull(C, B[4], 1) then
+            Exit;
+          N := B[4];
+        end;
+      end;
+      if not ConnReadFull(C, B[5], N + 2) then
+        Exit;
+    end
+    else
+    begin
+      Head := ConnReadHead(C);
+      if Pos('CONNECT ', Head) <> 1 then
+        Exit;
+    end;
+    Origin := fpsocket(AF_INET, SOCK_STREAM, 0);
+    FillChar(Addr, SizeOf(Addr), 0);
+    Addr.sin_family := AF_INET;
+    Addr.sin_port := htons(FOriginPort);
+    Addr.sin_addr.s_addr := htonl($7F000001);
+    if fpconnect(Origin, @Addr, SizeOf(Addr)) <> 0 then
+    begin
+      fpClose(Origin);
+      Exit;
+    end;
+    SetTimeouts(Origin, 3000);
+    try
+      InterlockedIncrement(Tunnels);
+      if FMode = tmSocks5 then
+      begin
+        FillChar(B, SizeOf(B), 0);
+        B[0] := 5;
+        B[3] := 1;
+        ConnWrite(C, B[0], 10);
+      end
+      else
+        ConnWriteText(C, 'HTTP/1.1 200 Connection established'#13#10#13#10);
+      // pump both ways until either side ends
+      Fds[0].fd := AFd;
+      Fds[0].events := POLLIN;
+      Fds[1].fd := Origin;
+      Fds[1].events := POLLIN;
+      repeat
+        Ready := (C.Ssl <> nil) and (SSL_pending(C.Ssl) > 0);
+        Fds[0].revents := 0;
+        Fds[1].revents := 0;
+        if Ready then
+          Fds[0].revents := POLLIN
+        else if fpPoll(@Fds[0], 2, 4000) <= 0 then
+          Break;
+        if Fds[0].revents <> 0 then
+        begin
+          N := ConnRead(C, Buf[0], SizeOf(Buf));
+          if N <= 0 then
+            Break;
+          I := 0;
+          while I < N do
+          begin
+            I := I + fpSend(Origin, @Buf[I], N - I, 0);
+            if I < 0 then
+              Break;
+          end;
+        end;
+        if Fds[1].revents <> 0 then
+        begin
+          N := fpRecv(Origin, @Buf[0], SizeOf(Buf), 0);
+          if N <= 0 then
+            Break;
+          ConnWrite(C, Buf[0], N);
+        end;
+      until False;
+    finally
+      fpClose(Origin);
+    end;
+  finally
+    if C.Ssl <> nil then
+    begin
+      SSL_shutdown(C.Ssl);
+      SSL_free(C.Ssl);
+    end;
+  end;
+end;
+
+{ TFixedSelector }
+
+constructor TFixedSelector.Create(const AKind: TProxyKind; const APort: Word);
+begin
+  inherited Create;
+  FProxy := TProxy.Create(AKind, 'localhost', APort);
+end;
+
+function TFixedSelector.SelectProxy(const AUri: string): IProxy;
+begin
+  Result := FProxy;
+end;
+
+{ TWsRecorder }
+
+constructor TWsRecorder.Create;
+begin
+  inherited Create;
+  FEvent := TEvent.Create(nil, True, False, '');
+end;
+
+destructor TWsRecorder.Destroy;
+begin
+  FEvent.Free;
+  inherited Destroy;
+end;
+
+procedure TWsRecorder.OnText(const ASocket: IWebSocket; const AText: string;
+  const ALast: Boolean);
+begin
+  Text := AText;
+  FEvent.SetEvent;
+end;
+
+function TWsRecorder.WaitText(const AMs: Integer): Boolean;
+begin
+  Result := FEvent.WaitFor(AMs) = wrSignaled;
+end;
+
+{ TMutualTlsTest }
+
+procedure TMutualTlsTest.TearDown;
+begin
+  if FProxy <> nil then
+  begin
+    FProxy.Stop;
+    FreeAndNil(FProxy);
+  end;
+  if FServer <> nil then
+  begin
+    FServer.Stop;
+    FreeAndNil(FServer);
+  end;
+end;
+
+function TMutualTlsTest.StartServer(const AKind: TMtlsKind;
+  const AVersion: Integer): TMtlsServer;
+begin
+  if not OpenSslIsAvailable then
+    Fail('OpenSSL is not available: set OPENSSL_LIBPATH');
+  FServer := TMtlsServer.Create(AKind, AVersion);
+  Result := FServer;
+end;
+
+function TMutualTlsTest.Url(const AScheme: string): string;
+begin
+  Result := Format('%s://localhost:%d/', [AScheme, FServer.Port]);
+end;
+
+function TMutualTlsTest.GoodIdentity: IClientIdentity;
+begin
+  Result := TClientIdentity.FromPemFiles(Fixture('client-chain.pem'),
+    Fixture('client.key'));
+end;
+
+function TMutualTlsTest.NewClient(const AIdentity: IClientIdentity;
+  const AFallback: Boolean): IHttpClient;
+var
+  F: THttpClientFactory;
+begin
+  F := THttpClientFactory.Create
+    .WithCACertFile(Fixture('ca.crt'))
+    .WithConnectTimeout(3000)
+    .WithHeaderTimeout(5000);
+  if AIdentity <> nil then
+    F := F.WithClientIdentity(AIdentity);
+  if AFallback then
+    F := F.WithHttp1Fallback(True);
+  if FProxy <> nil then
+    // loopback origins bypass the built-in selectors, so route explicitly
+    case FProxy.FMode of
+      tmConnect: F := F.WithProxySelector(TFixedSelector.Create(pkHttp, FProxy.Port));
+      tmSocks5: F := F.WithProxySelector(TFixedSelector.Create(pkSocks5, FProxy.Port));
+      tmHttps: F := F.WithProxySelector(TFixedSelector.Create(pkHttps, FProxy.Port));
+    end;
+  Result := F.Build;
+end;
+
+function TMutualTlsTest.Fetch(const AClient: IHttpClient;
+  out ABody: string): Integer;
+var
+  Resp: IHttpResponse;
+  Raw: TBytes;
+begin
+  Resp := AClient.Send(THttpRequest.Create(hmGet, Url));
+  Result := Resp.StatusCode;
+  Raw := ReadAllBodyBytes(Resp.Body);
+  SetString(ABody, PAnsiChar(@Raw[0]), Length(Raw));
+end;
+
+function TMutualTlsTest.AlertOfFetch(const AClient: IHttpClient): string;
+var
+  Body: string;
+begin
+  Result := '';
+  try
+    Fetch(AClient, Body);
+    Fail('the request must be rejected');
+  except
+    on E: EHttpTlsClientAuthError do
+      Result := E.Alert;
+  end;
+end;
+
+procedure TMutualTlsTest.RunAccepts(const AKind: TMtlsKind;
+  const AVersion: Integer; const AFallback: Boolean);
+var
+  Client: IHttpClient;
+  Body: string;
+begin
+  StartServer(AKind, AVersion);
+  Client := NewClient(GoodIdentity, AFallback);
+  AssertEquals('status', 200, Fetch(Client, Body));
+  AssertEquals('body', 'ok', Body);
+  Client.Close;
+  FServer.Stop;
+  AssertEquals('one handshake completed', 1, FServer.Handshakes);
+  AssertEquals('one request', 1, FServer.Requests);
+  AssertTrue('the server saw the client certificate',
+    Pos('mtls client', FServer.LastSubject) > 0);
+end;
+
+procedure TMutualTlsTest.RunSse(const AVersion: Integer);
+var
+  Client: IHttpClient;
+  Source: TSseSource;
+  Event: TSseEvent;
+begin
+  StartServer(mkSse, AVersion);
+  Client := NewClient(GoodIdentity, True);
+  Source := TSseSource.Create(Client.Send(SseRequest(Url)));
+  try
+    AssertTrue('an event arrived', Source.ReadEvent(Event));
+    AssertEquals('data', 'hello', Event.Data);
+  finally
+    Source.Close;
+  end;
+  Client.Close;
+  FServer.Stop;
+  AssertEquals('one handshake completed', 1, FServer.Handshakes);
+  AssertTrue('the server saw the client certificate',
+    Pos('mtls client', FServer.LastSubject) > 0);
+end;
+
+procedure TMutualTlsTest.RunWebSocket(const AVersion: Integer);
+var
+  Client: IHttpClient;
+  Rec: TWsRecorder;
+  RecRef: IWebSocketListener;
+  Sock: IWebSocket;
+begin
+  StartServer(mkWebSocket, AVersion);
+  Client := NewClient(GoodIdentity);
+  Rec := TWsRecorder.Create;
+  RecRef := Rec;
+  Sock := Client.Send(TWebSocketRequest.Create(
+    Format('wss://localhost:%d/chat', [FServer.Port]), RecRef).WithAutoRequest);
+  AssertTrue('the server sent a message', Rec.WaitText(4000));
+  AssertEquals('text', 'hello', Rec.Text);
+  Sock.Close;
+  Sleep(50);
+  Client.Close;
+  FServer.Stop;
+  AssertEquals('one handshake completed', 1, FServer.Handshakes);
+  AssertTrue('the server saw the client certificate',
+    Pos('mtls client', FServer.LastSubject) > 0);
+end;
+
+procedure TMutualTlsTest.RunNoIdentity(const AKind: TMtlsKind;
+  const AVersion: Integer; const AFallback: Boolean; const AExpected: string);
+var
+  Client: IHttpClient;
+  Alert: string;
+begin
+  StartServer(AKind, AVersion);
+  Client := NewClient(nil, AFallback);
+  Alert := AlertOfFetch(Client);
+  Client.Close;
+  FServer.Stop;
+  AssertEquals('the alert', AExpected, Alert);
+  AssertEquals('one connection: no retry, no fallback dial', 1,
+    FServer.Connections);
+  AssertEquals('the handshake never completed', 0, FServer.Handshakes);
+end;
+
+procedure TMutualTlsTest.RunWrongCa(const AVersion: Integer);
+var
+  Client: IHttpClient;
+  Alert: string;
+begin
+  StartServer(mkH2, AVersion);
+  Client := NewClient(TClientIdentity.FromPemFiles(Fixture('other-client.crt'),
+    Fixture('other-client.key')));
+  Alert := AlertOfFetch(Client);
+  Client.Close;
+  FServer.Stop;
+  AssertEquals('the alert', 'unknown ca', Alert);
+  AssertEquals('one connection', 1, FServer.Connections);
+end;
+
+/// dial straight through TTlsSocket (Build refuses an expired identity) and
+/// report the alert, whether it surfaces in the handshake or on the first read
+function TMutualTlsTest.ProbeAlert(const AVersion: Integer;
+  const AIdentity: IClientIdentity; const AKind: TMtlsKind): string;
+var
+  Sock: IHttp2Socket;
+  B: array[0..8] of Byte;
+begin
+  Result := '';
+  try
+    Sock := TTlsSocket.DialWithAlpn('localhost', FServer.Port,
+      AlpnProtocolList([cHttp2AlpnProtocol, cHttp11AlpnProtocol]), False, 3000,
+      Fixture('ca.crt'), '', 0, AIdentity);
+    B[0] := 0;
+    Sock.Write(B[0], 1);
+    Sock.Read(B[0], 9);
+    Fail('the server must reject the certificate');
+  except
+    on E: EHttpTlsClientAuthError do
+      Result := E.Alert;
+  end;
+end;
+
+procedure TMutualTlsTest.RunExpiredOnTheWire(const AVersion: Integer;
+  const AExpected: string);
+var
+  Alert: string;
+begin
+  StartServer(mkH2, AVersion);
+  Alert := ProbeAlert(AVersion, TClientIdentity.FromPemFiles(
+    Fixture('expired.crt'), Fixture('expired.key')), mkH2);
+  FServer.Stop;
+  AssertEquals('the alert', AExpected, Alert);
+end;
+
+procedure TMutualTlsTest.RunTunnel(const AMode: TTunnelMode;
+  const AVersion: Integer);
+var
+  Client: IHttpClient;
+  Body: string;
+begin
+  StartServer(mkH2, AVersion);
+  FProxy := TTunnelProxy.Create(AMode, FServer.Port);
+  Client := NewClient(GoodIdentity);
+  AssertEquals('status', 200, Fetch(Client, Body));
+  AssertEquals('body', 'ok', Body);
+  Client.Close;
+  FProxy.Stop;
+  FServer.Stop;
+  AssertEquals('one tunnel', 1, FProxy.Tunnels);
+  AssertEquals('the origin accepted the identity', 1, FServer.Handshakes);
+  AssertTrue('the origin saw the client certificate',
+    Pos('mtls client', FServer.LastSubject) > 0);
+  AssertFalse('the proxy was not handed the identity', FProxy.SawClientCert);
+end;
+
+{ accepted identity }
+
+procedure TMutualTlsTest.TestHttp2WithTheIdentityTls12;
+begin
+  RunAccepts(mkH2, cTls12, False);
+end;
+
+procedure TMutualTlsTest.TestHttp2WithTheIdentityTls13;
+begin
+  RunAccepts(mkH2, cTls13, False);
+end;
+
+procedure TMutualTlsTest.TestHttp11FallbackWithTheIdentityTls12;
+begin
+  RunAccepts(mkHttp1, cTls12, True);
+end;
+
+procedure TMutualTlsTest.TestHttp11FallbackWithTheIdentityTls13;
+begin
+  RunAccepts(mkHttp1, cTls13, True);
+end;
+
+procedure TMutualTlsTest.TestSseWithTheIdentityTls12;
+begin
+  RunSse(cTls12);
+end;
+
+procedure TMutualTlsTest.TestSseWithTheIdentityTls13;
+begin
+  RunSse(cTls13);
+end;
+
+procedure TMutualTlsTest.TestWssWithTheIdentityTls12;
+begin
+  RunWebSocket(cTls12);
+end;
+
+procedure TMutualTlsTest.TestWssWithTheIdentityTls13;
+begin
+  RunWebSocket(cTls13);
+end;
+
+procedure TMutualTlsTest.TestPkcs12IdentityIsAccepted;
+var
+  Client: IHttpClient;
+  Body: string;
+begin
+  StartServer(mkH2, cTls13);
+  Client := NewClient(TClientIdentity.FromPkcs12File(Fixture('client-chain.p12'),
+    cPass));
+  AssertEquals('status', 200, Fetch(Client, Body));
+  Client.Close;
+  FServer.Stop;
+  AssertEquals('handshake', 1, FServer.Handshakes);
+end;
+
+{ rejection }
+
+procedure TMutualTlsTest.TestNoIdentityIsRejectedOnceTls12;
+begin
+  RunNoIdentity(mkH2, cTls12, False, 'handshake failure');
+end;
+
+procedure TMutualTlsTest.TestNoIdentityIsRejectedOnceTls13;
+begin
+  RunNoIdentity(mkH2, cTls13, False, 'certificate required');
+end;
+
+procedure TMutualTlsTest.TestNoIdentityOverHttp11IsRejectedTls13;
+begin
+  RunNoIdentity(mkHttp1, cTls13, True, 'certificate required');
+end;
+
+procedure TMutualTlsTest.TestNoIdentityWithFallbackOnDoesNotFallBackTls13;
+begin
+  // fallback is on, the server is HTTP/2: the rejection is final
+  RunNoIdentity(mkH2, cTls13, True, 'certificate required');
+end;
+
+procedure TMutualTlsTest.TestNoIdentityOnWssIsRejectedTls13;
+var
+  Client: IHttpClient;
+  Rec: TWsRecorder;
+  RecRef: IWebSocketListener;
+  Alert: string;
+begin
+  StartServer(mkWebSocket, cTls13);
+  Client := NewClient(nil);
+  Rec := TWsRecorder.Create;
+  RecRef := Rec;
+  Alert := '';
+  try
+    Client.Send(TWebSocketRequest.Create(
+      Format('wss://localhost:%d/chat', [FServer.Port]), RecRef));
+    Fail('the upgrade must be rejected');
+  except
+    on E: EHttpTlsClientAuthError do
+      Alert := E.Alert;
+  end;
+  Client.Close;
+  FServer.Stop;
+  AssertEquals('certificate required', Alert);
+  AssertEquals('one connection', 1, FServer.Connections);
+end;
+
+procedure TMutualTlsTest.TestWrongCaIsRejectedTls12;
+begin
+  RunWrongCa(cTls12);
+end;
+
+procedure TMutualTlsTest.TestWrongCaIsRejectedTls13;
+begin
+  RunWrongCa(cTls13);
+end;
+
+procedure TMutualTlsTest.TestExpiredIsRejectedOnTheWireTls12;
+begin
+  RunExpiredOnTheWire(cTls12, 'certificate expired');
+end;
+
+procedure TMutualTlsTest.TestExpiredIsRejectedOnTheWireTls13;
+begin
+  RunExpiredOnTheWire(cTls13, 'certificate expired');
+end;
+
+procedure TMutualTlsTest.TestRejectionIsNotRetried;
+var
+  Client: IHttpClient;
+  Alert1, Alert2: string;
+begin
+  // an idempotent GET is the retry candidate; the client must not repeat it
+  StartServer(mkH2, cTls13);
+  Client := NewClient(nil);
+  Alert1 := AlertOfFetch(Client);
+  AssertEquals('first attempt', 'certificate required', Alert1);
+  AssertEquals('exactly one connection for one request', 1, FServer.Connections);
+  Alert2 := AlertOfFetch(Client);
+  Client.Close;
+  FServer.Stop;
+  AssertEquals('second request', 'certificate required', Alert2);
+  AssertEquals('one more connection for the second request', 2,
+    FServer.Connections);
+end;
+
+{ routed dials }
+
+procedure TMutualTlsTest.TestConnectTunnelPresentsTheIdentityTls13;
+begin
+  RunTunnel(tmConnect, cTls13);
+end;
+
+procedure TMutualTlsTest.TestSocks5TunnelPresentsTheIdentityTls13;
+begin
+  RunTunnel(tmSocks5, cTls13);
+end;
+
+procedure TMutualTlsTest.TestHttpsProxyLegNeverSeesTheIdentityTls13;
+begin
+  RunTunnel(tmHttps, cTls13);
+end;
+
+{ dial helpers }
+
+procedure TMutualTlsTest.TestEveryDialHelperPresentsTheIdentity;
+var
+  Id: IClientIdentity;
+  Sock: IHttp2Socket;
+  Offer: TBytes;
+  Before: Integer;
+
+  procedure Check(const AWhat: string);
+  begin
+    Sock.Close;
+    Sock := nil;
+    // the server handshake counter moves once the client has finished
+    Sleep(50);
+    Inc(Before);
+    AssertEquals(AWhat + ': the server accepted the identity', Before,
+      FServer.Handshakes);
+  end;
+
+begin
+  StartServer(mkH2, cTls13);
+  Id := GoodIdentity;
+  Offer := AlpnOfferFor(False);
+  Before := 0;
+  Sock := TTlsSocket.Dial('localhost', FServer.Port, False, 3000,
+    Fixture('ca.crt'), '', 0, Id);
+  Check('Dial');
+  Sock := TTlsSocket.DialWithAlpn('localhost', FServer.Port, Offer, False, 3000,
+    Fixture('ca.crt'), '', 0, Id);
+  Check('DialWithAlpn');
+  Sock := TTlsSocket.DialVia('localhost', FServer.Port, False, 3000,
+    Fixture('ca.crt'), nil, Id);
+  Check('DialVia');
+  Sock := TTlsSocket.DialWithAlpnVia('localhost', FServer.Port, Offer, False,
+    3000, Fixture('ca.crt'), nil, Id);
+  Check('DialWithAlpnVia');
+  Sock := TProtocolSocketFactory.Create(Fixture('ca.crt'), False, '', 0, Id)
+    .DialHttp1('localhost', FServer.Port, 'https', 3000, nil);
+  Check('TProtocolSocketFactory.DialHttp1');
+end;
+
+/// the story's enumeration check: no TTlsSocket for an origin may be built
+/// without the identity.  The only construction that omits it is the leg to an
+/// https proxy, which must never receive the origin identity.
+procedure TMutualTlsTest.TestEveryTlsSocketConstructionCarriesTheIdentity;
+var
+  Names: array[0..1] of string;
+  Calls: array[0..3] of string;
+  I, J, P, Q, E, Seen: Integer;
+  Text, Stmt, Path: string;
+  L: TStringList;
+begin
+  Names[0] := 'src/Http2.Tls.pas';
+  Names[1] := 'src/Http2.Client.pas';
+  Calls[0] := 'TTlsSocket.Create(';
+  Calls[1] := 'TTlsSocket.Dial(';
+  Calls[2] := 'TTlsSocket.DialWithAlpnVia(';
+  Calls[3] := 'TTlsSocket.DialWithAlpn(';
+  Seen := 0;
+  for I := 0 to High(Names) do
+  begin
+    Path := ExtractFilePath(ParamStr(0)) + '../' + Names[I];
+    if not FileExists(Path) then
+      Path := Names[I];
+    if not FileExists(Path) then
+    begin
+      Fail('cannot find ' + Names[I] + ' from ' + GetCurrentDir);
+    end;
+    L := TStringList.Create;
+    try
+      L.LoadFromFile(Path);
+      Text := L.Text;
+    finally
+      L.Free;
+    end;
+    for J := 0 to High(Calls) do
+    begin
+      P := 1;
+      while True do
+      begin
+        Q := Pos(Calls[J], Copy(Text, P, MaxInt));
+        if Q = 0 then
+          Break;
+        P := P + Q - 1;
+        E := Pos(';', Copy(Text, P, MaxInt)) + P - 1;
+        Stmt := Copy(Text, P, E - P);
+        // a declaration or a method heading, not a call
+        if Pos('const ', Stmt) = 0 then
+          Inc(Seen);
+        if (Pos('const ', Stmt) = 0) and (Pos('AProxy.Host', Stmt) = 0) then
+          AssertTrue(Names[I] + ': ' + Calls[J] + ' passes the identity: ' +
+            Stmt, Pos('Identity', Stmt) > 0);
+        P := E;
+      end;
+    end;
+  end;
+  AssertTrue('the scan found the dial sites (' + IntToStr(Seen) + ')', Seen >= 9);
+end;
+
+{ other }
+
+procedure TMutualTlsTest.TestCleartextIgnoresTheIdentity;
+var
+  Client: IHttpClient;
+  Body: string;
+begin
+  StartServer(mkPlain, 0);
+  Client := THttpClientFactory.Create
+    .WithClientIdentity(GoodIdentity)
+    .WithClearText(ctHttp1)
+    .WithConnectTimeout(3000)
+    .WithHeaderTimeout(5000)
+    .Build;
+  AssertEquals('status', 200,
+    Client.Send(THttpRequest.Create(hmGet, Url('http'))).StatusCode);
+  Client.Close;
+  FServer.Stop;
+  AssertEquals('one request', 1, FServer.Requests);
+  Body := '';
+  AssertEquals('no handshake', 0, FServer.Handshakes);
+end;
+
+procedure TMutualTlsTest.TestLogLineHasSubjectAndFingerprintButNoSecrets;
+var
+  Logger: TRecordingLogger;
+  LoggerRef: IHttpLogger;
+  Client: IHttpClient;
+  Body, Joined, Fingerprint: string;
+  I: Integer;
+  Id: IClientIdentity;
+  Found: Boolean;
+begin
+  StartServer(mkH2, cTls13);
+  Logger := TRecordingLogger.Create;
+  LoggerRef := Logger;
+  Id := TClientIdentity.FromPemFiles(Fixture('client-chain.pem'),
+    Fixture('client-encrypted.key'), cPass);
+  Fingerprint := Id.Fingerprint;
+  Client := THttpClientFactory.Create
+    .WithCACertFile(Fixture('ca.crt'))
+    .WithClientCertificateFiles(Fixture('client-chain.pem'),
+      Fixture('client-encrypted.key'), cPass)
+    .WithLogger(LoggerRef)
+    .Build;
+  AssertEquals('status', 200, Fetch(Client, Body));
+  Client.Close;
+  FServer.Stop;
+  Found := False;
+  Joined := '';
+  for I := 0 to Logger.Count - 1 do
+  begin
+    Joined := Joined + Logger.MessageAt(I) + #10;
+    if (Pos(Id.Subject, Logger.MessageAt(I)) > 0) and
+       (Pos(Fingerprint, Logger.MessageAt(I)) > 0) then
+    begin
+      Found := True;
+      AssertTrue('at debug level', Logger.LevelAt(I) = llDebug);
+    end;
+  end;
+  AssertTrue('a line names the subject and fingerprint', Found);
+  AssertEquals('no passphrase logged', 0, Pos(cPass, Joined));
+  AssertEquals('no key path logged', 0, Pos('client-encrypted.key', Joined));
+  AssertEquals('no PEM logged', 0, Pos('-----BEGIN', Joined));
+end;
+
+initialization
+  RegisterTest(TMutualTlsTest);
+end.

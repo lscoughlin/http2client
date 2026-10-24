@@ -11,6 +11,7 @@ up: "[http2client](../http2client.md)"
 related:
   - "[architecture](architecture.md)"
   - "[proxy](proxy.md)"
+  - "[mtls](mtls.md)"
   - "[messages](messages.md)"
   - "[open-questions](open-questions.md)"
 updated: 2026-10-13
@@ -62,6 +63,9 @@ type
     function WithSocketFactory(const AFactory: IHttp2SocketFactory): THttpClientFactory;
     function WithCACertFile(const AFileName: string): THttpClientFactory;
     function WithInsecureTls(const AInsecure: Boolean = True): THttpClientFactory;
+    function WithClientIdentity(const AIdentity: IClientIdentity): THttpClientFactory;
+    function WithClientCertificateFiles(const ACertFile, AKeyFile: string;
+      const APassphrase: string = ''): THttpClientFactory;
     function WithHttp1Fallback(const AEnable: Boolean = True): THttpClientFactory;
     function WithClearText(const APolicy: TClearTextPolicy): THttpClientFactory;
     function WithObserver(const AObserver: IHttp2Observer): THttpClientFactory;
@@ -141,7 +145,11 @@ test suite uses (`IHttp2SocketFactory` with an in-memory socket) and the
 hook for a caller who must supply their own TLS stack. `WithCACertFile`
 points certificate verification at a specific trust bundle;
 `WithInsecureTls` disables verification (test/development only, never a
-default). `WithObserver` installs an `IHttp2Observer` for connection,
+default). `WithClientIdentity` presents a client certificate on every TLS
+connection to an origin (mutual TLS), and `WithClientCertificateFiles` loads
+one from PEM files; `Build` raises `EHttpTlsConfigError` for an identity that
+cannot be used, and a server that refuses the certificate raises
+`EHttpTlsClientAuthError`. See [mtls](mtls.md). `WithObserver` installs an `IHttp2Observer` for connection,
 stream, and frame-level events — see [testing-observability](testing-observability.md).
 
 `WithRequestObserver` installs an `IHttpClientObserver`, the request-level

@@ -210,6 +210,14 @@ idempotent methods (no body writer), and only on `ecRefusedStream` or a
   The default stays strict. See [fallback](fallback.md).
 - Certificate validation/trust configuration is a factory concern (hostname
   verification on by default).
+- Client identity: when the factory holds a client certificate, `TTlsSocket`
+  installs its leaf, chain and key on the per-dial context before the
+  handshake, on every TLS dial to an origin (direct, through a tunnel, the
+  HTTP/1.1-only dial and the fallback dial) and never on the leg to an
+  `https` proxy. A server that rejects it surfaces as `EHttpTlsClientAuthError`
+  (on the handshake under TLS 1.2, on the first read under TLS 1.3), which is
+  final: it is not retried and does not trigger the HTTP/1.1 fallback. See
+  [mtls](mtls.md).
 - Proxy: when a request is routed through a proxy (`WithProxy`, the proxy
   environment variables or an `IProxySelector`; see [proxy](proxy.md), including the
   SOCKS5 variant), TLS/`h2` is negotiated over a caller-supplied

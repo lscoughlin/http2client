@@ -47,6 +47,7 @@ flowchart TB
 | [messages](design/messages.md) | `IHttpResponse`, `THttpRequest`, `IHttpHeaders`, header constants, streaming |
 | [protocol](design/protocol.md) | frame layer, HPACK, flow control |
 | [transport](design/transport.md) | threading and queues, connection lifecycle, TLS/ALPN |
+| [mtls](design/mtls.md) | mutual TLS: `IClientIdentity`, the PEM and PKCS#12 loaders, `WithClientIdentity`, and the `EHttpTlsClientAuthError` a rejection raises |
 | [proxy](design/proxy.md) | proxy routing per request: fixed proxy, `http_proxy` / `https_proxy` / `no_proxy`, `WithNoProxy`, `IProxySelector` |
 | [websocket](design/websocket.md) | WebSocket client (RFC 6455): `IWebSocketRequest`, `IWebSocketListener`, `IWebSocket`, demand-driven delivery, close handshake, `ws`/`wss` through every proxy kind |
 | [fallback](design/fallback.md) | cleartext h2c (prior knowledge and upgrade) and HTTP/1.1 fallback |
@@ -97,7 +98,7 @@ OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib ./myprogram
 
 ## Examples
 
-`examples/` holds ten small programs and three observer adapter units — see `examples/README.md`:
+`examples/` holds eleven small programs and three observer adapter units — see `examples/README.md`:
 
 | Program | Shows |
 |---|---|
@@ -107,6 +108,7 @@ OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib ./myprogram
 | `xml_request` | `Http2.Readers` XML send + read |
 | `sse_stream` | `Http2.Sse` event-stream reader |
 | `websocket_echo` | `TWebSocketRequest` + a listener: open, request demand, send, close |
+| `mtls_get` | `WithClientCertificateFiles`: a GET or `wss` session with a client certificate, `EHttpTlsClientAuthError` on a rejection |
 | `proxy_env` | `WithProxyEnvironmentVars` + `WithNoProxy`: routing by `http_proxy` / `https_proxy` / `all_proxy` / `no_proxy` |
 | `threaded_get` | one shared `IHttpClient` driven by many threads |
 | `observer_all` | the tracing, metrics and logging adapters (`observer_tracing`, `observer_metrics`, `observer_logging`) installed together on a request, an SSE stream and a WebSocket |

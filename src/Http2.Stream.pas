@@ -744,7 +744,7 @@ begin
   if Msg = '' then
     Msg := 'stream failed';
   if FConnectionError then
-    Result := EHttpConnectionError.Create(Msg, FErrorCode)
+    Result := FConnection.FailureError(Msg, FErrorCode)
   else
     Result := EHttpStreamError.Create(Msg, FStreamId, FErrorCode);
 end;
@@ -875,8 +875,10 @@ begin
   if FStreamId = 0 then
     raise EHttpError.Create('client stream-id space is exhausted',
       ecInternalError);
+  FRegistered := True;     // before registering: the connection may fail us at once
   FConnection.RegisterStream(FStreamId, Self);
-  FRegistered := True;
+  if FFailed then
+    raise MakeStreamError;
   try
     SendHeaders;
     if FLocalState = lsHeadersSent then

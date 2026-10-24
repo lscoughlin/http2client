@@ -8,7 +8,7 @@ tags:
   - design
   - tls
   - api
-status: draft
+status: done
 up: "[http2client](../http2client.md)"
 related:
   - "[client-api](client-api.md)"
@@ -25,8 +25,9 @@ updated: 2026-10-24
 A client can present a certificate during the TLS handshake, so a server that
 asks for one can authenticate the caller. This note describes how a consumer
 supplies that identity, where it is used, and how a rejection is reported.
-The library today verifies the server only (`WithCACertFile`,
-`WithInsecureTls`); it never answers a server's certificate request.
+The library verifies the server with `WithCACertFile` and `WithInsecureTls`;
+a client identity is what answers the server's certificate request, and
+without one the client answers none.
 
 ## Goals
 
@@ -36,8 +37,9 @@ The library today verifies the server only (`WithCACertFile`,
 - The identity can come from PEM files, PEM held in memory, or a PKCS#12
   bundle, with an optional passphrase.
 - A consumer that needs a different identity per origin, or that rotates the
-  certificate while the process runs, supplies a selector that is asked at
-  each dial.
+  certificate while the process runs, will supply a selector that is asked at
+  each dial. That extension is described below under "Selector and proxy
+  identity" and is not built yet.
 - A bad configuration fails when the client is built, not on the first
   request.
 - A server that rejects the identity produces a distinct error, even though
@@ -65,9 +67,8 @@ The library today verifies the server only (`WithCACertFile`,
 
 ## Public surface
 
-New unit `Http2.ClientCert` (no dependency on the client, so a consumer can
-load an identity to test it). Declarations are indicative; the story fixes
-the final names.
+Unit `Http2.ClientCert` (no dependency on the client, so a consumer can
+load an identity to test it).
 
 ```pascal
 type
@@ -76,6 +77,11 @@ type
     function GetSubject: string;        // leaf subject, for diagnostics only
     function GetFingerprint: string;    // lowercase hex SHA-256 of the leaf DER
     function GetNotAfter: TDateTime;    // UTC expiry of the leaf
+    // the OpenSSL objects, borrowed by the TLS layer while the identity lives
+    function GetCertificate: PX509;
+    function GetPrivateKey: PEVP_PKEY;
+    function GetChainCount: Integer;
+    function GetChainCertificate(const AIndex: Integer): PX509;
     property Subject: string read GetSubject;
     property Fingerprint: string read GetFingerprint;
     property NotAfter: TDateTime read GetNotAfter;
@@ -96,28 +102,29 @@ type
       const APassphrase: string = ''): IClientIdentity; static;
   end;
 
-  /// asked once per dial; return nil to present no certificate
-  IClientIdentitySelector = interface
-    function Select(const AHost: string; const APort: Word): IClientIdentity;
-  end;
 ```
 
-Factory additions:
+Factory methods:
 
 | Method | Meaning |
 |---|---|
-| `WithClientIdentity(identity)` | present this identity on every TLS dial |
+| `WithClientIdentity(identity)` | present this identity on every TLS dial; `nil` removes it |
 | `WithClientCertificateFiles(cert, key, passphrase)` | sugar: load PEM files, then `WithClientIdentity` |
-| `WithClientIdentitySelector(selector)` | ask the selector at each dial; replaces a fixed identity |
-| `WithProxyClientIdentity(identity)` | present this identity to an `https://` proxy only |
 
-A client with none of these configured behaves as before.
+A client with neither configured behaves as before. `Build` raises
+`EHttpTlsConfigError` for an identity whose leaf has expired, and for files
+given to `WithClientCertificateFiles` that could not be loaded: the factory is
+a value builder, so the load failure is held and raised at `Build`, and the
+passphrase is not kept past the call. An injected socket factory
+(`WithSocketFactory`) is a test seam and receives no identity.
 
-Loaders raise `EHttpTlsConfigError` (new, derives from `EHttpError`, as
+Loaders raise `EHttpTlsConfigError` (derives from `EHttpError`, as
 `EHttpProxyConfigError` does) for an unreadable file, malformed PEM or
-PKCS#12, a wrong passphrase, a key that does not match the leaf, or an
-expired leaf. The message names the file and the OpenSSL reason, never the
-passphrase or key bytes.
+PKCS#12, a wrong passphrase, or a key that does not match the leaf. An
+expired leaf still loads, so `NotAfter` can be inspected; `Build` refuses it.
+The message names the file and the OpenSSL reason, never the passphrase or
+key bytes. An encrypted key with no passphrase raises instead of prompting on
+the terminal.
 
 ## Loading and use
 
@@ -146,7 +153,7 @@ passphrase or key bytes.
 |---|---|
 | TLS to an origin, direct | the client identity, or the selector's answer |
 | TLS to an origin inside a proxy tunnel | the same; the tunnel is transparent to the origin |
-| TLS to an `https://` proxy | `WithProxyClientIdentity` only, never the origin identity |
+| TLS to an `https://` proxy | none; the origin identity is never handed to the proxy |
 | `http` and `ws` | none |
 
 The proxy rule keeps an origin identity from being handed to a third party
@@ -154,13 +161,23 @@ that happens to relay the connection.
 
 ## Pooling
 
-The pool keys connections by origin and route. A connection authenticated as
-one identity must not serve a request that expects another, so when a
-selector is installed the key gains the identity fingerprint. With a fixed
-identity, or none, the key is unchanged. A rotated certificate therefore
-opens new connections; connections that were authenticated with the old one
-stay pooled until they close or idle out, and the pool statistics show
-nothing special about them.
+The pool keys connections by origin and route. A client has one identity, so
+the key is unchanged.
+
+## Selector and proxy identity
+
+Not built yet; the shape is fixed so the pieces added later fit:
+
+- `IClientIdentitySelector.Select(host, port)` returns the identity for a dial,
+  or `nil`, and `WithClientIdentitySelector` installs it in place of a fixed
+  identity. A selector that returns a fresh `FromPemFiles` per dial gives
+  rotation.
+- When a selector is installed the pool key gains the identity fingerprint, so
+  two identities to one origin never share a connection, and connections that
+  were authenticated with a rotated-out certificate stay pooled until they
+  close or idle out.
+- `WithProxyClientIdentity(identity)` presents an identity to an `https://`
+  proxy only.
 
 ## Rejection
 
@@ -176,9 +193,16 @@ Both are reported as `EHttpTlsClientAuthError` (new, derives from
 `EHttpConnectionError`), carrying the alert name (`certificate required`,
 `bad certificate`, `unknown ca`, `certificate expired`, `certificate
 revoked`, `access denied`, `unsupported certificate`, `unknown certificate`)
-derived from the OpenSSL reason code. The connection layer recognises the
-reason on the first failing read of a connection and raises this error to the
-request that was waiting, instead of a generic closed-connection error.
+derived from the OpenSSL reason code (`SSL_R_TLSV13_ALERT_CERTIFICATE_REQUIRED`,
+`SSL_R_SSLV3_ALERT_BAD_CERTIFICATE`, `SSL_R_TLSV1_ALERT_UNKNOWN_CA` and the
+matching `SSL_R_*` values in `openssl/sslerr.h`). A TLS 1.2 server that gets no
+certificate answers `handshake failure`; that is reported as a rejection only
+after the server sent a `CertificateRequest`, so an unrelated handshake failure
+stays a generic connection error. The TLS socket recognises the reason on the
+handshake or on the first failing read of a connection; the connection layer
+carries the alert to the request that was waiting, instead of a generic
+closed-connection error. A connection that fails before a stream registers
+fails that stream at once rather than leaving it to the header timeout.
 
 Consequences:
 
@@ -208,11 +232,13 @@ Consequences:
   without a chain), and that no loader error contains the passphrase.
 - Loopback: an in-process OpenSSL server that requires a client certificate
   against a mock-free client dial: accepted identity, none configured, wrong
-  CA, expired, and selector answers, for TLS 1.2 and TLS 1.3 separately.
-- Pool: two identities to one origin never share a connection.
-- Live: a Python `ssl` server with `CERT_REQUIRED` and `nghttpd
-  --verify-client`, with HTTP/2, HTTP/1.1, SSE and `wss` over it, directly
-  and through each proxy kind.
+  CA and expired, for TLS 1.2 and TLS 1.3 separately, over HTTP/2, HTTP/1.1,
+  SSE and `wss`, and through a CONNECT, a SOCKS5 and an `https` proxy. A
+  source scan checks that every `TTlsSocket` for an origin is built with the
+  identity.
+- Live: a Python `ssl` server with `CERT_REQUIRED` (TLS 1.2 and 1.3, HTTP/1.1,
+  SSE and `wss`) and `nghttpd --verify-client` for HTTP/2 (it requests a
+  certificate but does not verify it); `make validate-mtls`.
 
 Fixtures (a private CA, a server certificate, an accepted client, an expired
 client, a client from another CA) are generated by a script and checked in

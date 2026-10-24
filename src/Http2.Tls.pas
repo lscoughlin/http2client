@@ -18,8 +18,8 @@ interface
 
 uses
   SysUtils, Classes, Sockets, ssockets, BaseUnix,
-  mormot.core.base, mormot.lib.openssl11,
-  Http2.Errors, Http2.Proxy, Http2.Socks;
+  mormot.core.base, mormot.core.os, mormot.lib.openssl11,
+  Http2.Errors, Http2.Proxy, Http2.Socks, Http2.ClientCert;
 
 const
   /// the single ALPN protocol this client offers in strict mode (RFC 7540
@@ -108,6 +108,11 @@ procedure RequireH2Alpn(const AData: PByte; const ALen: Cardinal);
 // (doc/design/fallback.md "Negotiation")
 function AlpnOfferFor(const AHttp1Fallback: Boolean): TBytes;
 
+/// the TLS alert name ('certificate required', 'unknown ca', ...) for the
+// OpenSSL reason code of a client-certificate rejection, or '' when the
+// reason is anything else (doc/design/mtls.md "Rejection")
+function ClientAuthAlertName(const AReason: Cardinal): string;
+
 /// a 32-bit value from the OpenSSL CSPRNG.  A failing generator raises
 /// EHttpConnectionError; there is no fallback to a non-secure source.
 function SecureRandomCardinal: Cardinal;
@@ -178,10 +183,13 @@ type
     FInsecure: Boolean;
     FProxyHost: string;
     FProxyPort: Word;
+    FIdentity: IClientIdentity;
   public
+    /// AIdentity is presented on every TLS connection to an origin; cleartext
+    /// dials ignore it (doc/design/mtls.md)
     constructor Create(const ACACertFile: string = '';
       const AInsecure: Boolean = False; const AProxyHost: string = '';
-      const AProxyPort: Word = 0);
+      const AProxyPort: Word = 0; const AIdentity: IClientIdentity = nil);
     function DialProtocol(const AHost: string; const APort: Word;
       const AScheme: string; const AHttp1Fallback: Boolean;
       const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
@@ -250,12 +258,20 @@ type
     FSelectedProtocol: string;
     FAlpnOffer: TBytes;
     FRequireH2: Boolean;
+    FIdentity: IClientIdentity;
+    /// True once application data has been read: only an alert on the first
+    /// read of a connection is reported as a client-certificate rejection
+    FReadAny: Boolean;
+    /// True once the server sent a CertificateRequest
+    FCertRequested: Boolean;
     FConnectTimeoutMs: Integer;
     FReadTimeoutMs: Integer;
     FWriteTimeoutMs: Integer;
     procedure BioFlush;
     function BioFeed: Boolean;
     function StreamHandshake(const ASsl: PSSL): Integer;
+    procedure RaiseIfClientAuthRejected(const AErr: Integer);
+    procedure ProbeRejectionAfterWrite;
   protected
     // --- crypto seams (overridden by tests) ---
     function CreateSslContext: PSSL_CTX; virtual;
@@ -264,6 +280,8 @@ type
     procedure DestroySslHandle; virtual;
     function ApplyAlpnProtos(const ACtx: PSSL_CTX): Integer; virtual;
     procedure ApplyVerifyMode(const ACtx: PSSL_CTX; const AMode: Integer); virtual;
+    /// install the client identity (leaf, chain, key) on the per-dial context
+    procedure ApplyClientIdentity(const ACtx: PSSL_CTX); virtual;
     function ApplyHostnameVerification(const ASsl: PSSL;
       const AHost: string): Integer; virtual;
     function ApplySniHost(const ASsl: PSSL;
@@ -272,6 +290,9 @@ type
     function HandshakeConnect(const ASsl: PSSL): Integer; virtual;
     function SelectedAlpnBytes(const ASsl: PSSL): TBytes; virtual;
     function LastSslError(const ASsl: PSSL; const AResult: Integer): Integer; virtual;
+    /// drain the OpenSSL error queue after an SSL_ERROR_SSL and return the
+    /// reason code of its last entry (0 when empty)
+    function TakeSslReason: Cardinal; virtual;
     function SslReadBytes(const ASsl: PSSL; const ABuffer: Pointer;
       const ACount: Integer): Integer; virtual;
     function SslWriteBytes(const ASsl: PSSL; const ABuffer: Pointer;
@@ -280,7 +301,8 @@ type
     function GetSocketFd: Integer; virtual;
   public
     constructor Create(const ATransport: IHttp2Socket; const AHost: string;
-      const AInsecure: Boolean = False; const ACACertFile: string = '');
+      const AInsecure: Boolean = False; const ACACertFile: string = '';
+      const AIdentity: IClientIdentity = nil);
     destructor Destroy; override;
     /// perform the TLS handshake and verify ALPN; raises on failure
     procedure Establish;
@@ -290,7 +312,8 @@ type
       const AInsecure: Boolean = False;
       const AConnectTimeoutMs: Integer = cDefaultSocketTimeoutMs;
       const ACACertFile: string = ''; const AProxyHost: string = '';
-      const AProxyPort: Word = 0): IHttp2Socket;
+      const AProxyPort: Word = 0;
+      const AIdentity: IClientIdentity = nil): IHttp2Socket;
     /// dial and TLS-wrap while offering the caller's ALPN list (in wire form,
     /// e.g. AlpnOfferFor(True)); the negotiated name is in SelectedProtocol
     // - fallback is the caller's decision, so the strict ALPN check is skipped
@@ -299,7 +322,8 @@ type
       const AAlpnOffer: TBytes; const AInsecure: Boolean = False;
       const AConnectTimeoutMs: Integer = cDefaultSocketTimeoutMs;
       const ACACertFile: string = ''; const AProxyHost: string = '';
-      const AProxyPort: Word = 0): IHttp2Socket;
+      const AProxyPort: Word = 0;
+      const AIdentity: IClientIdentity = nil): IHttp2Socket;
     /// dial a CLEARTEXT TCP socket for h2c prior knowledge
     // (doc/design/fallback.md "h2c prior knowledge"); the caller writes the
     // connection preface.  No TLS, no ALPN, so SelectedProtocol is not used.
@@ -313,13 +337,16 @@ type
     /// dial through AProxy (nil = direct): the proxy leg is TCP, or TCP+TLS for
     /// an https proxy, and a CONNECT or SOCKS5 tunnel to AHost:APort is
     /// negotiated before TLS to the origin begins
+    // - AIdentity goes to the origin leg only, never to an https proxy
     class function DialVia(const AHost: string; const APort: Word;
       const AInsecure: Boolean; const AConnectTimeoutMs: Integer;
-      const ACACertFile: string; const AProxy: IProxy): IHttp2Socket;
+      const ACACertFile: string; const AProxy: IProxy;
+      const AIdentity: IClientIdentity = nil): IHttp2Socket;
     class function DialWithAlpnVia(const AHost: string; const APort: Word;
       const AAlpnOffer: TBytes; const AInsecure: Boolean;
       const AConnectTimeoutMs: Integer; const ACACertFile: string;
-      const AProxy: IProxy): IHttp2Socket;
+      const AProxy: IProxy;
+      const AIdentity: IClientIdentity = nil): IHttp2Socket;
     class function DialCleartextVia(const AHost: string; const APort: Word;
       const AConnectTimeoutMs: Integer; const AProxy: IProxy;
       const AInsecure: Boolean = False;
@@ -327,6 +354,8 @@ type
     function ReadSome(var ABuffer; ACount: Integer): Integer;
     property StreamMode: Boolean read FStreamMode write FStreamMode;
     property Insecure: Boolean read FInsecure;
+    /// the identity installed on the per-dial context; nil presents none
+    property Identity: IClientIdentity read FIdentity;
     /// PEM bundle used to verify the peer; '' = the system trust store
     property CACertFile: string read FCACertFile;
     property SelectedProtocol: string read FSelectedProtocol;
@@ -817,6 +846,87 @@ begin
   FWriteTimeoutMs := AValue;
 end;
 
+{ client-certificate rejection }
+
+const
+  // OpenSSL reason codes of the alerts a server sends when it refuses the
+  // client's certificate (openssl/sslerr.h: SSL_AD_REASON_OFFSET + alert number)
+  SSL_R_SSLV3_ALERT_NO_CERTIFICATE = 1041;
+  SSL_R_SSLV3_ALERT_BAD_CERTIFICATE = 1042;
+  SSL_R_SSLV3_ALERT_UNSUPPORTED_CERTIFICATE = 1043;
+  SSL_R_SSLV3_ALERT_CERTIFICATE_REVOKED = 1044;
+  SSL_R_SSLV3_ALERT_CERTIFICATE_EXPIRED = 1045;
+  SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN = 1046;
+  SSL_R_TLSV1_ALERT_UNKNOWN_CA = 1048;
+  SSL_R_TLSV1_ALERT_ACCESS_DENIED = 1049;
+  SSL_R_TLSV13_ALERT_CERTIFICATE_REQUIRED = 1116;
+  // a TLS 1.2 server that gets no certificate answers handshake_failure; it
+  // counts as a client-certificate rejection only after a CertificateRequest
+  SSL_R_SSLV3_ALERT_HANDSHAKE_FAILURE = 1040;
+  cSslReasonMask = $7FFFFF;   // ERR_REASON_MASK
+  cHandshakeContentType = 22; // SSL3_RT_HANDSHAKE
+  cMsgCertificateRequest = 13;
+
+function ClientAuthAlertName(const AReason: Cardinal): string;
+begin
+  case AReason of
+    SSL_R_TLSV13_ALERT_CERTIFICATE_REQUIRED:   Result := 'certificate required';
+    SSL_R_SSLV3_ALERT_NO_CERTIFICATE:          Result := 'no certificate';
+    SSL_R_SSLV3_ALERT_BAD_CERTIFICATE:         Result := 'bad certificate';
+    SSL_R_SSLV3_ALERT_UNSUPPORTED_CERTIFICATE: Result := 'unsupported certificate';
+    SSL_R_SSLV3_ALERT_CERTIFICATE_REVOKED:     Result := 'certificate revoked';
+    SSL_R_SSLV3_ALERT_CERTIFICATE_EXPIRED:     Result := 'certificate expired';
+    SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN:     Result := 'unknown certificate';
+    SSL_R_TLSV1_ALERT_UNKNOWN_CA:              Result := 'unknown ca';
+    SSL_R_TLSV1_ALERT_ACCESS_DENIED:           Result := 'access denied';
+  else
+    Result := '';
+  end;
+end;
+
+type
+  TSslMsgCallback = procedure(write_p, version, content_type: Integer;
+    buf: Pointer; len: PtrUInt; ssl: PSSL; arg: Pointer); cdecl;
+  // SSL_set_msg_callback and SSL_set_msg_callback_arg are macros over these
+  TSslCallbackCtrl = function(ssl: PSSL; cmd: Integer;
+    fp: Pointer): PtrInt; cdecl;
+  TSslCtrl = function(ssl: PSSL; cmd: Integer; larg: PtrInt;
+    parg: Pointer): PtrInt; cdecl;
+
+const
+  SSL_CTRL_SET_MSG_CALLBACK = 15;
+  SSL_CTRL_SET_MSG_CALLBACK_ARG = 16;
+
+var
+  GSslCallbackCtrl: TSslCallbackCtrl;
+  GSslCtrl: TSslCtrl;
+  GMsgCallbackResolved: Boolean;
+
+/// the address of an optional libssl entry the mormot bindings do not expose,
+// or nil when it cannot be resolved
+function ResolveSslProc(const AName: PAnsiChar): Pointer;
+var
+  Dir: string;
+  Lib: TLibHandle;
+begin
+  Result := nil;
+  Dir := GetEnvironmentVariable('OPENSSL_LIBPATH');
+  if Dir <> '' then
+    Dir := IncludeTrailingPathDelimiter(Dir);
+  Lib := LibraryOpen(Dir + LIB_SSL3);
+  if Lib <> 0 then
+    Result := LibraryResolve(Lib, AName);
+end;
+
+/// notes a CertificateRequest from the server on the owning TTlsSocket
+procedure NoteHandshakeMessage(write_p, version, content_type: Integer;
+  buf: Pointer; len: PtrUInt; ssl: PSSL; arg: Pointer); cdecl;
+begin
+  if (write_p = 0) and (content_type = cHandshakeContentType) and (len >= 1) and
+     (arg <> nil) and (PByte(buf)^ = cMsgCertificateRequest) then
+    TTlsSocket(arg).FCertRequested := True;
+end;
+
 { routed dialing }
 
 /// connect AHost:APort through AProxy (nil = direct).  The result is the
@@ -888,9 +998,11 @@ end;
 { TTlsSocket }
 
 constructor TTlsSocket.Create(const ATransport: IHttp2Socket;
-  const AHost: string; const AInsecure: Boolean; const ACACertFile: string);
+  const AHost: string; const AInsecure: Boolean; const ACACertFile: string;
+  const AIdentity: IClientIdentity);
 begin
   inherited Create;
+  FIdentity := AIdentity;
   FTransport := ATransport;
   FHost := AHost;
   FInsecure := AInsecure;
@@ -938,6 +1050,20 @@ begin
   Result := SSL_new(ACtx);
   if Result = nil then
     raise EHttpConnectionError.Create('SSL_new failed');
+  // SSL_set_msg_callback is optional: without it a TLS 1.2 handshake_failure
+  // stays a generic connection error
+  if not GMsgCallbackResolved then
+  begin
+    GSslCallbackCtrl := ResolveSslProc('SSL_callback_ctrl');
+    GSslCtrl := ResolveSslProc('SSL_ctrl');
+    GMsgCallbackResolved := True;
+  end;
+  if Assigned(GSslCallbackCtrl) and Assigned(GSslCtrl) then
+  begin
+    GSslCallbackCtrl(Result, SSL_CTRL_SET_MSG_CALLBACK,
+      Pointer(@NoteHandshakeMessage));
+    GSslCtrl(Result, SSL_CTRL_SET_MSG_CALLBACK_ARG, 0, Self);
+  end;
 end;
 
 procedure TTlsSocket.DestroySslHandle;
@@ -972,6 +1098,41 @@ begin
     else
       SSL_CTX_set_default_verify_paths(ACtx);
   SSL_CTX_set_verify(ACtx, AMode, nil);
+end;
+
+procedure TTlsSocket.ApplyClientIdentity(const ACtx: PSSL_CTX);
+var
+  I: Integer;
+  Cert: PX509;
+begin
+  if FIdentity = nil then
+    Exit;
+  // the identity keeps its own references: OpenSSL up-refs the leaf and key,
+  // and each chain certificate is up-ref'd here because
+  // SSL_CTX_add_extra_chain_cert takes ownership of the one it is given
+  if SSL_CTX_use_certificate(ACtx, FIdentity.GetCertificate) <> 1 then
+  begin
+    TakeSslReason;
+    raise EHttpConnectionError.Create('installing the client certificate failed');
+  end;
+  for I := 0 to FIdentity.GetChainCount - 1 do
+  begin
+    Cert := FIdentity.GetChainCertificate(I);
+    X509_up_ref(Cert);
+    if SSL_CTX_add_extra_chain_cert(ACtx, Cert) <> 1 then
+    begin
+      X509_free(Cert);
+      TakeSslReason;
+      raise EHttpConnectionError.Create(
+        'installing the client certificate chain failed');
+    end;
+  end;
+  if (SSL_CTX_use_PrivateKey(ACtx, FIdentity.GetPrivateKey) <> 1) or
+     (SSL_CTX_check_private_key(ACtx) <> 1) then
+  begin
+    TakeSslReason;
+    raise EHttpConnectionError.Create('installing the client key failed');
+  end;
 end;
 
 function TTlsSocket.ApplyHostnameVerification(const ASsl: PSSL;
@@ -1019,6 +1180,56 @@ begin
   Result := SSL_get_error(ASsl, AResult);
 end;
 
+function TTlsSocket.TakeSslReason: Cardinal;
+var
+  Code: Cardinal;
+begin
+  Result := 0;
+  if not OpenSslIsAvailable then
+    Exit;
+  repeat
+    Code := ERR_get_error;
+    if Code <> 0 then
+      Result := Code and cSslReasonMask;
+  until Code = 0;
+end;
+
+procedure TTlsSocket.RaiseIfClientAuthRejected(const AErr: Integer);
+var
+  Alert: string;
+  Reason: Cardinal;
+begin
+  if AErr <> SSL_ERROR_SSL then
+    Exit;
+  Reason := TakeSslReason;
+  Alert := ClientAuthAlertName(Reason);
+  if (Alert = '') and FCertRequested and
+     (Reason = SSL_R_SSLV3_ALERT_HANDSHAKE_FAILURE) then
+    Alert := 'handshake failure';
+  // TLS 1.3 reports the rejection on the first read, after the handshake
+  // "succeeded"; an alert after application data is not classified this way
+  if (Alert <> '') and (not FReadAny) then
+    raise EHttpTlsClientAuthError.Create(
+      'the server rejected the client certificate (TLS alert: ' + Alert + ')',
+      Alert);
+end;
+
+procedure TTlsSocket.ProbeRejectionAfterWrite;
+var
+  B: Byte;
+  N: Integer;
+begin
+  // a write that fails before anything was read may have been cut short by the
+  // server closing after a client-certificate alert (TLS 1.3): read once to
+  // see whether that alert is waiting
+  if FReadAny or FStreamMode then
+    Exit;
+  TakeSslReason;
+  N := SslReadBytes(FSsl, @B, 1);
+  if N <= 0 then
+    RaiseIfClientAuthRejected(LastSslError(FSsl, N));
+end;
+
 function TTlsSocket.SslReadBytes(const ASsl: PSSL; const ABuffer: Pointer;
   const ACount: Integer): Integer;
 begin
@@ -1049,7 +1260,7 @@ end;
 
 procedure TTlsSocket.Establish;
 var
-  r: Integer;
+  r, err: Integer;
   Alpn: TBytes;
 begin
   if FHandshaked then
@@ -1057,6 +1268,7 @@ begin
   try
     FCtx := CreateSslContext;
     ApplyVerifyMode(FCtx, SslVerifyModeFor(FInsecure));
+    ApplyClientIdentity(FCtx);
     if ApplyAlpnProtos(FCtx) <> 0 then
       raise EHttpConnectionError.Create('SSL_CTX_set_alpn_protos failed');
     FSsl := CreateSslHandle(FCtx);
@@ -1096,8 +1308,12 @@ begin
         raise EHttpTimeout.CreateFmt('TLS handshake timed out after %d ms',
           [FConnectTimeoutMs])
       else
+      begin
+        err := LastSslError(FSsl, r);
+        RaiseIfClientAuthRejected(err);
         raise EHttpConnectionError.CreateFmt(
-          'TLS handshake failed (SSL_get_error=%d)', [LastSslError(FSsl, r)]);
+          'TLS handshake failed (SSL_get_error=%d)', [err]);
+      end;
     Alpn := SelectedAlpnBytes(FSsl);
     // strict mode still fails when the peer does not select "h2" (interop
     // A.9); a fallback dial skips the check and reports the name instead
@@ -1118,14 +1334,15 @@ end;
 class function TTlsSocket.Dial(const AHost: string; const APort: Word;
   const AInsecure: Boolean; const AConnectTimeoutMs: Integer;
   const ACACertFile: string; const AProxyHost: string;
-  const AProxyPort: Word): IHttp2Socket;
+  const AProxyPort: Word; const AIdentity: IClientIdentity): IHttp2Socket;
 var
   Transport: TPlainSocket;
   Sock: TTlsSocket;
 begin
   Transport := TPlainSocket.Create(AHost, APort, AConnectTimeoutMs, AProxyHost,
     AProxyPort);
-  Sock := TTlsSocket.Create(Transport, AHost, AInsecure, ACACertFile);
+  Sock := TTlsSocket.Create(Transport, AHost, AInsecure, ACACertFile,
+    AIdentity);
   Sock.ConnectTimeoutMs := AConnectTimeoutMs;
   Sock.ReadTimeoutMs := AConnectTimeoutMs;
   try
@@ -1141,14 +1358,15 @@ class function TTlsSocket.DialWithAlpn(const AHost: string; const APort: Word;
   const AAlpnOffer: TBytes; const AInsecure: Boolean;
   const AConnectTimeoutMs: Integer;
   const ACACertFile: string; const AProxyHost: string;
-  const AProxyPort: Word): IHttp2Socket;
+  const AProxyPort: Word; const AIdentity: IClientIdentity): IHttp2Socket;
 var
   Transport: TPlainSocket;
   Sock: TTlsSocket;
 begin
   Transport := TPlainSocket.Create(AHost, APort, AConnectTimeoutMs, AProxyHost,
     AProxyPort);
-  Sock := TTlsSocket.Create(Transport, AHost, AInsecure, ACACertFile);
+  Sock := TTlsSocket.Create(Transport, AHost, AInsecure, ACACertFile,
+    AIdentity);
   Sock.ConnectTimeoutMs := AConnectTimeoutMs;
   Sock.ReadTimeoutMs := AConnectTimeoutMs;
   // the caller supplies the offer and applies its own ALPN policy afterwards
@@ -1179,7 +1397,8 @@ end;
 
 class function TTlsSocket.DialVia(const AHost: string; const APort: Word;
   const AInsecure: Boolean; const AConnectTimeoutMs: Integer;
-  const ACACertFile: string; const AProxy: IProxy): IHttp2Socket;
+  const ACACertFile: string; const AProxy: IProxy;
+  const AIdentity: IClientIdentity): IHttp2Socket;
 var
   Transport: IHttp2Socket;
   Stream: Boolean;
@@ -1187,7 +1406,8 @@ var
 begin
   Transport := DialRoutedTransport(AHost, APort, AConnectTimeoutMs, AProxy,
     AInsecure, ACACertFile, Stream);
-  Sock := TTlsSocket.Create(Transport, AHost, AInsecure, ACACertFile);
+  Sock := TTlsSocket.Create(Transport, AHost, AInsecure, ACACertFile,
+    AIdentity);
   Sock.FStreamMode := Stream;
   Sock.ConnectTimeoutMs := AConnectTimeoutMs;
   Sock.ReadTimeoutMs := AConnectTimeoutMs;
@@ -1203,7 +1423,7 @@ end;
 class function TTlsSocket.DialWithAlpnVia(const AHost: string;
   const APort: Word; const AAlpnOffer: TBytes; const AInsecure: Boolean;
   const AConnectTimeoutMs: Integer; const ACACertFile: string;
-  const AProxy: IProxy): IHttp2Socket;
+  const AProxy: IProxy; const AIdentity: IClientIdentity): IHttp2Socket;
 var
   Transport: IHttp2Socket;
   Stream: Boolean;
@@ -1211,7 +1431,8 @@ var
 begin
   Transport := DialRoutedTransport(AHost, APort, AConnectTimeoutMs, AProxy,
     AInsecure, ACACertFile, Stream);
-  Sock := TTlsSocket.Create(Transport, AHost, AInsecure, ACACertFile);
+  Sock := TTlsSocket.Create(Transport, AHost, AInsecure, ACACertFile,
+    AIdentity);
   Sock.FStreamMode := Stream;
   Sock.ConnectTimeoutMs := AConnectTimeoutMs;
   Sock.ReadTimeoutMs := AConnectTimeoutMs;
@@ -1259,7 +1480,10 @@ begin
   begin
     n := SslReadBytes(FSsl, base + Result, ACount - Result);
     if n > 0 then
-      Inc(Result, n)
+    begin
+      FReadAny := True;
+      Inc(Result, n);
+    end
     else
     begin
       err := LastSslError(FSsl, n);
@@ -1278,8 +1502,11 @@ begin
         raise EHttpTimeout.CreateFmt('TLS read timed out after %d ms',
           [FReadTimeoutMs])
       else
+      begin
+        RaiseIfClientAuthRejected(err);
         raise EHttpConnectionClosed.CreateFmt(
           'TLS read failed (SSL_get_error=%d)', [err]);
+      end;
     end;
   end;
 end;
@@ -1320,8 +1547,13 @@ begin
         raise EHttpTimeout.CreateFmt('TLS write timed out after %d ms',
           [FWriteTimeoutMs])
       else
+      begin
+        RaiseIfClientAuthRejected(err);
+        if err = SSL_ERROR_SYSCALL then
+          ProbeRejectionAfterWrite;
         raise EHttpConnectionClosed.CreateFmt(
           'TLS write failed (SSL_get_error=%d)', [err]);
+      end;
     end;
   end;
 end;
@@ -1340,7 +1572,10 @@ begin
   begin
     n := SslReadBytes(FSsl, @ABuffer, ACount);
     if n > 0 then
+    begin
+      FReadAny := True;
       Exit(n);
+    end;
     err := LastSslError(FSsl, n);
     if FStreamMode and (err = SSL_ERROR_WANT_READ) then
     begin
@@ -1357,8 +1592,11 @@ begin
       raise EHttpTimeout.CreateFmt('TLS read timed out after %d ms',
         [FReadTimeoutMs])
     else
+    begin
+      RaiseIfClientAuthRejected(err);
       raise EHttpConnectionClosed.CreateFmt(
         'TLS read failed (SSL_get_error=%d)', [err]);
+    end;
   end;
 end;
 
@@ -1484,9 +1722,10 @@ end;
 
 constructor TProtocolSocketFactory.Create(const ACACertFile: string;
   const AInsecure: Boolean; const AProxyHost: string;
-  const AProxyPort: Word);
+  const AProxyPort: Word; const AIdentity: IClientIdentity);
 begin
   inherited Create;
+  FIdentity := AIdentity;
   FCACertFile := ACACertFile;
   FInsecure := AInsecure;
   FProxyHost := AProxyHost;
@@ -1548,7 +1787,7 @@ begin
   // https: the ALPN offer follows the fallback flag, then the result maps to a
   // codec.  DialWithAlpn skips the strict check so we can map the name here.
   Sock := TTlsSocket.DialWithAlpnVia(AHost, APort, AlpnOfferFor(AHttp1Fallback),
-    FInsecure, ATimeoutMs, FCACertFile, AProxy);
+    FInsecure, ATimeoutMs, FCACertFile, AProxy, FIdentity);
   // $interfaces com: an interface reference points past the object's VMT, so
   // `TTlsSocket(Sock)` (a raw hard cast) would read the wrong memory.  Recover
   // the object with `as TObject` before the class cast so the property read
@@ -1595,7 +1834,7 @@ begin
       FInsecure, FCACertFile));
   Result := TTlsSocket.DialWithAlpnVia(AHost, APort,
     AlpnProtocolList([cHttp11AlpnProtocol]), FInsecure, ATimeoutMs,
-    FCACertFile, Proxy);
+    FCACertFile, Proxy, FIdentity);
   Name := '';
   if Supports(Result, TTlsSocket, TlsObj) then
     Name := TTlsSocket(TlsObj).SelectedProtocol;

@@ -20,6 +20,7 @@ type
     procedure TestStreamErrorCarriesStreamId;
     procedure TestExceptionRaiseAndCatchByBase;
     procedure TestErrorCodeNames;
+    procedure TestClientCertificateErrorsAreCatchableByTheirBases;
   end;
 
 implementation
@@ -111,6 +112,40 @@ begin
   AssertEquals('FRAME_SIZE_ERROR', Http2ErrorCodeName(ecFrameSizeError));
   AssertEquals('COMPRESSION_ERROR', Http2ErrorCodeName(ecCompressionError));
   AssertEquals('HTTP_1_1_REQUIRED', Http2ErrorCodeName(ecHttp11Required));
+end;
+
+procedure TErrorsTest.TestClientCertificateErrorsAreCatchableByTheirBases;
+var
+  BaseSeen, ConnSeen: Boolean;
+  Alert: string;
+begin
+  AssertTrue('config error is an EHttpError',
+    EHttpTlsConfigError.InheritsFrom(EHttpError));
+  AssertFalse('config error is not a connection error',
+    EHttpTlsConfigError.InheritsFrom(EHttpConnectionError));
+  AssertTrue('client auth error is an EHttpConnectionError',
+    EHttpTlsClientAuthError.InheritsFrom(EHttpConnectionError));
+  BaseSeen := False;
+  try
+    raise EHttpTlsConfigError.Create('bad identity');
+  except
+    on E: EHttpError do
+      BaseSeen := E.Message = 'bad identity';
+  end;
+  AssertTrue('config error caught by EHttpError', BaseSeen);
+  ConnSeen := False;
+  Alert := '';
+  try
+    raise EHttpTlsClientAuthError.Create('rejected', 'unknown ca');
+  except
+    on E: EHttpConnectionError do
+    begin
+      ConnSeen := True;
+      Alert := (E as EHttpTlsClientAuthError).Alert;
+    end;
+  end;
+  AssertTrue('client auth error caught by EHttpConnectionError', ConnSeen);
+  AssertEquals('alert survived', 'unknown ca', Alert);
 end;
 
 initialization

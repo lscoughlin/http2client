@@ -1,6 +1,6 @@
 # Examples
 
-Ten small programs and three adapter units showing how to use `http2client`.
+Eleven small programs and three adapter units showing how to use `http2client`.
 They are smoke builds: the build compiles them, it does not run them.
 
 ## Build
@@ -52,6 +52,7 @@ make measure-observer
 | `observer_all.pas` | `WithRequestObserver` with the tracing, metrics and logging adapters together: a plain request, an SSE stream with a reconnect and a WebSocket session against the `tools/validate` servers; prints one trace, the derived metrics and the log lines. |
 | `observer_overhead.pas` | The cost of the observers on a loopback request (no observer, the three adapters, the per-event gate on); starts its own server. Run with `make measure-observer`. |
 | `observer_tracing.pas`, `observer_metrics.pas`, `observer_logging.pas` | Adapter units, not programs: a tracer, a metrics registry and a structured logger over `IHttpClientObserver`, with in-memory stand-ins for the tracer and the registry. The tests compile against them. |
+| `mtls_get.pas` | `WithClientCertificateFiles`: a GET or a `wss` session with a client certificate, a bad identity failing at `Build`, and `EHttpTlsClientAuthError` on a rejection. |
 | `proxy_env.pas` | `WithProxyEnvironmentVars` + `WithNoProxy`: route a GET by `http_proxy` / `https_proxy` / `all_proxy` / `no_proxy`. |
 
 ## Notes

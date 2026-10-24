@@ -117,6 +117,7 @@ has its own task.
 | `task validate:harness` | The RFC conformance harness. 146 case ids. | About 30 minutes |
 | `task validate:sse` | The opt-in live SSE case against `tools/validate/sse_server.py`. | Seconds |
 | `task validate:websocket` | The opt-in live WebSocket case: `ws` and `wss`, directly and through an HTTP `CONNECT`, https and SOCKS5 proxy, against `tools/validate/ws_servers.py`, plus a check of the servers' logs (mask bit on every client frame, close codes, route). `task validate:websocket:autobahn` runs the Autobahn|Testsuite client cases (Docker). | Seconds |
+| `task validate:mtls` | The opt-in live mutual TLS case: an accepted identity, none, one from another CA and an expired one, against `tools/validate/mtls_server.py` (HTTP/1.1, an event stream and `wss`, pinned to TLS 1.2 and to TLS 1.3) and `nghttpd --verify-client` (HTTP/2). The expired identity is refused by the client at `Build`. | Seconds |
 | `task validate:cleartext` | The opt-in live cleartext case: a bodyless `GET`, `POST`, `DELETE` and `HEAD` under `ctUpgrade` and `ctHttp1` against `tools/validate/h1_counter_server.py`, an HTTP/1.1-only server that logs each request; every request arrives once. | Seconds |
 | `task validate:proxy` | The opt-in live proxy case: HTTP `CONNECT`, https and SOCKS5 proxies from `tools/validate/proxy_servers.py`, with and without credentials, HTTP/2 through each proxy kind when `nghttpd` is installed, plus a check of the proxy logs. | Seconds |
 
@@ -308,6 +309,37 @@ reached with a `CONNECT` tunnel, over TLS for an `https://` proxy value, or a SO
 For a test against a private certificate, use `WithCACertFile`.
 For a self-signed certificate, use `WithInsecureTls`.
 
+### Mutual TLS
+
+A server that asks for a client certificate is answered with an identity: a
+certificate chain and its private key, loaded from PEM files, PEM in memory or
+a PKCS#12 bundle. The client presents it on every TLS connection to an origin:
+HTTP/2, the HTTP/1.1 fallback, SSE and `wss`, directly or through a proxy
+tunnel.
+
+```pascal
+Client := THttpClientFactory.Create
+  .WithCACertFile('ca.pem')
+  .WithClientCertificateFiles('client-chain.pem', 'client.key', 'passphrase')
+  .Build;
+
+// or load once, inspect, and share
+Identity := TClientIdentity.FromPkcs12File('client.p12', 'passphrase');
+WriteLn(Identity.Subject, ' ', Identity.Fingerprint, ' ', DateTimeToStr(Identity.NotAfter));
+Client := THttpClientFactory.Create.WithClientIdentity(Identity).Build;
+```
+
+A bad identity (unreadable file, wrong passphrase, a key that does not match
+the certificate, an expired certificate) raises `EHttpTlsConfigError` from
+`Build`; the message never contains the passphrase. A server that refuses the
+certificate raises `EHttpTlsClientAuthError` with the TLS alert in `Alert`
+(`certificate required`, `unknown ca`, `certificate expired`, ...), under TLS
+1.2 and TLS 1.3 alike. It is never retried and never falls back to HTTP/1.1.
+Cleartext (`http`, `ws`) connections ignore the identity. With an
+`IHttpLogger` installed, a debug line names the identity's subject and
+fingerprint, and nothing else about it. `examples/mtls_get.pas` is a short
+program; see `doc/design/mtls.md`.
+
 ### Text, JSON, and XML helpers
 
 `WithTextBody` and `ReadText` live in `Http2.Client`:
@@ -450,7 +482,7 @@ method and the results are in `doc/verification/observer-overhead.md`. See
 
 ## Examples
 
-The `examples/` directory has ten small programs and three adapter units. Build
+The `examples/` directory has eleven small programs and three adapter units. Build
 them all with:
 
 ```sh
@@ -483,6 +515,7 @@ make measure-observer                                # observer overhead on loop
 | `threaded_get.pas` | Many threads sharing one client and its pool. |
 | `sse_stream.pas` | `SseRequest` + `TSseReconnectLoop` over an event stream. |
 | `proxy_env.pas` | A GET routed by the proxy environment variables. |
+| `mtls_get.pas` | A GET, or a `wss` session, with a client certificate; reports a rejection. |
 | `websocket_echo.pas` | Open a WebSocket, send a message, print the echo, close. |
 | `observer_all.pas` | The tracing, metrics and logging adapters together on a request, an SSE stream with a reconnect and a WebSocket. |
 | `observer_overhead.pas` | What the observers cost on a loopback request. |
@@ -493,7 +526,7 @@ make measure-observer                                # observer overhead on loop
 | Path | Content |
 |---|---|
 | `src/` | The library units. |
-| `examples/` | Ten small, runnable programs and three observer adapters. See [Examples](#examples). |
+| `examples/` | Eleven small, runnable programs and three observer adapters. See [Examples](#examples). |
 | `test/` | The unit suite, the mock socket, and the `h2probe` CLI. |
 | `tools/validate/` | The interop, sanity, and harness scripts. |
 | `bin/` | The build output. |
@@ -545,6 +578,8 @@ The connection speaks HTTP/1.1 (RFC 6455); a WebSocket is not pooled. See
 - `doc/design/client-api.md` gives the full factory surface.
 - `doc/design/proxy.md` gives the proxy routing: environment variables,
   the no-proxy list, and `IProxySelector`.
+- `doc/design/mtls.md` gives mutual TLS: the identity loaders, where the
+  identity is presented, and how a rejection is reported.
 - `doc/design/websocket.md` gives the WebSocket client: handshake, framing,
   delivery and demand, closing, and the reference implementations.
 - `doc/design/messages.md` gives the request and response types.

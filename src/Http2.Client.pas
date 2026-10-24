@@ -20,8 +20,8 @@ interface
 
 uses
   SysUtils, Classes, SyncObjs, Generics.Collections, TypInfo, BaseUnix,
-  Sockets,
-  Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack,
+  Sockets, DateUtils,
+  Http2.Errors, Http2.ClientCert,Http2.Frames, Http2.Headers, Http2.Hpack,
   Http2.Tls, Http2.Connection, Http2.Stream, Http2.Observer, Http2.Messages,
   Http2.Http1, Http2.Encoding, Http2.Proxy, Http2.WebSocket,
   Http2.Clock, Http2.RequestObserver;
@@ -108,11 +108,21 @@ type
     FInsecure: Boolean;
     FProxyHost: string;
     FProxyPort: Word;
+    FIdentity: IClientIdentity;
+    FLogger: IHttpLogger;
     FProtocols: TProtocolSocketFactory;
+    /// debug line naming the identity a TLS dial to AHost:APort installs
+    procedure LogIdentity(const AHost: string; const APort: Word);
   public
+    /// AIdentity is presented on every TLS connection to an origin; ALogger
+    /// (may be nil) receives the debug line that names it
     constructor Create(const ACACertFile: string = '';
       const AInsecure: Boolean = False; const AProxyHost: string = '';
-      const AProxyPort: Word = 0);
+      const AProxyPort: Word = 0; const AIdentity: IClientIdentity = nil;
+      const ALogger: IHttpLogger = nil);
+    /// a copy of this factory that presents AIdentity and logs to ALogger
+    function WithIdentity(const AIdentity: IClientIdentity;
+      const ALogger: IHttpLogger): TDefaultSocketFactory;
     function Dial(const AHost: string; const APort: Word;
       const ATimeoutMs: Integer): IHttp2Socket;
     function DialProtocol(const AHost: string; const APort: Word;
@@ -277,6 +287,8 @@ type
     FEnvLookup: TEnvLookup;
     FRequestObservers: TArray<IHttpClientObserver>;
     FLogger: IHttpLogger;
+    FIdentity: IClientIdentity;
+    FIdentityError: string;   // a deferred WithClientCertificateFiles failure
   public
     class function Create: THttpClientFactory; static;
     /// compatibility shim: sets BOTH the per-host and the total cap to AMax,
@@ -321,6 +333,16 @@ type
     /// harnesses whose cert has no SAN (e.g. the h2 conformance harness,
     /// which self-signs with CN=localhost only).
     function WithInsecureTls(const AInsecure: Boolean = True): THttpClientFactory;
+    /// present AIdentity (doc/design/mtls.md) on every TLS connection to an
+    /// origin: HTTP/2, HTTP/1.1, SSE and wss, direct or through a tunnel.
+    /// Cleartext connections ignore it.  Build raises EHttpTlsConfigError when
+    /// the leaf certificate has expired.  nil removes it.
+    function WithClientIdentity(const AIdentity: IClientIdentity): THttpClientFactory;
+    /// load a PEM certificate chain (leaf first) and key, then WithClientIdentity.
+    /// A file that cannot be loaded raises EHttpTlsConfigError from Build, so
+    /// the passphrase is not kept past this call.
+    function WithClientCertificateFiles(const ACertFile, AKeyFile: string;
+      const APassphrase: string = ''): THttpClientFactory;
     /// offer "http/1.1" as an ALPN alternative and accept an HTTP/1.1
     /// response when the peer does not select "h2" (doc/design/fallback.md).
     /// Off by default: strict mode keeps failing loudly (interop A.9).
@@ -363,6 +385,7 @@ type
     property NoProxy: string read FNoProxy;
     property CACertFile: string read FCACertFile;
     property InsecureTls: Boolean read FInsecure;
+    property ClientIdentity: IClientIdentity read FIdentity;
     property Observer: IHttp2Observer read FObserver;
     property RequestObservers: TArray<IHttpClientObserver>
       read FRequestObservers;
@@ -1860,22 +1883,48 @@ end;
 { IHttp2SocketFactory }
 
 constructor TDefaultSocketFactory.Create(const ACACertFile: string;
-  const AInsecure: Boolean; const AProxyHost: string; const AProxyPort: Word);
+  const AInsecure: Boolean; const AProxyHost: string; const AProxyPort: Word;
+  const AIdentity: IClientIdentity; const ALogger: IHttpLogger);
 begin
   inherited Create;
   FCACertFile := ACACertFile;
   FInsecure := AInsecure;
   FProxyHost := AProxyHost;
   FProxyPort := AProxyPort;
+  FIdentity := AIdentity;
+  FLogger := ALogger;
   FProtocols := TProtocolSocketFactory.Create(ACACertFile, AInsecure, AProxyHost,
-    AProxyPort);
+    AProxyPort, AIdentity);
+end;
+
+function TDefaultSocketFactory.WithIdentity(const AIdentity: IClientIdentity;
+  const ALogger: IHttpLogger): TDefaultSocketFactory;
+begin
+  Result := TDefaultSocketFactory.Create(FCACertFile, FInsecure, FProxyHost,
+    FProxyPort, AIdentity, ALogger);
+end;
+
+procedure TDefaultSocketFactory.LogIdentity(const AHost: string;
+  const APort: Word);
+begin
+  if (FIdentity = nil) or (FLogger = nil) then
+    Exit;
+  // only the subject and the fingerprint: never the PEM, a path or a passphrase
+  try
+    FLogger.Log(llDebug, Format(
+      'TLS to %s:%d presents client identity subject="%s" fingerprint=%s',
+      [AHost, APort, FIdentity.Subject, FIdentity.Fingerprint]));
+  except
+    // a logger that raises must not break a dial
+  end;
 end;
 
 function TDefaultSocketFactory.Dial(const AHost: string; const APort: Word;
   const ATimeoutMs: Integer): IHttp2Socket;
 begin
+  LogIdentity(AHost, APort);
   Result := TTlsSocket.Dial(AHost, APort, FInsecure, ATimeoutMs, FCACertFile,
-    FProxyHost, FProxyPort);
+    FProxyHost, FProxyPort, FIdentity);
 end;
 
 function TDefaultSocketFactory.DialProtocol(const AHost: string;
@@ -1891,6 +1940,8 @@ function TDefaultSocketFactory.DialHttp1(const AHost: string;
   const APort: Word; const AScheme: string; const ATimeoutMs: Integer;
   const AProxy: IProxy): IHttp2Socket;
 begin
+  if AScheme <> 'http' then
+    LogIdentity(AHost, APort);
   Result := FProtocols.DialHttp1(AHost, APort, AScheme, ATimeoutMs, AProxy);
 end;
 
@@ -1922,8 +1973,9 @@ begin
   // selected name to a codec.  DialWithAlpn reports the name instead of
   // enforcing "h2", so the mapping happens here
   // (doc/design/fallback.md "Negotiation").
+  LogIdentity(AHost, APort);
   Sock := TTlsSocket.DialWithAlpnVia(AHost, APort, AlpnOfferFor(AHttp1Fallback),
-    FInsecure, ATimeoutMs, FCACertFile, Proxy);
+    FInsecure, ATimeoutMs, FCACertFile, Proxy, FIdentity);
   // downcast with Supports, NOT a hard class cast: a hard cast reinterprets
   // the interface pointer (which is not the object base) and reads garbage
   Name := '';
@@ -2194,6 +2246,8 @@ begin
   Result.FEnvLookup := nil;
   Result.FCACertFile := '';
   Result.FInsecure := False;
+  Result.FIdentity := nil;
+  Result.FIdentityError := '';
   Result.FObserver := nil;
   Result.FRequestObservers := nil;
   Result.FLogger := nil;
@@ -2323,6 +2377,31 @@ begin
     AInsecure);
 end;
 
+function THttpClientFactory.WithClientIdentity(
+  const AIdentity: IClientIdentity): THttpClientFactory;
+begin
+  Result := Self;
+  Result.FIdentity := AIdentity;
+  Result.FIdentityError := '';
+end;
+
+function THttpClientFactory.WithClientCertificateFiles(const ACertFile,
+  AKeyFile: string; const APassphrase: string): THttpClientFactory;
+begin
+  Result := Self;
+  try
+    Result.FIdentity := TClientIdentity.FromPemFiles(ACertFile, AKeyFile,
+      APassphrase);
+    Result.FIdentityError := '';
+  except
+    on E: EHttpTlsConfigError do
+    begin
+      Result.FIdentity := nil;
+      Result.FIdentityError := E.Message;
+    end;
+  end;
+end;
+
 function THttpClientFactory.WithConnectTimeout(
   const AMs: Integer): THttpClientFactory;
 begin
@@ -2394,7 +2473,23 @@ var
   Env: TProxyEnvironment;
   Selector: IProxySelector;
   Client: THttpClient;
+  Factory: IHttp2SocketFactory;
 begin
+  // a bad identity fails here, not on the first request
+  if FIdentityError <> '' then
+    raise EHttpTlsConfigError.Create(FIdentityError);
+  Factory := FSocketFactory;
+  if FIdentity <> nil then
+  begin
+    if FIdentity.NotAfter < LocalTimeToUniversal(Now) then
+      raise EHttpTlsConfigError.CreateFmt(
+        'the client certificate expired on %s UTC',
+        [FormatDateTime('yyyy-mm-dd hh:nn:ss', FIdentity.NotAfter)]);
+    // an injected transport factory is the test seam and is left alone
+    if Factory is TDefaultSocketFactory then
+      Factory := TDefaultSocketFactory(Factory as TObject).WithIdentity(
+        FIdentity, FLogger);
+  end;
   // every proxy source collapses into one selector here (nil = all direct);
   // an unusable proxy value raises EHttpProxyConfigError before any request
   Fixed := nil;
@@ -2408,7 +2503,7 @@ begin
       Env := ReadProxyEnvironment;
   Selector := BuildProxySelector(FProxySelector, Fixed, FAllProxy,
     FProxyEnvVars, Env, FNoProxy);
-  Client := THttpClient.Create(FSocketFactory, FMaxConnectionsPerHost,
+  Client := THttpClient.Create(Factory, FMaxConnectionsPerHost,
     FMaxTotalConnections, FMaxStreamsPerConnection, FFollowRedirects,
     FMaxRedirects, FConnectTimeoutMs, FHeaderTimeoutMs, FIdleTimeoutMs,
     FObserver, FHttp1Fallback, FClearTextPolicy, Selector);
@@ -2582,12 +2677,25 @@ var
   Deadline: QWord;
   Slice, Remaining: Integer;
   Ok: Boolean;
+  Err: EHttpError;
 begin
   AAcquired := False;
   FLock.Acquire;
   try
     if FClosing or (not Eligible) then
+    begin
+      // a server that rejected the client certificate ends the connection
+      // right after it opened; that is final, not a reason for the pool to
+      // dial again and repeat the rejection
+      if (FConn <> nil) and (FConn.State = csClosed) then
+      begin
+        Err := FConn.FailureError(FConn.ErrorMessage, FConn.ErrorCode);
+        if Err is EHttpTlsClientAuthError then
+          raise Err;
+        Err.Free;
+      end;
       Exit;
+    end;
     Lease := TStreamLease.Create(FConn, FAllocator, ARequest, FEncoder,
       FDecoder);
     Keep := Lease;
@@ -3189,6 +3297,7 @@ function TConnectionPool.StartHttp2(const Sock: IHttp2Socket;
 var
   Conn: TConnection;
   Pooled: THttpConnection;
+  Err: EHttpError;
 begin
   Conn := TConnection.Create(Sock);
   if FObserver <> nil then
@@ -3204,6 +3313,18 @@ begin
     Conn.Start;    // DoPreface writes the preface + the initial SETTINGS frame
     if not Conn.WaitForState(csOpen, FConnectTimeoutMs) then
     begin
+      // a server that rejected the client certificate closes before the
+      // connection opens; report that, not a generic open failure
+      if Conn.State = csClosed then
+      begin
+        Err := Conn.FailureError(Conn.ErrorMessage, Conn.ErrorCode);
+        if Err is EHttpTlsClientAuthError then
+        begin
+          Pooled.Free;
+          raise Err;
+        end;
+        Err.Free;
+      end;
       Pooled.Free;
       raise EHttpConnectionError.Create('HTTP/2 connection did not open');
     end;

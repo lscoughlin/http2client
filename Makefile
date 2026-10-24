@@ -12,6 +12,7 @@
 #   make validate-websocket  opt-in live WebSocket gate against tools/validate/ws_servers.py
 #   make validate-websocket-autobahn  Autobahn|Testsuite client run (needs Docker)
 #   make validate-cleartext  opt-in live gate: cleartext requests are sent once
+#   make validate-mtls  opt-in live mutual TLS gate against tools/validate/mtls_server.py and nghttpd
 #   make measure-observer  opt-in observer overhead measurement on loopback
 #   make clean    remove build outputs
 
@@ -32,7 +33,7 @@ EXAMPLEUNITS = examples/observer_tracing.pas examples/observer_metrics.pas examp
 EXAMPLESRC = $(filter-out $(EXAMPLEUNITS),$(wildcard examples/*.pas))
 BIN        = bin
 
-.PHONY: all test examples measure-observer clean validate-interop validate-harness validate-sse validate-proxy validate-websocket validate-websocket-autobahn validate-cleartext validate
+.PHONY: all test examples measure-observer clean validate-interop validate-harness validate-sse validate-proxy validate-websocket validate-websocket-autobahn validate-cleartext validate-mtls validate
 
 all: $(BIN)/libhttp2.a
 
@@ -101,5 +102,11 @@ validate-websocket-autobahn: all | $(BIN)
 # proves a request is sent once under ctUpgrade (declined) and ctHttp1.
 validate-cleartext: all | $(BIN)
 	bash tools/validate/cleartext-live.sh
+
+# Opt-in live mutual TLS gate: servers that require a client certificate (a
+# Python ssl server pinned to TLS 1.2 and 1.3, and nghttpd --verify-client),
+# driven by examples/mtls_get.pas.
+validate-mtls: all | $(BIN)
+	bash tools/validate/mtls-live.sh
 
 validate: validate-interop validate-harness

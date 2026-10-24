@@ -68,6 +68,20 @@ type
   /// a proxy value, selector result or SOCKS5 credential is unusable
   /// (doc/design/proxy.md "Errors"); never carries a password in its message
   EHttpProxyConfigError = class(EHttpError);
+  /// a client identity cannot be used: unreadable or malformed file, wrong
+  /// passphrase, a key that does not match the certificate, or an expired
+  /// leaf (doc/design/mtls.md); never carries a passphrase in its message
+  EHttpTlsConfigError = class(EHttpError);
+  /// the server rejected the client certificate with a TLS alert; Alert names
+  /// it ('certificate required', 'unknown ca', ...).  Final: never retried
+  EHttpTlsClientAuthError = class(EHttpConnectionError)
+  private
+    FAlert: string;
+  public
+    constructor Create(const AMessage, AAlert: string); overload;
+    /// the alert the server sent, as a lowercase TLS alert name
+    property Alert: string read FAlert;
+  end;
 
   /// a WebSocket API was misused (unusable argument, restricted header, ...)
   /// (doc/design/websocket.md "Errors")
@@ -127,6 +141,12 @@ constructor EHttpStreamError.Create(const AMessage: string;
 begin
   inherited Create(AMessage, AErrorCode);
   FStreamId := AStreamId;
+end;
+
+constructor EHttpTlsClientAuthError.Create(const AMessage, AAlert: string);
+begin
+  inherited Create(AMessage);
+  FAlert := AAlert;
 end;
 
 function Http2ErrorCodeName(const ACode: THttp2ErrorCode): string;
