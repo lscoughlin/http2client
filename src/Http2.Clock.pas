@@ -62,11 +62,15 @@ end;
 const
   cClockMonotonic = 1;   // CLOCK_MONOTONIC on Linux and the BSDs
 
+// FPC's Unix and BaseUnix units do not export clock_gettime on every target
+function SysClockGetTime(AClockId: LongInt; ATimeSpec: PTimeSpec): LongInt;
+  cdecl; external 'c' name 'clock_gettime';
+
 function SystemNowUs: Int64;
 var
   TS: TTimeSpec;
 begin
-  if clock_gettime(cClockMonotonic, @TS) <> 0 then
+  if SysClockGetTime(cClockMonotonic, @TS) <> 0 then
     Exit(Int64(GetTickCount64) * 1000);
   Result := Int64(TS.tv_sec) * 1000000 + TS.tv_nsec div 1000;
 end;

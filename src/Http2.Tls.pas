@@ -1909,4 +1909,12 @@ begin
   end;
 end;
 
+{$IFDEF LINUX}
+initialization
+  // Linux has no SO_NOSIGPIPE and OpenSSL writes the descriptor with write(),
+  // so a write to a peer that has closed would kill the process with SIGPIPE;
+  // ignored, the write fails with EPIPE and the connection reports it
+  fpSignal(SIGPIPE, SignalHandler(SIG_IGN));
+{$ENDIF}
+
 end.

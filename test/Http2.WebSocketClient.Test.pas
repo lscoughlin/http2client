@@ -217,7 +217,9 @@ begin
     if FFd < 0 then
       Exit;
     One := 1;
+    {$IFDEF DARWIN}
     fpSetSockOpt(FFd, SOL_SOCKET, SO_NOSIGPIPE, @One, SizeOf(One));
+    {$ENDIF}
     FScript(Self);
   except
     on E: Exception do

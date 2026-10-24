@@ -150,7 +150,9 @@ begin
     if Fd < 0 then
       Break;
     One := 1;
+    {$IFDEF DARWIN}
     fpSetSockOpt(Fd, SOL_SOCKET, SO_NOSIGPIPE, @One, SizeOf(One));
+    {$ENDIF}
     fpSetSockOpt(Fd, IPPROTO_TCP, TCP_NODELAY, @One, SizeOf(One));
     try
       Serve(Fd);

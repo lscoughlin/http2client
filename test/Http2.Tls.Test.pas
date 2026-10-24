@@ -412,7 +412,9 @@ begin
     Exit;
   opt := 1;
 {$IFDEF DARWIN}
+  {$IFDEF DARWIN}
   fpSetSockOpt(FAcceptedFd, SOL_SOCKET, SO_NOSIGPIPE, @opt, SizeOf(opt));
+  {$ENDIF}
 {$ENDIF}
   ctx := SSL_CTX_new(TLS_server_method());
   try
@@ -473,8 +475,12 @@ begin
     // writing to a peer that has already closed must not kill the process
     opt := 1;
 {$IFDEF DARWIN}
+    {$IFDEF DARWIN}
     fpSetSockOpt(A, SOL_SOCKET, SO_NOSIGPIPE, @opt, SizeOf(opt));
+    {$ENDIF}
+    {$IFDEF DARWIN}
     fpSetSockOpt(B, SOL_SOCKET, SO_NOSIGPIPE, @opt, SizeOf(opt));
+    {$ENDIF}
 {$ENDIF}
   end;
 end;
@@ -948,7 +954,9 @@ begin
     Exit;
   opt := 1;
 {$IFDEF DARWIN}
+  {$IFDEF DARWIN}
   fpSetSockOpt(FAcceptedFd, SOL_SOCKET, SO_NOSIGPIPE, @opt, SizeOf(opt));
+  {$ENDIF}
 {$ENDIF}
   // read the request headers up to the blank line
   repeat
