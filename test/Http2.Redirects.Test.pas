@@ -25,7 +25,7 @@ uses
 
 type
   /// one scripted server response
-  TRespKind = (rkHeaders, rkRst);
+  TRespKind = (rkHeaders, rkRst, rkHeadersThenRst);
   TRespSpec = record
     Kind: TRespKind;
     Status: string;
@@ -40,6 +40,8 @@ function HdrSpec(const AStatus: string; const ALocation: string = '';
   const ABody: TBytes = nil; const AEndStream: Boolean = True): TRespSpec;
 /// a RST_STREAM response
 function RstSpec(const ACode: THttp2ErrorCode): TRespSpec;
+/// a 200 response head that stays open, then RST_STREAM
+function HdrRstSpec(const ACode: THttp2ErrorCode): TRespSpec;
 /// copy an inline open-array literal into a dynamic array
 function SpecArray(const A: array of TRespSpec): TArray<TRespSpec>;
 
@@ -51,6 +53,8 @@ type
     Path: string;
     Authority: string;
     HeaderNames: string;
+    /// every regular header as 'name: value' lines, in wire order
+    HeaderLines: string;
     Body: TBytes;
     HasBody: Boolean;
   end;
@@ -176,6 +180,13 @@ begin
   Result.Location := '';
   Result.Body := nil;
   Result.EndStream := True;
+  Result.RstCode := ACode;
+end;
+
+function HdrRstSpec(const ACode: THttp2ErrorCode): TRespSpec;
+begin
+  Result := HdrSpec('200', '', nil, False);
+  Result.Kind := rkHeadersThenRst;
   Result.RstCode := ACode;
 end;
 
@@ -309,6 +320,7 @@ begin
   Rec.Path := '';
   Rec.Authority := '';
   Rec.HeaderNames := '';
+  Rec.HeaderLines := '';
   Rec.Body := nil;
   Rec.HasBody := False;
   Fields := FCodec.Decode(ABlock);
@@ -326,6 +338,7 @@ begin
       if Rec.HeaderNames <> '' then
         Rec.HeaderNames := Rec.HeaderNames + ',';
       Rec.HeaderNames := Rec.HeaderNames + F.Name;
+      Rec.HeaderLines := Rec.HeaderLines + F.Name + ': ' + F.Value + #10;
     end;
   end;
   SetLength(FReqs, Length(FReqs) + 1);
@@ -359,6 +372,12 @@ begin
     Block[1].Sensitive := False;
   end;
   Enc := FRespCodec.Encode(Block);
+  if Spec.Kind = rkHeadersThenRst then
+  begin
+    AppendInLocked(FrameBytes(BuildHeadersFrame(AStreamId, Enc, True, False)));
+    AppendInLocked(FrameBytes(BuildRstStreamFrame(AStreamId, Spec.RstCode)));
+    Exit;
+  end;
   if Length(Spec.Body) = 0 then
     AppendInLocked(FrameBytes(BuildHeadersFrame(AStreamId, Enc, True,
       Spec.EndStream)))
