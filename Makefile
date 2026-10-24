@@ -14,6 +14,7 @@
 #   make validate-cleartext  opt-in live gate: cleartext requests are sent once
 #   make validate-mtls  opt-in live mutual TLS gate against tools/validate/mtls_server.py and nghttpd
 #   make validate-mtls-real  opt-in mutual TLS gate against nginx, Apache httpd and Caddy (needs a Docker host)
+#   make validate-proxy-real  opt-in gate against REAL Apache httpd and Squid proxies (Docker host)
 #   make measure-observer  opt-in observer overhead measurement on loopback
 #   make clean    remove build outputs
 
@@ -34,7 +35,7 @@ EXAMPLEUNITS = examples/observer_tracing.pas examples/observer_metrics.pas examp
 EXAMPLESRC = $(filter-out $(EXAMPLEUNITS),$(wildcard examples/*.pas))
 BIN        = bin
 
-.PHONY: all test examples measure-observer clean validate-interop validate-harness validate-sse validate-proxy validate-websocket validate-websocket-autobahn validate-cleartext validate-mtls validate-mtls-real validate
+.PHONY: all test examples measure-observer clean validate-interop validate-harness validate-sse validate-proxy validate-websocket validate-websocket-autobahn validate-cleartext validate-mtls validate-mtls-real validate-proxy-real validate
 
 all: $(BIN)/libhttp2.a
 
@@ -118,3 +119,10 @@ validate-mtls-real:
 	bash tools/validate/mtls-real.sh
 
 validate: validate-interop validate-harness
+
+# Opt-in real-proxy gate: Apache httpd (mod_proxy_connect) and Squid in stock
+# containers on a Docker host (PROXY_REAL_HOST, default the remote box), the
+# client driver tools/validate/proxy_real_client.pas built in the dev image;
+# the proxies' access logs are read to prove the route.  Not part of `make test`.
+validate-proxy-real:
+	bash tools/validate/proxy-real.sh

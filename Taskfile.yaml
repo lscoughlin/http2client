@@ -178,6 +178,11 @@ tasks:
     cmds:
       - bash tools/validate/mtls-real.sh
 
+  validate:proxy:real:
+    desc: 'Real-proxy gate — Apache httpd and Squid in containers on a Docker host (PROXY_REAL_HOST)'
+    cmds:
+      - bash tools/validate/proxy-real.sh
+
   validate:harness:
     desc: 'S12 gate B — 146-id h2-client-test-harness sweep (~30 min, Docker)'
     deps:
