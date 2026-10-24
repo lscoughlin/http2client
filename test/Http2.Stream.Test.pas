@@ -91,6 +91,7 @@ type
     // 08.9
     procedure TestCleanupHappensExactlyOnce;
     procedure TestConnectionFailureReachesLeaseExactlyOnce;
+    procedure TestStartOnADeadConnectionLeavesNothingRegistered;
     procedure TestGoAwayMarksHigherStreamRetryable;
     // end to end + integration
     procedure TestEndToEndSingleLeaseOverMockedConnection;
@@ -1104,6 +1105,43 @@ begin
         IsTimeout);
       AssertTrue('the connection failure reaches the blocked read',
         IsConnError);
+    finally
+      Lease.ReleaseLease;
+      IL := nil;
+      Alloc.Free;
+    end;
+  finally
+    Conn.Free;
+  end;
+end;
+
+procedure TStreamLeaseTest.TestStartOnADeadConnectionLeavesNothingRegistered;
+var
+  Sock: TMockSocket;
+  Conn: TConnection;
+  Lease: TStreamLease;
+  IL: IConnectionStream;
+  Alloc: TStreamIdAllocator;
+  Req: TStreamRequest;
+  Raised: Boolean;
+begin
+  Sock := TMockSocket.Create;
+  Conn := TConnection.Create(Sock);
+  try
+    Conn.FailWith('socket reset', ecConnectError);
+    Req := TStreamRequest.WithMethod(hmGet, 'api.example');
+    MakeLease(Conn, Req, Alloc, Lease, IL);
+    try
+      Raised := False;
+      try
+        Lease.Start;
+      except
+        on E: EHttpConnectionError do Raised := True;
+      end;
+      AssertTrue('Start fails at once on a dead connection', Raised);
+      AssertEquals('the stream is not left in the connection map', 0,
+        Conn.StreamCount);
+      AssertEquals('unregistered exactly once', 1, Lease.UnregisterCount);
     finally
       Lease.ReleaseLease;
       IL := nil;

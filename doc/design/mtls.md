@@ -68,7 +68,8 @@ without one the client answers none.
   fixed identity per client.
 - No identity on the `http://` or `socks5://` proxy leg: they have no TLS, so
   the proxy identity is unused there.
-- No eviction of pooled connections authenticated with a replaced certificate.
+- No eviction of a busy connection: a connection of a replaced identity is
+  closed only while idle, and only to make room under a connection cap.
 
 ## Vocabulary
 
@@ -158,8 +159,14 @@ A client with neither configured behaves as before. `Build` raises
 `EHttpTlsConfigError` for a fixed or proxy identity whose leaf has expired, and for files
 given to `WithClientCertificateFiles` that could not be loaded: the factory is
 a value builder, so the load failure is held and raised at `Build`, and the
-passphrase is not kept past the call. An injected socket factory
-(`WithSocketFactory`) is a test seam and receives no identity.
+passphrase is not kept past the call.
+
+An injected socket factory (`WithSocketFactory`) is a test seam and can present
+an identity only when it implements `IIdentitySocketFactory`. `Build` raises
+`EHttpTlsConfigError` when a fixed identity, a proxy identity or a selector is
+configured with an injected factory that does not, and `Send` raises it before
+dialling when an `https` or `wss` request carries an identity and the factory
+cannot present it. Nothing is dropped silently.
 
 Loaders raise `EHttpTlsConfigError` (derives from `EHttpError`, as
 `EHttpProxyConfigError` does) for an unreadable file, malformed PEM or
@@ -234,10 +241,17 @@ The key carries the origin identity fingerprint
 
 Cleartext requests keep the plain key, since no origin identity is presented
 to them. A request identity is never passed to the selector, and a connection
-found by fingerprint is reused without calling it. The connection caps count
-per origin, route and identity, so an origin can briefly hold more than
-`MaxConnectionsPerHost` split across keys (`MaxTotalConnections` still bounds
-the pool), and `PoolStats` lists the keys with their `id=` suffix.
+found by fingerprint is reused without calling it. `PoolStats` lists the keys with their `id=` suffix.
+
+The caps do not follow the key. `MaxConnectionsPerHost` counts connections to
+one origin and route across all identities, and `MaxTotalConnections` counts
+the whole pool, so an origin never holds more than the cap however many
+identities it is reached with. When a cap is reached and the origin holds an
+idle connection of a different identity, the pool closes the oldest such idle
+connection and dials for the new identity in its place; this is how a replaced
+certificate gives up its connections. A connection with a request in flight is
+never evicted: the new request waits for a slot, or fails with the usual
+timeout, as the caps already define.
 
 ## Selector and proxy identity
 
@@ -251,14 +265,23 @@ place of a fixed identity.
   a tunnel. A request that reuses a pooled connection does not call it, a
   request that carries its own identity does not call it, and a cleartext
   request never does. It may be
-  called from several threads at once and the dial waits for it, so it should
-  not block for long. The lock is released while it runs, so two concurrent
-  requests to a cold origin can both ask; one dials and the other then finds
-  that connection, so it is asked at most once per request that needs a dial.
+  called from several threads at once (for different origins) and the dial
+  waits for it, so it should not block for long. The lock is released while it
+  runs. While one request is asking for an origin and route, a concurrent
+  request that also needs a dial for it waits for that dial to publish its
+  connection or fail instead of asking again, so two concurrent requests to a
+  cold origin ask once and share the new connection (HTTP/2). The waiting
+  request asks itself if the dial did not leave it a usable connection (the
+  connection is busy, as an HTTP/1.1 one is, or the dial failed), so the
+  guarantee is at most one call per request that needs a dial, and one call
+  per dial when the new connection can serve the waiting request. The wait is
+  bounded by the header timeout.
 - An exception from the selector fails that dial with `EHttpTlsConfigError`
   carrying its message; nothing is dialled, and the next request asks again.
-  `Build` cannot check an identity the selector has not returned yet, so an
-  expired answer reaches the server and is reported as a rejection.
+- An answer whose leaf has expired fails that dial with `EHttpTlsConfigError`
+  naming the expiry date (never key material), before anything is dialled; a
+  `wss` dial likewise. `Build` cannot check an identity the selector has not
+  returned yet, so this check runs on each dial.
 - How the pool asks without holding its lock: a request first looks for a
   connection under the fingerprint the last dial to that origin presented
   (remembered per origin). Only when none is eligible and a new connection may
@@ -269,10 +292,11 @@ place of a fixed identity.
   identity that a background task replaces) is presented by the next new
   connection. Connections authenticated with the replaced certificate stay in
   the pool, finish the requests already on them and are used until they close
-  or idle out; they are not evicted. A pooled HTTP/2 connection takes every
+  or idle out, or until a cap needs their slot while they are idle. A pooled HTTP/2 connection takes every
   later request while it lives, so a new certificate is presented once that
   connection closes, idles out, or the pool opens another (for example because
-  it is full). The selector is not asked in between.
+  it is full: an idle connection of the replaced identity is then evicted, see
+  "Pooling"). The selector is not asked in between.
 - Per origin: the selector decides by host and port.
 
 ```pascal
@@ -325,7 +349,8 @@ Resp := Client.Send(THttpRequest.Create(hmGet, 'https://billing.example/')
 - Requests stay immutable: `Clone`, `WithUrl`, `DropBody`, `WithMethodToken`
   and the other `With` methods carry it.
 - Send raises `EHttpTlsConfigError` before dialling when the identity has
-  expired (a `wss` request likewise).
+  expired (a `wss` request likewise), and when the injected socket factory
+  cannot present it.
 - Redirects: the identity follows a redirect to the same origin (scheme, host
   and port) and is dropped on a redirect to another origin, which falls back to
   the selector's answer or the client's fixed identity. It behaves like a
@@ -394,7 +419,14 @@ Consequences:
   request, never for cleartext), check the thread and that another thread can
   take the pool lock meanwhile, choose a different identity per origin, answer
   `nil`, throw, rotate between two dials (the old connection still delivers
-  its response and the pool holds two keys) and cover `wss`. The proxy cases
+  its response and the pool holds two keys), refuse an expired answer before
+  dialling (HTTP/2 and `wss`), ask once for two concurrent cold requests and
+  cover `wss`. The cap cases check that rotation at `MaxConnectionsPerHost` and
+  at `MaxTotalConnections` evicts the idle connection of the old identity, that
+  a busy one is never evicted, and that two identities share the host cap. An
+  injected factory without `IIdentitySocketFactory` is refused at `Build` for a
+  fixed identity, a proxy identity and a selector, and at `Send` for a request
+  identity (`https` and `wss`). The proxy cases
   use a loopback `https` proxy that requires a client certificate: through
   CONNECT, SOCKS5 and the `https` proxy (TLS 1.2 and 1.3) the origin sees the
   origin identity, the `https` proxy sees only the proxy identity, the origin
