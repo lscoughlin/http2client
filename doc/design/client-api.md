@@ -195,6 +195,23 @@ overloads.
 `IHttpResponse` bodies remain readable until they complete or the caller
 releases them.
 
+### Pool statistics
+
+`THttpClient.PoolStats` returns a `TPoolStats` snapshot of the connection
+pool: total, idle and active-stream counts, the callers parked waiting for a
+slot, and per origin (the key includes the proxy route) the same counts plus a
+`TConnectionStats` for each connection with its protocol, state, age, idle
+time and the peer's settings. The record types and the field list are in
+[request-observability](request-observability.md#pull-based-pool-statistics).
+
+The counts are the ones the pool's own caps use: `Connections` is what
+`MaxTotalConnections` bounds, `ActiveStreams` is what
+`MaxStreamsPerConnection` and the peer's `SETTINGS_MAX_CONCURRENT_STREAMS`
+bound, and `PendingAcquires` is the number of `Send` calls waiting for a slot.
+The snapshot is copied under the pool lock and returned by value, so it is
+consistent and points at nothing in the pool. On a closed client it is all
+zeros. It is safe from any thread.
+
 ### Lease acquisition
 
 `Send` performs these steps under the pool's `TCriticalSection`:

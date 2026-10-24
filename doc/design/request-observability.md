@@ -262,6 +262,22 @@ asynchronous gauge, a Prometheus collector). The library pushes no gauge
 events. The per-connection detail serves diagnosis: connection age and idle
 time show churn, and the peer settings show why streams queue.
 
+The counts are the values the pool's caps use. `Connections` counts every
+pooled connection (what `MaxTotalConnections` bounds), `IdleConnections` the
+open ones with no active stream, `ActiveStreams` the streams in flight, and
+`PendingAcquires` the `Send` calls parked waiting for a slot. `IdleMs` is the
+time since the pool last handed the connection out and is 0 while a stream is
+active; `AgeMs` is the time since it was pooled. An HTTP/1.1 connection
+reports zero peer settings and one active stream while a response is being
+read. A proxied route is its own entry in `PerOrigin`, as it is its own pool
+key. `PoolStats` on a closed client returns zeros.
+
+Polling guidance: take one snapshot per collection cycle and read every gauge
+from it, rather than calling `PoolStats` once per gauge. The call takes the
+pool lock for the copy, so a scrape interval of seconds costs nothing; the
+per-connection `Details` allocate, so a gauge that needs only totals reads the
+top-level fields and ignores `PerOrigin`.
+
 ### Library diagnostics
 
 ```pascal

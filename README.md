@@ -345,6 +345,24 @@ descendant (arrays, numbers, strings). A body that does not parse raises
 `EXMLReadError`. The XML reader also accepts documents that declare
 `encoding="us-ascii"`, which `fcl-xml` rejects on its own.
 
+### Pool statistics
+
+`THttpClient.PoolStats` returns a snapshot of the connection pool, for a
+gauge callback to poll or for diagnosis:
+
+```pascal
+Stats := (Client as THttpClient).PoolStats;
+WriteLn(Stats.Connections, ' open, ', Stats.IdleConnections, ' idle, ',
+  Stats.ActiveStreams, ' streams, ', Stats.PendingAcquires, ' waiting');
+for Origin in Stats.PerOrigin do
+  for Conn in Origin.Details do
+    WriteLn(Origin.Origin, ' age ', Conn.AgeMs, ' ms, idle ', Conn.IdleMs, ' ms');
+```
+
+The snapshot is a copy: it holds no reference into the pool, and it is all
+zeros once the client is closed. Take one snapshot per polling cycle and read
+every gauge from it. See `doc/design/request-observability.md`.
+
 ## Examples
 
 The `examples/` directory has eight small programs. Build them all with:
