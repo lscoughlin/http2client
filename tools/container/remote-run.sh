@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tools/container/remote-run.sh — run a command in the dev container on a remote Docker host.
 #
-# Usage: tools/container/remote-run.sh HOST COMMAND...
+# Usage: tools/container/remote-run.sh HOST COMMAND...   (each checkout gets its own remote directory)
 #   e.g. tools/container/remote-run.sh lscoughlin@liam-rzbox.local make test
 #
 # The image (tools/container/Dockerfile) is built once and reused: it is
@@ -18,7 +18,10 @@ cd "$REPO_ROOT"
 HOST="${1:?usage: remote-run.sh HOST COMMAND...}"
 shift
 IMAGE="${HTTP2_IMAGE:-http2client-dev}"
-DIR="${HTTP2_REMOTE_DIR:-http2client-ci}"
+# one remote directory per checkout, so concurrent runs from different
+# worktrees never rebuild over each other
+TAG="$(printf '%s' "$REPO_ROOT" | cksum | cut -d' ' -f1)"
+DIR="${HTTP2_REMOTE_DIR:-http2client-ci/run-$TAG}"
 
 # image: build only when absent (or forced)
 if [ "${HTTP2_REBUILD_IMAGE:-0}" = 1 ] || \
@@ -39,5 +42,8 @@ if ! ssh "$HOST" "[ -d $DIR/src/third_party/mORMot2/src ]"; then
     ssh "$HOST" "tar -x -C $DIR/src/third_party"
 fi
 
+# %q keeps each argument intact through the remote shell, so
+# `sh -c 'make test; make validate-proxy'` works as written
+ARGS="$(printf '%q ' "$@")"
 ssh "$HOST" "cd $DIR/src && docker run --rm --user \$(id -u):\$(id -g) \
-  -e HOME=/tmp -v \"\$PWD:/src\" -w /src $IMAGE $*"
+  -e HOME=/tmp -v \"\$PWD:/src\" -w /src $IMAGE $ARGS"
