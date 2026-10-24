@@ -41,7 +41,7 @@ type
   end;
 
   /// chooses the identity for a TLS dial to an origin (doc/design/mtls.md,
-  /// "Selector and proxy identity").  Select is called once per new
+  /// "Selector").  Select is called once per new
   /// connection, on the dialling thread and outside the pool lock, never for a
   /// request that reuses a pooled connection.  nil presents no certificate.
   /// An implementation may be called from several threads at once and must

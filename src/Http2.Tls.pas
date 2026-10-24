@@ -172,9 +172,11 @@ type
   end;
 
   /// implemented by a socket factory that takes the origin identity per dial
-  /// (doc/design/mtls.md "Selector and proxy identity"): the pool asks the
-  /// selector outside its lock and hands the answer down.  AIdentity nil
-  /// presents no certificate; the factory's own identity is not used.
+  /// (doc/design/mtls.md "Where it applies"): the pool asks the selector
+  /// outside its lock and hands the answer down.  AIdentity nil presents no
+  /// certificate; the factory's own identity is not used.  The identity goes
+  /// to the origin on a direct route and to an https proxy on a proxied one,
+  /// never to both.
   IIdentitySocketFactory = interface
     ['{7B1D5E02-9F6A-4C57-8A31-5D2E0C4A9B24}']
     function DialProtocolViaAs(const AHost: string; const APort: Word;
@@ -200,15 +202,13 @@ type
     FProxyHost: string;
     FProxyPort: Word;
     FIdentity: IClientIdentity;
-    FProxyIdentity: IClientIdentity;
   public
-    /// AIdentity is presented on every TLS connection to an origin; cleartext
-    /// dials ignore it (doc/design/mtls.md).  AProxyIdentity is presented to
-    /// an https proxy and to nothing else.
+    /// AIdentity is presented to the origin on a direct TLS connection and to
+    /// an https proxy on a proxied one; cleartext direct dials and http or
+    /// socks5 proxies ignore it (doc/design/mtls.md "Where it applies").
     constructor Create(const ACACertFile: string = '';
       const AInsecure: Boolean = False; const AProxyHost: string = '';
-      const AProxyPort: Word = 0; const AIdentity: IClientIdentity = nil;
-      const AProxyIdentity: IClientIdentity = nil);
+      const AProxyPort: Word = 0; const AIdentity: IClientIdentity = nil);
     function DialProtocol(const AHost: string; const APort: Word;
       const AScheme: string; const AHttp1Fallback: Boolean;
       const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
@@ -364,22 +364,21 @@ type
     /// dial through AProxy (nil = direct): the proxy leg is TCP, or TCP+TLS for
     /// an https proxy, and a CONNECT or SOCKS5 tunnel to AHost:APort is
     /// negotiated before TLS to the origin begins
-    // - AIdentity goes to the origin leg only, never to an https proxy;
-    //   AProxyIdentity goes to the TLS leg of an https proxy only
+    // - AIdentity goes to the origin when AProxy is nil and to the TLS leg of
+    //   an https proxy otherwise; the origin leg inside a tunnel never
+    //   presents one, and an http or socks5 proxy has no TLS leg to give it to
     class function DialVia(const AHost: string; const APort: Word;
       const AInsecure: Boolean; const AConnectTimeoutMs: Integer;
       const ACACertFile: string; const AProxy: IProxy;
-      const AIdentity: IClientIdentity = nil;
-      const AProxyIdentity: IClientIdentity = nil): IHttp2Socket;
+      const AIdentity: IClientIdentity = nil): IHttp2Socket;
     class function DialWithAlpnVia(const AHost: string; const APort: Word;
       const AAlpnOffer: TBytes; const AInsecure: Boolean;
       const AConnectTimeoutMs: Integer; const ACACertFile: string;
-      const AProxy: IProxy; const AIdentity: IClientIdentity = nil;
-      const AProxyIdentity: IClientIdentity = nil): IHttp2Socket;
+      const AProxy: IProxy; const AIdentity: IClientIdentity = nil): IHttp2Socket;
     class function DialCleartextVia(const AHost: string; const APort: Word;
       const AConnectTimeoutMs: Integer; const AProxy: IProxy;
       const AInsecure: Boolean = False; const ACACertFile: string = '';
-      const AProxyIdentity: IClientIdentity = nil): IHttp2Socket;
+      const AIdentity: IClientIdentity = nil): IHttp2Socket;
     function ReadSome(var ABuffer; ACount: Integer): Integer;
     property StreamMode: Boolean read FStreamMode write FStreamMode;
     property Insecure: Boolean read FInsecure;
@@ -966,7 +965,7 @@ end;
 function DialRoutedTransport(const AHost: string; const APort: Word;
   const AConnectTimeoutMs: Integer; const AProxy: IProxy;
   const AInsecure: Boolean; const ACACertFile: string;
-  const AProxyIdentity: IClientIdentity; out AStream: Boolean): IHttp2Socket;
+  const AIdentity: IClientIdentity; out AStream: Boolean): IHttp2Socket;
 var
   Plain: TPlainSocket;
   Leg: TTlsSocket;
@@ -989,10 +988,10 @@ begin
     if AProxy.Kind = pkHttps then
     begin
       // TLS to the proxy, verified against the proxy's host name; no ALPN, the
-      // CONNECT exchange is HTTP/1.1.  It presents the proxy identity only:
-      // the origin identity never reaches this leg (doc/design/mtls.md)
+      // CONNECT exchange is HTTP/1.1.  This is the only leg
+      // that presents the identity on a proxied route (doc/design/mtls.md)
       Leg := TTlsSocket.Create(Plain, AProxy.Host, AInsecure, ACACertFile,
-        AProxyIdentity);
+        AIdentity);
       Leg.FAlpnOffer := nil;
       Leg.FRequireH2 := False;
       Leg.ConnectTimeoutMs := AConnectTimeoutMs;
@@ -1429,16 +1428,22 @@ end;
 class function TTlsSocket.DialVia(const AHost: string; const APort: Word;
   const AInsecure: Boolean; const AConnectTimeoutMs: Integer;
   const ACACertFile: string; const AProxy: IProxy;
-  const AIdentity, AProxyIdentity: IClientIdentity): IHttp2Socket;
+  const AIdentity: IClientIdentity): IHttp2Socket;
 var
   Transport: IHttp2Socket;
   Stream: Boolean;
   Sock: TTlsSocket;
+  OriginIdentity: IClientIdentity;
 begin
   Transport := DialRoutedTransport(AHost, APort, AConnectTimeoutMs, AProxy,
-    AInsecure, ACACertFile, AProxyIdentity, Stream);
+    AInsecure, ACACertFile, AIdentity, Stream);
+  // only a direct route presents the identity to the origin
+  if AProxy = nil then
+    OriginIdentity := AIdentity
+  else
+    OriginIdentity := nil;
   Sock := TTlsSocket.Create(Transport, AHost, AInsecure, ACACertFile,
-    AIdentity);
+    OriginIdentity);
   Sock.FStreamMode := Stream;
   Sock.ConnectTimeoutMs := AConnectTimeoutMs;
   Sock.ReadTimeoutMs := AConnectTimeoutMs;
@@ -1454,17 +1459,22 @@ end;
 class function TTlsSocket.DialWithAlpnVia(const AHost: string;
   const APort: Word; const AAlpnOffer: TBytes; const AInsecure: Boolean;
   const AConnectTimeoutMs: Integer; const ACACertFile: string;
-  const AProxy: IProxy; const AIdentity,
-  AProxyIdentity: IClientIdentity): IHttp2Socket;
+  const AProxy: IProxy; const AIdentity: IClientIdentity): IHttp2Socket;
 var
   Transport: IHttp2Socket;
   Stream: Boolean;
   Sock: TTlsSocket;
+  OriginIdentity: IClientIdentity;
 begin
   Transport := DialRoutedTransport(AHost, APort, AConnectTimeoutMs, AProxy,
-    AInsecure, ACACertFile, AProxyIdentity, Stream);
+    AInsecure, ACACertFile, AIdentity, Stream);
+  // only a direct route presents the identity to the origin
+  if AProxy = nil then
+    OriginIdentity := AIdentity
+  else
+    OriginIdentity := nil;
   Sock := TTlsSocket.Create(Transport, AHost, AInsecure, ACACertFile,
-    AIdentity);
+    OriginIdentity);
   Sock.FStreamMode := Stream;
   Sock.ConnectTimeoutMs := AConnectTimeoutMs;
   Sock.ReadTimeoutMs := AConnectTimeoutMs;
@@ -1483,12 +1493,12 @@ end;
 class function TTlsSocket.DialCleartextVia(const AHost: string;
   const APort: Word; const AConnectTimeoutMs: Integer; const AProxy: IProxy;
   const AInsecure: Boolean; const ACACertFile: string;
-  const AProxyIdentity: IClientIdentity): IHttp2Socket;
+  const AIdentity: IClientIdentity): IHttp2Socket;
 var
   Stream: Boolean;
 begin
   Result := DialRoutedTransport(AHost, APort, AConnectTimeoutMs, AProxy,
-    AInsecure, ACACertFile, AProxyIdentity, Stream);
+    AInsecure, ACACertFile, AIdentity, Stream);
   Result.ConnectTimeoutMs := AConnectTimeoutMs;
   Result.ReadTimeoutMs := AConnectTimeoutMs;
   Result.WriteTimeoutMs := AConnectTimeoutMs;
@@ -1755,11 +1765,10 @@ end;
 
 constructor TProtocolSocketFactory.Create(const ACACertFile: string;
   const AInsecure: Boolean; const AProxyHost: string;
-  const AProxyPort: Word; const AIdentity, AProxyIdentity: IClientIdentity);
+  const AProxyPort: Word; const AIdentity: IClientIdentity);
 begin
   inherited Create;
   FIdentity := AIdentity;
-  FProxyIdentity := AProxyIdentity;
   FCACertFile := ACACertFile;
   FInsecure := AInsecure;
   FProxyHost := AProxyHost;
@@ -1815,14 +1824,14 @@ begin
         begin
           AProtocol := npHttp1Cleartext;
           Result := TTlsSocket.DialCleartextVia(AHost, APort, ATimeoutMs, AProxy,
-            FInsecure, FCACertFile, FProxyIdentity);
+            FInsecure, FCACertFile, AIdentity);
         end;
     else
       // ctPriorKnowledge: speak HTTP/2 at once, the caller writes the preface
       begin
         AProtocol := npHttp2Cleartext;
         Result := TTlsSocket.DialCleartextVia(AHost, APort, ATimeoutMs, AProxy,
-          FInsecure, FCACertFile, FProxyIdentity);
+          FInsecure, FCACertFile, AIdentity);
       end;
     end;
     Exit;
@@ -1831,7 +1840,7 @@ begin
   // https: the ALPN offer follows the fallback flag, then the result maps to a
   // codec.  DialWithAlpn skips the strict check so we can map the name here.
   Sock := TTlsSocket.DialWithAlpnVia(AHost, APort, AlpnOfferFor(AHttp1Fallback),
-    FInsecure, ATimeoutMs, FCACertFile, AProxy, AIdentity, FProxyIdentity);
+    FInsecure, ATimeoutMs, FCACertFile, AProxy, AIdentity);
   // $interfaces com: an interface reference points past the object's VMT, so
   // `TTlsSocket(Sock)` (a raw hard cast) would read the wrong memory.  Recover
   // the object with `as TObject` before the class cast so the property read
@@ -1882,10 +1891,10 @@ begin
     Proxy := TProxy.Create(FProxyHost, FProxyPort);
   if AScheme = 'http' then
     Exit(TTlsSocket.DialCleartextVia(AHost, APort, ATimeoutMs, Proxy,
-      FInsecure, FCACertFile, FProxyIdentity));
+      FInsecure, FCACertFile, AIdentity));
   Result := TTlsSocket.DialWithAlpnVia(AHost, APort,
     AlpnProtocolList([cHttp11AlpnProtocol]), FInsecure, ATimeoutMs,
-    FCACertFile, Proxy, AIdentity, FProxyIdentity);
+    FCACertFile, Proxy, AIdentity);
   Name := '';
   if Supports(Result, TTlsSocket, TlsObj) then
     Name := TTlsSocket(TlsObj).SelectedProtocol;

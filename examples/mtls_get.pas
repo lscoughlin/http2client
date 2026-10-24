@@ -8,11 +8,14 @@
 //          origin port with a selector that reads the files at each dial (so a
 //          replaced file is presented by the next new connection), in place of
 //          the certificate arguments
-//          MTLS_PROXY=port routes every request through an https proxy on
-//          localhost:port; MTLS_PROXY_CERT and MTLS_PROXY_KEY are the identity
-//          that proxy requires (never sent to the origin)
-// - shows: WithClientCertificateFiles, WithClientIdentitySelector,
-//   WithProxyClientIdentity, a bad identity failing at Build, and the
+//          MTLS_PROXY=[http:|https:]port routes every request through a proxy
+//          on localhost:port (https unless told otherwise).  The one identity
+//          (the certificate arguments, or the selector's answer for the
+//          proxy's port) goes to an https proxy only; the origin inside the
+//          tunnel never sees it, and an http proxy gets it nowhere
+// - shows: WithClientCertificateFiles, WithClientIdentitySelector, the
+//   identity applying to an https proxy and not to the origin behind it, a
+//   bad identity failing at Build, and the
 //   distinct EHttpTlsClientAuthError when the server rejects the certificate.
 program example_mtls_get;
 
@@ -34,12 +37,12 @@ type
     function Select(const AHost: string; const APort: Word): IClientIdentity;
   end;
 
-  /// every request goes through one https proxy
-  TFixedHttpsProxy = class(TInterfacedObject, IProxySelector)
+  /// every request goes through one proxy
+  TFixedProxy = class(TInterfacedObject, IProxySelector)
   private
     FProxy: IProxy;
   public
-    constructor Create(const APort: Word);
+    constructor Create(const AKind: TProxyKind; const APort: Word);
     function SelectProxy(const AUri: string): IProxy;
   end;
 
@@ -124,13 +127,13 @@ begin
     Copy(Value, P + 1, MaxInt));
 end;
 
-constructor TFixedHttpsProxy.Create(const APort: Word);
+constructor TFixedProxy.Create(const AKind: TProxyKind; const APort: Word);
 begin
   inherited Create;
-  FProxy := TProxy.Create(pkHttps, 'localhost', APort);
+  FProxy := TProxy.Create(AKind, 'localhost', APort);
 end;
 
-function TFixedHttpsProxy.SelectProxy(const AUri: string): IProxy;
+function TFixedProxy.SelectProxy(const AUri: string): IProxy;
 begin
   Result := FProxy;
 end;
@@ -139,7 +142,8 @@ var
   Factory: THttpClientFactory;
   Urls: TStringList;
   UrlIndex: Integer;
-  SelectSpec, ProxyPort, ProxyCert, ProxyKey: string;
+  SelectSpec, ProxySpec: string;
+  ProxyKind: TProxyKind;
   Client: IHttpClient;
   Response: IHttpResponse;
   Listener: TFirstText;
@@ -163,23 +167,28 @@ begin
   // HTTP/1.1 is accepted as well as HTTP/2, so any server will do
   Factory := THttpClientFactory.Create.WithHttp1Fallback(True);
   SelectSpec := GetEnvironmentVariable('MTLS_SELECT');
-  ProxyPort := GetEnvironmentVariable('MTLS_PROXY');
-  ProxyCert := GetEnvironmentVariable('MTLS_PROXY_CERT');
-  ProxyKey := GetEnvironmentVariable('MTLS_PROXY_KEY');
+  ProxySpec := GetEnvironmentVariable('MTLS_PROXY');
   if SelectSpec <> '' then
     Factory := Factory.WithClientIdentitySelector(TFileSelector.Create(SelectSpec))
   else if ParamStr(2) <> '-' then
     Factory := Factory.WithClientCertificateFiles(ParamStr(2), ParamStr(3),
       Passphrase);
-  if ProxyPort <> '' then
+  if ProxySpec <> '' then
+  begin
+    ProxyKind := pkHttps;
+    if Pos('http:', ProxySpec) = 1 then
+    begin
+      ProxyKind := pkHttp;
+      Delete(ProxySpec, 1, Length('http:'));
+    end
+    else if Pos('https:', ProxySpec) = 1 then
+      Delete(ProxySpec, 1, Length('https:'));
     Factory := Factory.WithProxySelector(
-      TFixedHttpsProxy.Create(Word(StrToInt(ProxyPort))));
+      TFixedProxy.Create(ProxyKind, Word(StrToInt(ProxySpec))));
+  end;
   if CaFile <> '' then
     Factory := Factory.WithCACertFile(CaFile);
   try
-    if ProxyCert <> '' then
-      Factory := Factory.WithProxyClientIdentity(
-        TClientIdentity.FromPemFiles(ProxyCert, ProxyKey));
     // an unreadable file, a wrong passphrase, a key that does not match the
     // certificate and an expired certificate all fail here, not on the request
     Client := Factory.Build;

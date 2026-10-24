@@ -15,7 +15,7 @@ It logs one line per TLS connection to the file given with --log:
     reject <reason>                     the handshake was refused
 
 and `request <path>` for each request, so the gate can prove what the server
-saw.  Two options serve the selector and proxy-identity cases:
+saw.  Four options serve the selector and proxy cases:
 
     --only-subject CN   serve only a client whose common name is CN; any other
                         accepted client gets 403 and a `forbid` log line, so
@@ -23,13 +23,20 @@ saw.  Two options serve the selector and proxy-identity cases:
     --proxy             act as an https proxy that requires a client
                         certificate: answer CONNECT host:port with 200, log
                         `tunnel host:port` and pipe the bytes
+    --plain-proxy       act as an http:// CONNECT proxy with no TLS at all, so
+                        there is no leg on which to present an identity; logs
+                        `tunnel host:port` and pipes the bytes
+    --optional-cert     ask for a client certificate without requiring one;
+                        a connection that presents none is logged
+                        `accept nocert`, so the gate can prove an origin
+                        behind a proxy was shown nothing
 
 Usage:
 
     python3 tools/validate/mtls_server.py --port 8661 \
         --cert test/certs/mtls/server.crt --key test/certs/mtls/server.key \
         --ca test/certs/mtls/ca.crt --log /tmp/mtls.log [--tls 1.2|1.3] \
-        [--only-subject CN] [--proxy]
+        [--only-subject CN] [--proxy] [--plain-proxy] [--optional-cert]
 
 It prints "ready" on stdout once it listens.  See doc/design/mtls.md.
 """
@@ -144,7 +151,10 @@ def handle(raw, ctx, log, lock, opts):
         return
     try:
         cert = conn.getpeercert()
-        note("accept subject=%s" % subject_of(cert))
+        if cert:
+            note("accept subject=%s" % subject_of(cert))
+        else:
+            note("accept nocert")
         head = read_head(conn)
         if not head:
             return
@@ -179,6 +189,25 @@ def handle(raw, ctx, log, lock, opts):
             pass
 
 
+def handle_plain(raw, log, lock):
+    def note(text):
+        with lock:
+            with open(log, "a") as f:
+                f.write(text + "\n")
+
+    try:
+        head = read_head(raw)
+        if head:
+            serve_proxy(raw, head, note)
+    except OSError:
+        pass
+    finally:
+        try:
+            raw.close()
+        except OSError:
+            pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, required=True)
@@ -189,12 +218,15 @@ def main():
     ap.add_argument("--tls", choices=("1.2", "1.3"), default=None)
     ap.add_argument("--only-subject", default=None)
     ap.add_argument("--proxy", action="store_true")
+    ap.add_argument("--plain-proxy", action="store_true")
+    ap.add_argument("--optional-cert", action="store_true")
     args = ap.parse_args()
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(args.cert, args.key)
     ctx.load_verify_locations(args.ca)
-    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.verify_mode = (ssl.CERT_OPTIONAL if args.optional_cert
+                       else ssl.CERT_REQUIRED)
     ctx.set_alpn_protocols(["http/1.1"])
     if args.tls:
         version = (ssl.TLSVersion.TLSv1_2 if args.tls == "1.2"
@@ -212,6 +244,10 @@ def main():
     while True:
         raw, _ = srv.accept()
         raw.settimeout(5)
+        if args.plain_proxy:
+            threading.Thread(target=handle_plain, args=(raw, args.log, lock),
+                             daemon=True).start()
+            continue
         threading.Thread(target=handle, args=(raw, ctx, args.log, lock, args),
                          daemon=True).start()
 

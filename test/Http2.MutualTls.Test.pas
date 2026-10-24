@@ -50,7 +50,12 @@ type
     Connections, Handshakes, Refused, Requests: Integer;
     /// subject of the last client certificate the server accepted
     LastSubject: string;
-    constructor Create(const AKind: TMtlsKind; const AVersion: Integer);
+    /// a client certificate was offered on any accepted handshake
+    SawClientCert: Boolean;
+    /// AOptionalCert asks for a certificate without insisting on one, so a
+    /// client that presents none still completes the handshake
+    constructor Create(const AKind: TMtlsKind; const AVersion: Integer;
+      const AOptionalCert: Boolean = False);
     destructor Destroy; override;
     procedure Stop;
     property Port: Word read FPort;
@@ -129,8 +134,9 @@ type
   private
     FServer: TMtlsServer;
     FProxy: TTunnelProxy;
-    function StartServer(const AKind: TMtlsKind;
-      const AVersion: Integer): TMtlsServer;
+    function StartServer(const AKind: TMtlsKind; const AVersion: Integer;
+      const AOptionalCert: Boolean = False): TMtlsServer;
+    function RouteVia(const AFactory: THttpClientFactory): THttpClientFactory;
     function Url(const AScheme: string = 'https'): string;
     function GoodIdentity: IClientIdentity;
     function NewClient(const AIdentity: IClientIdentity;
@@ -152,7 +158,8 @@ type
     function ReadBody(const AResponse: IHttpResponse): string;
     function Client2Identity: IClientIdentity;
     function SubjectIs(const ASubject, AName: string): Boolean;
-    procedure RunProxyIdentity(const AVersion: Integer);
+    procedure RunSelectorVia(const AMode: TTunnelMode);
+    procedure RunWssVia(const AMode: TTunnelMode; const ASelect: Boolean);
     function SelectorClient(const ASelector: IClientIdentitySelector): IHttpClient;
     function ProbeAlert(const AVersion: Integer;
       const AIdentity: IClientIdentity; const AKind: TMtlsKind): string;
@@ -181,13 +188,19 @@ type
     procedure TestExpiredIsRejectedOnTheWireTls13;
     procedure TestRejectionIsNotRetried;
     // routed dials
-    procedure TestConnectTunnelPresentsTheIdentityTls13;
-    procedure TestSocks5TunnelPresentsTheIdentityTls13;
-    procedure TestHttpsProxyLegNeverSeesTheIdentityTls13;
+    procedure TestConnectTunnelOriginSeesNoIdentityTls13;
+    procedure TestSocks5TunnelOriginSeesNoIdentityTls13;
+    procedure TestHttpsProxyGetsTheIdentityAndTheOriginNoneTls13;
+    procedure TestHttpsProxyGetsTheIdentityAndTheOriginNoneTls12;
+    procedure TestSelectorIsAskedForTheHttpsProxy;
+    procedure TestSelectorIsNotAskedThroughAConnectProxy;
+    procedure TestSelectorIsNotAskedThroughASocks5Proxy;
+    procedure TestWssThroughAnHttpsProxyPresentsTheIdentityToTheProxyOnly;
+    procedure TestWssThroughAConnectProxyPresentsNoIdentity;
     // every dial helper
     procedure TestEveryDialHelperPresentsTheIdentity;
     procedure TestEveryTlsSocketConstructionCarriesTheIdentity;
-    // selector and proxy identity
+    // selector
     procedure TestFixedIdentitySelectorAnswersTheIdentity;
     procedure TestSelectorIsCalledOncePerDialNotPerRequest;
     procedure TestSelectorRunsOnTheDiallingThreadOutsideThePoolLock;
@@ -199,11 +212,8 @@ type
     procedure TestSelectorAppliesToWss;
     procedure TestSelectorIsNotCalledForCleartext;
     procedure TestSelectorAndFixedIdentityReplaceEachOther;
-    procedure TestProxyIdentityGoesToTheProxyOnlyTls13;
-    procedure TestProxyIdentityGoesToTheProxyOnlyTls12;
-    procedure TestOriginIdentityAloneDoesNotSatisfyAProxyThatAsksForOne;
-    procedure TestProxyIdentityDoesNotReachACleartextOrigin;
-    procedure TestSelectorAndProxyIdentityTogether;
+    procedure TestNoIdentityIsRefusedByAnHttpsProxyThatAsksForOne;
+    procedure TestHttpsProxyToACleartextOriginGetsTheIdentity;
     // other
     procedure TestCleartextIgnoresTheIdentity;
     procedure TestLogLineHasSubjectAndFingerprintButNoSecrets;
@@ -389,7 +399,8 @@ end;
 
 { TMtlsServer }
 
-constructor TMtlsServer.Create(const AKind: TMtlsKind; const AVersion: Integer);
+constructor TMtlsServer.Create(const AKind: TMtlsKind; const AVersion: Integer;
+  const AOptionalCert: Boolean);
 var
   SetCb: TSetAlpnSelectCb;
   Name: AnsiString;
@@ -403,8 +414,11 @@ begin
     SSL_FILETYPE_PEM);
   SSL_CTX_load_verify_locations(FCtx,
     PUtf8Char(UTF8String(Fixture('ca.crt'))), nil);
-  SSL_CTX_set_verify(FCtx,
-    SSL_VERIFY_PEER or SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nil);
+  if AOptionalCert then
+    SSL_CTX_set_verify(FCtx, SSL_VERIFY_PEER, nil)
+  else
+    SSL_CTX_set_verify(FCtx,
+      SSL_VERIFY_PEER or SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nil);
   if AVersion <> 0 then
   begin
     SSL_CTX_set_min_proto_version(FCtx, AVersion);
@@ -537,6 +551,7 @@ begin
     Peer := SSL_get_peer_certificate(C.Ssl);
     if Peer <> nil then
     begin
+      SawClientCert := True;
       LastSubject := string(Peer^.SubjectName);
       X509_free(Peer);
     end;
@@ -940,11 +955,11 @@ begin
 end;
 
 function TMutualTlsTest.StartServer(const AKind: TMtlsKind;
-  const AVersion: Integer): TMtlsServer;
+  const AVersion: Integer; const AOptionalCert: Boolean): TMtlsServer;
 begin
   if not OpenSslIsAvailable then
     Fail('OpenSSL is not available: set OPENSSL_LIBPATH');
-  FServer := TMtlsServer.Create(AKind, AVersion);
+  FServer := TMtlsServer.Create(AKind, AVersion, AOptionalCert);
   Result := FServer;
 end;
 
@@ -972,14 +987,24 @@ begin
     F := F.WithClientIdentity(AIdentity);
   if AFallback then
     F := F.WithHttp1Fallback(True);
+  Result := RouteVia(F).Build;
+end;
+
+/// loopback origins bypass the built-in selectors, so route through FProxy
+/// explicitly when there is one
+function TMutualTlsTest.RouteVia(
+  const AFactory: THttpClientFactory): THttpClientFactory;
+begin
+  Result := AFactory;
   if FProxy <> nil then
-    // loopback origins bypass the built-in selectors, so route explicitly
     case FProxy.FMode of
-      tmConnect: F := F.WithProxySelector(TFixedSelector.Create(pkHttp, FProxy.Port));
-      tmSocks5: F := F.WithProxySelector(TFixedSelector.Create(pkSocks5, FProxy.Port));
-      tmHttps: F := F.WithProxySelector(TFixedSelector.Create(pkHttps, FProxy.Port));
+      tmConnect: Result := Result.WithProxySelector(
+        TFixedSelector.Create(pkHttp, FProxy.Port));
+      tmSocks5: Result := Result.WithProxySelector(
+        TFixedSelector.Create(pkSocks5, FProxy.Port));
+      tmHttps: Result := Result.WithProxySelector(
+        TFixedSelector.Create(pkHttps, FProxy.Port));
     end;
-  Result := F.Build;
 end;
 
 function TMutualTlsTest.Fetch(const AClient: IHttpClient;
@@ -1139,14 +1164,16 @@ begin
   AssertEquals('the alert', AExpected, Alert);
 end;
 
+/// the identity goes to an https proxy and never into the tunnel: the origin
+/// asks for a certificate but must see none, through every kind of proxy
 procedure TMutualTlsTest.RunTunnel(const AMode: TTunnelMode;
   const AVersion: Integer);
 var
   Client: IHttpClient;
   Body: string;
 begin
-  StartServer(mkH2, AVersion);
-  FProxy := TTunnelProxy.Create(AMode, FServer.Port);
+  StartServer(mkH2, AVersion, True);
+  FProxy := TTunnelProxy.Create(AMode, FServer.Port, AMode = tmHttps);
   Client := NewClient(GoodIdentity);
   AssertEquals('status', 200, Fetch(Client, Body));
   AssertEquals('body', 'ok', Body);
@@ -1154,10 +1181,18 @@ begin
   FProxy.Stop;
   FServer.Stop;
   AssertEquals('one tunnel', 1, FProxy.Tunnels);
-  AssertEquals('the origin accepted the identity', 1, FServer.Handshakes);
-  AssertTrue('the origin saw the client certificate',
-    Pos('mtls client', FServer.LastSubject) > 0);
-  AssertFalse('the proxy was not handed the identity', FProxy.SawClientCert);
+  AssertEquals('the origin handshake completed', 1, FServer.Handshakes);
+  AssertFalse('the origin saw no client certificate', FServer.SawClientCert);
+  AssertEquals('the origin subject', '', FServer.LastSubject);
+  if AMode = tmHttps then
+  begin
+    AssertTrue('the https proxy saw the identity', FProxy.SawClientCert);
+    AssertTrue('the proxy accepted the identity',
+      SubjectIs(FProxy.LastSubject, 'mtls client'));
+  end
+  else
+    AssertFalse('there is no TLS to this proxy to present it on',
+      FProxy.SawClientCert);
 end;
 
 function TMutualTlsTest.ServerUrl(const AServer: TMtlsServer): string;
@@ -1204,41 +1239,60 @@ end;
 function TMutualTlsTest.SelectorClient(
   const ASelector: IClientIdentitySelector): IHttpClient;
 begin
-  Result := THttpClientFactory.Create
+  Result := RouteVia(THttpClientFactory.Create
     .WithCACertFile(Fixture('ca.crt'))
     .WithConnectTimeout(3000)
     .WithHeaderTimeout(5000)
     .WithHttp1Fallback(True)
-    .WithClientIdentitySelector(ASelector)
+    .WithClientIdentitySelector(ASelector))
     .Build;
 end;
 
-procedure TMutualTlsTest.RunProxyIdentity(const AVersion: Integer);
+/// the selector is asked about the peer that receives the identity: the https
+/// proxy, with the proxy's host and port; an http or socks5 proxy has no TLS
+/// leg, so the selector is not asked and the pool key does not vary
+procedure TMutualTlsTest.RunSelectorVia(const AMode: TTunnelMode);
 var
+  Sel: TCountingSelector;
+  SelRef: IClientIdentitySelector;
   Client: IHttpClient;
-  Body: string;
+  Stats: TPoolStats;
+  I: Integer;
+  Keys: string;
 begin
-  StartServer(mkH2, AVersion);
-  FProxy := TTunnelProxy.Create(tmHttps, FServer.Port, True);
-  Client := THttpClientFactory.Create
-    .WithCACertFile(Fixture('ca.crt'))
-    .WithClientIdentity(GoodIdentity)
-    .WithProxyClientIdentity(Client2Identity)
-    .WithProxySelector(TFixedSelector.Create(pkHttps, FProxy.Port))
-    .WithConnectTimeout(3000)
-    .WithHeaderTimeout(5000)
-    .Build;
-  AssertEquals('status', 200, Fetch(Client, Body));
-  AssertEquals('body', 'ok', Body);
+  StartServer(mkH2, cTls13, True);
+  FProxy := TTunnelProxy.Create(AMode, FServer.Port, AMode = tmHttps);
+  Sel := TCountingSelector.Create;
+  SelRef := Sel;
+  Sel.Answer := Client2Identity;
+  Client := SelectorClient(SelRef);
+  AssertEquals('status', 200, SendTo(Client, Url).StatusCode);
+  AssertEquals('pooled', 200, SendTo(Client, Url).StatusCode);
+  Stats := (Client as THttpClient).PoolStats;
+  Keys := '';
+  for I := 0 to High(Stats.PerOrigin) do
+    Keys := Keys + Stats.PerOrigin[I].Origin + '|';
   Client.Close;
   FProxy.Stop;
   FServer.Stop;
-  AssertEquals('one tunnel', 1, FProxy.Tunnels);
-  AssertTrue('the proxy accepted the proxy identity',
-    SubjectIs(FProxy.LastSubject, 'mtls client two'));
-  AssertEquals('the origin accepted the origin identity', 1, FServer.Handshakes);
-  AssertTrue('the origin saw the origin identity, not the proxy one',
-    SubjectIs(FServer.LastSubject, 'mtls client'));
+  AssertFalse('the origin saw no client certificate', FServer.SawClientCert);
+  if AMode = tmHttps then
+  begin
+    AssertEquals('one dial, one call', 1, Sel.Calls);
+    AssertEquals('asked for the proxy host', 'localhost', Sel.LastHost);
+    AssertEquals('asked for the proxy port', FProxy.Port, Sel.LastPort);
+    AssertTrue('the proxy saw the selector identity',
+      SubjectIs(FProxy.LastSubject, 'mtls client two'));
+    AssertTrue('the key carries the proxy-leg fingerprint',
+      Pos(Client2Identity.Fingerprint, Keys) > 0);
+  end
+  else
+  begin
+    AssertEquals('the selector is not asked', 0, Sel.Calls);
+    AssertFalse('no TLS to the proxy', FProxy.SawClientCert);
+    AssertEquals('the key does not vary by identity', 0, Pos(' id=', Keys));
+  end;
+  AssertEquals('one tunnel, one pooled connection', 1, FProxy.Tunnels);
 end;
 
 { accepted identity }
@@ -1387,19 +1441,95 @@ end;
 
 { routed dials }
 
-procedure TMutualTlsTest.TestConnectTunnelPresentsTheIdentityTls13;
+procedure TMutualTlsTest.TestConnectTunnelOriginSeesNoIdentityTls13;
 begin
   RunTunnel(tmConnect, cTls13);
 end;
 
-procedure TMutualTlsTest.TestSocks5TunnelPresentsTheIdentityTls13;
+procedure TMutualTlsTest.TestSocks5TunnelOriginSeesNoIdentityTls13;
 begin
   RunTunnel(tmSocks5, cTls13);
 end;
 
-procedure TMutualTlsTest.TestHttpsProxyLegNeverSeesTheIdentityTls13;
+procedure TMutualTlsTest.TestHttpsProxyGetsTheIdentityAndTheOriginNoneTls13;
 begin
   RunTunnel(tmHttps, cTls13);
+end;
+
+procedure TMutualTlsTest.TestHttpsProxyGetsTheIdentityAndTheOriginNoneTls12;
+begin
+  RunTunnel(tmHttps, cTls12);
+end;
+
+procedure TMutualTlsTest.TestSelectorIsAskedForTheHttpsProxy;
+begin
+  RunSelectorVia(tmHttps);
+end;
+
+procedure TMutualTlsTest.TestSelectorIsNotAskedThroughAConnectProxy;
+begin
+  RunSelectorVia(tmConnect);
+end;
+
+procedure TMutualTlsTest.TestSelectorIsNotAskedThroughASocks5Proxy;
+begin
+  RunSelectorVia(tmSocks5);
+end;
+
+/// a wss dial goes through the same rule as a request
+procedure TMutualTlsTest.RunWssVia(const AMode: TTunnelMode;
+  const ASelect: Boolean);
+var
+  Sel: TCountingSelector;
+  SelRef: IClientIdentitySelector;
+  Client: IHttpClient;
+  Rec: TWsRecorder;
+  RecRef: IWebSocketListener;
+  Sock: IWebSocket;
+begin
+  StartServer(mkWebSocket, cTls13, True);
+  FProxy := TTunnelProxy.Create(AMode, FServer.Port, AMode = tmHttps);
+  Sel := TCountingSelector.Create;
+  SelRef := Sel;
+  Sel.Answer := Client2Identity;
+  if ASelect then
+    Client := SelectorClient(SelRef)
+  else
+    Client := NewClient(GoodIdentity);
+  Rec := TWsRecorder.Create;
+  RecRef := Rec;
+  Sock := Client.Send(TWebSocketRequest.Create(
+    Format('wss://localhost:%d/chat', [FServer.Port]), RecRef).WithAutoRequest);
+  AssertTrue('the server sent a message', Rec.WaitText(4000));
+  Sock.Close;
+  Sleep(50);
+  Client.Close;
+  FProxy.Stop;
+  FServer.Stop;
+  AssertFalse('the origin saw no client certificate', FServer.SawClientCert);
+  if AMode = tmHttps then
+  begin
+    AssertTrue('the https proxy saw the identity', FProxy.SawClientCert);
+    if ASelect then
+    begin
+      AssertEquals('one selector call', 1, Sel.Calls);
+      AssertEquals('asked for the proxy port', FProxy.Port, Sel.LastPort);
+      AssertTrue('the proxy saw the selector identity',
+        SubjectIs(FProxy.LastSubject, 'mtls client two'));
+    end;
+  end
+  else
+    AssertFalse('no TLS to the proxy', FProxy.SawClientCert);
+end;
+
+procedure TMutualTlsTest.TestWssThroughAnHttpsProxyPresentsTheIdentityToTheProxyOnly;
+begin
+  RunWssVia(tmHttps, True);
+end;
+
+procedure TMutualTlsTest.TestWssThroughAConnectProxyPresentsNoIdentity;
+begin
+  RunWssVia(tmConnect, False);
 end;
 
 { dial helpers }
@@ -1444,9 +1574,8 @@ begin
   Check('TProtocolSocketFactory.DialHttp1');
 end;
 
-/// the story's enumeration check: no TTlsSocket for an origin may be built
-/// without the identity.  The only construction that omits it is the leg to an
-/// https proxy, which must never receive the origin identity.
+/// enumeration check: every TTlsSocket construction is handed an identity
+/// parameter (the dial helpers decide which leg may present it)
 procedure TMutualTlsTest.TestEveryTlsSocketConstructionCarriesTheIdentity;
 var
   Names: array[0..1] of string;
@@ -1492,7 +1621,7 @@ begin
         // a declaration or a method heading, not a call
         if Pos('const ', Stmt) = 0 then
           Inc(Seen);
-        if (Pos('const ', Stmt) = 0) and (Pos('AProxy.Host', Stmt) = 0) then
+        if Pos('const ', Stmt) = 0 then
           AssertTrue(Names[I] + ': ' + Calls[J] + ' passes the identity: ' +
             Stmt, Pos('Identity', Stmt) > 0);
         P := E;
@@ -1502,7 +1631,7 @@ begin
   AssertTrue('the scan found the dial sites (' + IntToStr(Seen) + ')', Seen >= 9);
 end;
 
-{ selector and proxy identity }
+{ selector }
 
 procedure TMutualTlsTest.TestFixedIdentitySelectorAnswersTheIdentity;
 var
@@ -1803,26 +1932,16 @@ begin
   AssertTrue('nil removes the selector', F.ClientIdentitySelector = nil);
 end;
 
-/// the https proxy demands a certificate; the origin is told nothing of it
-procedure TMutualTlsTest.TestProxyIdentityGoesToTheProxyOnlyTls13;
-begin
-  RunProxyIdentity(cTls13);
-end;
-
-procedure TMutualTlsTest.TestProxyIdentityGoesToTheProxyOnlyTls12;
-begin
-  RunProxyIdentity(cTls12);
-end;
-
-procedure TMutualTlsTest.TestOriginIdentityAloneDoesNotSatisfyAProxyThatAsksForOne;
+/// the proxy asks for a certificate and the client has none
+procedure TMutualTlsTest.TestNoIdentityIsRefusedByAnHttpsProxyThatAsksForOne;
 var
   Client: IHttpClient;
   Body: string;
   Failed: Boolean;
 begin
-  StartServer(mkH2, cTls13);
+  StartServer(mkH2, cTls13, True);
   FProxy := TTunnelProxy.Create(tmHttps, FServer.Port, True);
-  Client := NewClient(GoodIdentity);
+  Client := NewClient(nil);
   Failed := False;
   try
     Fetch(Client, Body);
@@ -1830,7 +1949,7 @@ begin
     on E: EHttpConnectionError do
       Failed := True;
   end;
-  AssertTrue('the proxy must refuse a client without its own identity', Failed);
+  AssertTrue('the proxy must refuse a client without an identity', Failed);
   Client.Close;
   FProxy.Stop;
   FServer.Stop;
@@ -1839,18 +1958,17 @@ begin
   AssertEquals('the origin was never reached', 0, FServer.Connections);
 end;
 
-procedure TMutualTlsTest.TestProxyIdentityDoesNotReachACleartextOrigin;
+procedure TMutualTlsTest.TestHttpsProxyToACleartextOriginGetsTheIdentity;
 var
   Client: IHttpClient;
 begin
   // http origin through an https proxy: the TLS leg is the proxy's, and it
-  // gets the proxy identity; there is no origin handshake to hand anything to
+  // gets the identity; there is no origin handshake to hand anything to
   StartServer(mkPlain, 0);
   FProxy := TTunnelProxy.Create(tmHttps, FServer.Port, True);
   Client := THttpClientFactory.Create
     .WithCACertFile(Fixture('ca.crt'))
     .WithClientIdentity(GoodIdentity)
-    .WithProxyClientIdentity(Client2Identity)
     .WithProxySelector(TFixedSelector.Create(pkHttps, FProxy.Port))
     .WithClearText(ctHttp1)
     .WithConnectTimeout(3000)
@@ -1861,40 +1979,9 @@ begin
   Client.Close;
   FProxy.Stop;
   FServer.Stop;
-  AssertTrue('the proxy saw the proxy identity',
-    SubjectIs(FProxy.LastSubject, 'mtls client two'));
+  AssertTrue('the proxy saw the identity',
+    SubjectIs(FProxy.LastSubject, 'mtls client'));
   AssertEquals('one origin request', 1, FServer.Requests);
-end;
-
-procedure TMutualTlsTest.TestSelectorAndProxyIdentityTogether;
-var
-  Sel: TCountingSelector;
-  SelRef: IClientIdentitySelector;
-  Client: IHttpClient;
-begin
-  StartServer(mkH2, cTls13);
-  FProxy := TTunnelProxy.Create(tmHttps, FServer.Port, True);
-  Sel := TCountingSelector.Create;
-  SelRef := Sel;
-  Sel.Answer := GoodIdentity;
-  Client := THttpClientFactory.Create
-    .WithCACertFile(Fixture('ca.crt'))
-    .WithClientIdentitySelector(SelRef)
-    .WithProxyClientIdentity(Client2Identity)
-    .WithProxySelector(TFixedSelector.Create(pkHttps, FProxy.Port))
-    .WithConnectTimeout(3000)
-    .WithHeaderTimeout(5000)
-    .Build;
-  AssertEquals('status', 200, SendTo(Client, Url).StatusCode);
-  AssertEquals('pooled', 200, SendTo(Client, Url).StatusCode);
-  Client.Close;
-  FProxy.Stop;
-  FServer.Stop;
-  AssertEquals('one dial, one call', 1, Sel.Calls);
-  AssertTrue('the proxy saw the proxy identity',
-    SubjectIs(FProxy.LastSubject, 'mtls client two'));
-  AssertTrue('the origin saw the selector identity',
-    SubjectIs(FServer.LastSubject, 'mtls client'));
 end;
 
 { other }

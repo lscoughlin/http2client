@@ -32,15 +32,17 @@ without one the client answers none.
 ## Goals
 
 - A consumer configures one client identity (certificate chain and private
-  key) and every TLS connection the client opens presents it: HTTP/2,
-  HTTP/1.1 fallback, Server-Sent Events and `wss`.
+  key) and the TLS connection the client opens to the peer it dials presents
+  it: HTTP/2, HTTP/1.1 fallback, Server-Sent Events and `wss` to an origin on a
+  direct route, the connection to an `https://` proxy on a proxied one (see
+  "Where it applies").
 - The identity can come from PEM files, PEM held in memory, or a PKCS#12
   bundle, with an optional passphrase.
 - A consumer that needs a different identity per origin, or that rotates the
   certificate while the process runs, supplies a selector that is asked at
-  each dial (see "Selector and proxy identity").
-- An `https://` proxy can require its own client identity, kept apart from the
-  origin identity.
+  each dial (see "Selector").
+- An `https://` proxy can require a client identity; the same one concept
+  answers it, and the origin behind the proxy never receives it.
 - A bad configuration fails when the client is built, not on the first
   request.
 - A server that rejects the identity produces a distinct error, even though
@@ -59,8 +61,15 @@ without one the client answers none.
 - No server-side mutual TLS.
 - No file watching or automatic reload; rotation is a selector that returns a
   fresh identity.
-- No identity from the proxy environment variables; `WithProxyClientIdentity`
-  is explicit.
+- No separate identity for a proxy: there is one identity concept, and on a
+  proxied route it goes to the proxy only.
+- No mutual TLS to an origin through a proxy. The origin leg inside a tunnel
+  presents no certificate, so an origin that requires a client certificate is
+  not reachable through any proxy: an `http://` or `socks5://` proxy has no
+  TLS leg to carry the identity, and an `https://` proxy receives it for
+  itself, not for the origin. A consumer that needs origin mutual TLS dials
+  the origin directly (for example with `WithNoProxy` or a route that
+  returns no proxy for it).
 - No eviction of pooled connections authenticated with a replaced certificate.
 
 ## Vocabulary
@@ -69,7 +78,6 @@ without one the client answers none.
 |---|---|
 | Identity | a leaf certificate, its chain, and the matching private key |
 | Selector | an object that returns the identity for a dial, or none |
-| Proxy identity | the identity presented to an `https://` proxy, never to an origin |
 | Rejection | the server closed the connection with a client-certificate alert |
 
 ## Public surface
@@ -109,7 +117,8 @@ type
       const APassphrase: string = ''): IClientIdentity; static;
   end;
 
-  /// chooses the identity of a TLS dial to an origin
+  /// chooses the identity of a dial that presents one: the origin on a
+  /// direct route, an https proxy on a proxied one
   IClientIdentitySelector = interface
     function Select(const AHost: string; const APort: Word): IClientIdentity;
   end;
@@ -123,17 +132,15 @@ Factory methods:
 
 | Method | Meaning |
 |---|---|
-| `WithClientIdentity(identity)` | present this identity on every TLS dial; `nil` removes it |
+| `WithClientIdentity(identity)` | present this identity to the peer the route gives it to ("Where it applies"); `nil` removes it |
 | `WithClientCertificateFiles(cert, key, passphrase)` | sugar: load PEM files, then `WithClientIdentity` |
 | `WithClientIdentitySelector(selector)` | ask the selector at each dial, in place of a fixed identity; `nil` removes it |
-| `WithProxyClientIdentity(identity)` | present this identity to an `https://` proxy only; `nil` removes it |
 
 `WithClientIdentity`, `WithClientCertificateFiles` and
 `WithClientIdentitySelector` replace one another: the last one called wins.
-`WithProxyClientIdentity` is independent of them.
 
 A client with neither configured behaves as before. `Build` raises
-`EHttpTlsConfigError` for a fixed or proxy identity whose leaf has expired, and for files
+`EHttpTlsConfigError` for a fixed identity whose leaf has expired, and for files
 given to `WithClientCertificateFiles` that could not be loaded: the factory is
 a value builder, so the load failure is held and raised at `Build`, and the
 passphrase is not kept past the call. An injected socket factory
@@ -170,45 +177,69 @@ the terminal.
 
 ## Where it applies
 
-| Connection | Identity |
-|---|---|
-| TLS to an origin, direct | the client identity, or the selector's answer |
-| TLS to an origin inside a proxy tunnel | the same; the tunnel is transparent to the origin |
-| TLS to an `https://` proxy | the proxy identity, or none; the origin identity is never handed to the proxy |
-| `http` and `ws` to an origin | none |
-| `http` and `ws` to an origin through an `https://` proxy | the proxy identity on the proxy leg only |
+The identity (the fixed one, or the selector's answer) is presented on exactly
+one TLS connection per dial, chosen by the route:
 
-The proxy rule keeps an origin identity from being handed to a third party
-that happens to relay the connection, and the proxy identity from being handed
-to the origin. The two never cross: the origin identity (or the selector's
-answer) reaches only the TLS handshake with the origin, and the proxy identity
-only the handshake with the proxy. Only the `TTlsSocket` built for the proxy
-leg in `DialRoutedTransport` takes the proxy identity. A SOCKS5 or plain
-`http://` proxy has no TLS leg, so the proxy identity is unused there.
+| Route | TLS to the proxy | TLS to the origin |
+|---|---|---|
+| direct, `https` or `wss` origin | none | the identity |
+| through an `https://` proxy, any origin | the identity | none |
+| through an `http://` proxy | none (cleartext leg) | none |
+| through a `socks5://` proxy | none (cleartext leg) | none |
+| direct, `http` or `ws` origin | none | none (no handshake) |
+
+- Direct route: the origin receives it, as it always has.
+- `https://` proxy: only the TLS leg to the proxy presents it, so a proxy that
+  requires a client certificate accepts the client. The origin leg inside the
+  tunnel presents no certificate. This holds for an `http` origin too: the
+  proxy leg is still TLS and still gets the identity. A selector is asked with
+  the proxy's host and port for that leg.
+- `http://` and `socks5://` proxy: there is no TLS to the proxy, so the
+  identity is presented nowhere on that route, and the selector is not asked.
+  The origin leg inside the tunnel presents no certificate, so mutual TLS to
+  the origin is not available through such a proxy (see Non-goals).
+
+The rule keeps a certificate from reaching a peer it was not meant for: the
+identity authenticates the client to the first hop it dials, never to an
+origin hidden behind a relay. In code, `DialRoutedTransport` hands the
+identity to the `TTlsSocket` it builds for an `https://` proxy leg, and the
+dial helpers (`DialVia`, `DialWithAlpnVia`) give the origin's `TTlsSocket` the
+identity only when there is no proxy.
 
 ## Pooling
 
 The pool keys connections by origin and route. With a fixed identity the key
 is unchanged, because a client has one identity. With a selector installed, a
-TLS request's key also carries the identity fingerprint
+request's key carries the fingerprint of the identity its route presents
 (`origin id=<fingerprint>`, an empty fingerprint for a `nil` answer), so two
-identities to one origin never share a connection and neither does an identity
-and a `nil` answer. Cleartext requests keep the plain key. The connection caps
-then count per origin, route and identity, so after a rotation an origin can
-briefly hold more than `MaxConnectionsPerHost` split across the old and new
-keys (`MaxTotalConnections` still bounds the pool), and `PoolStats` lists the
-keys with their `id=` suffix.
+identities on one route never share a connection and neither does an identity
+and a `nil` answer:
 
-## Selector and proxy identity
+- direct `https`: the fingerprint of the origin identity;
+- through an `https://` proxy: the fingerprint of the proxy-leg identity (the
+  selector's answer for the proxy's host and port);
+- through an `http://` or `socks5://` proxy, and direct cleartext: the plain
+  key, because the identity is not used on that route and the key must not
+  vary by it.
+
+The connection caps then count per origin, route and identity, so after a
+rotation an origin can briefly hold more than `MaxConnectionsPerHost` split
+across the old and new keys (`MaxTotalConnections` still bounds the pool), and
+`PoolStats` lists the keys with their `id=` suffix.
+
+## Selector
 
 `IClientIdentitySelector.Select(host, port)` returns the identity for a dial,
 or `nil` to present no certificate. `WithClientIdentitySelector` installs it in
 place of a fixed identity.
 
-- It is called for each new TLS connection: on the dialling thread (the thread
-  that called `Send`, for a WebSocket the thread that opens it), outside the
-  pool lock, with the origin's host and port. A request that reuses a pooled
-  connection does not call it, and a cleartext request never does. It may be
+- It is called for each new connection that presents an identity: on the
+  dialling thread (the thread that called `Send`, for a WebSocket the thread
+  that opens it), outside the pool lock, with the host and port of the peer
+  that receives the identity: the origin on a direct route, the proxy on an
+  `https://` proxy route. A request that reuses a pooled connection does not
+  call it, and neither does a direct cleartext request or a route through an
+  `http://` or `socks5://` proxy. It may be
   called from several threads at once and the dial waits for it, so it should
   not block for long. The lock is released while it runs, so two concurrent
   requests to a cold origin can both ask; one dials and the other then finds
@@ -231,7 +262,8 @@ place of a fixed identity.
   later request while it lives, so a new certificate is presented once that
   connection closes, idles out, or the pool opens another (for example because
   it is full). The selector is not asked in between.
-- Per origin: the selector decides by host and port.
+- Per peer: the selector decides by host and port, so one selector can serve
+  several origins and the proxy a route goes through.
 
 ```pascal
 type
@@ -252,11 +284,9 @@ Client := THttpClientFactory.Create
   .Build;
 ```
 
-`WithProxyClientIdentity(identity)` presents an identity on the TLS leg to an
-`https://` proxy, so a proxy that requires a client certificate accepts the
-client, and to nothing else. It is checked at `Build` like a fixed identity.
-An origin identity does not satisfy a proxy that asks for one: the proxy
-refuses the handshake and the request fails before the origin is dialled.
+A client with no identity and no selector presents nothing to an `https://`
+proxy that asks for a certificate: the proxy refuses the handshake and the
+request fails before the origin is dialled.
 
 ## Rejection
 
@@ -312,23 +342,29 @@ Consequences:
 - Loopback: an in-process OpenSSL server that requires a client certificate
   against a mock-free client dial: accepted identity, none configured, wrong
   CA and expired, for TLS 1.2 and TLS 1.3 separately, over HTTP/2, HTTP/1.1,
-  SSE and `wss`, and through a CONNECT, a SOCKS5 and an `https` proxy. A
-  source scan checks that every `TTlsSocket` for an origin is built with the
-  identity. The selector cases count its calls (once per dial, not per
-  request, never for cleartext), check the thread and that another thread can
+  SSE and `wss`, and through a CONNECT, a SOCKS5 and an `https` proxy. The origin there asks
+  for a certificate without requiring one, and every proxy kind is checked to
+  leave it with none: the origin sees no client certificate through CONNECT,
+  SOCKS5 and `https`, while the `https` proxy leg sees the identity (a fixed
+  one, and a selector's answer, for a request and for `wss`). A source scan
+  checks that every `TTlsSocket` construction takes an identity parameter. The selector cases count its calls (once per dial, not per
+  request, never for cleartext, asked with the proxy's host and port on an
+  `https` proxy route and not at all through CONNECT or SOCKS5, with the pool
+  key carrying the proxy-leg fingerprint or none), check the thread and that another thread can
   take the pool lock meanwhile, choose a different identity per origin, answer
   `nil`, throw, rotate between two dials (the old connection still delivers
-  its response and the pool holds two keys) and cover `wss`. The proxy cases
-  use a loopback `https` proxy that requires a client certificate: it accepts
-  the proxy identity, the origin sees the origin identity only, the origin
-  identity alone is refused, and a cleartext origin behind it gets nothing.
+  its response and the pool holds two keys) and cover `wss`. A client with no
+  identity is refused by an `https` proxy that requires one, and a cleartext
+  origin behind that proxy is reached with the identity on the proxy leg.
 - Live: a Python `ssl` server with `CERT_REQUIRED` (TLS 1.2 and 1.3, HTTP/1.1,
   SSE and `wss`) and `nghttpd --verify-client` for HTTP/2 (it requests a
   certificate but does not verify it); two Python origins that each serve one
-  identity only, reached by one client with a selector; and a Python `https`
-  proxy that requires a client certificate in front of an origin that requires
-  another, with the logs of both showing which identity each saw;
-  `make validate-mtls`.
+  identity only, reached by one client with a selector; a Python `https`
+  proxy that requires a client certificate in front of an origin that asks for
+  one without requiring it (the proxy log shows the identity, the origin log
+  shows none, with a fixed identity and with a selector); and an `http` CONNECT
+  proxy, through which that origin sees none and an origin that requires a
+  certificate refuses the handshake; `make validate-mtls`.
 
 Fixtures (a private CA, a server certificate, two accepted clients, an expired
 client, a client from another CA) are generated by a script and checked in

@@ -68,7 +68,6 @@ type
       const APassphrase: string = ''): THttpClientFactory;
     function WithClientIdentitySelector(
       const ASelector: IClientIdentitySelector): THttpClientFactory;
-    function WithProxyClientIdentity(const AIdentity: IClientIdentity): THttpClientFactory;
     function WithHttp1Fallback(const AEnable: Boolean = True): THttpClientFactory;
     function WithClearText(const APolicy: TClearTextPolicy): THttpClientFactory;
     function WithObserver(const AObserver: IHttp2Observer): THttpClientFactory;
@@ -148,17 +147,16 @@ test suite uses (`IHttp2SocketFactory` with an in-memory socket) and the
 hook for a caller who must supply their own TLS stack. `WithCACertFile`
 points certificate verification at a specific trust bundle;
 `WithInsecureTls` disables verification (test/development only, never a
-default). `WithClientIdentity` presents a client certificate on every TLS
-connection to an origin (mutual TLS), and `WithClientCertificateFiles` loads
+default). `WithClientIdentity` presents a client certificate (mutual TLS) to the origin
+on a direct route and to an `https://` proxy on a proxied one, never to an
+origin inside a tunnel, and `WithClientCertificateFiles` loads
 one from PEM files; `Build` raises `EHttpTlsConfigError` for an identity that
 cannot be used, and a server that refuses the certificate raises
 `EHttpTlsClientAuthError`. `WithClientIdentitySelector` asks an
-`IClientIdentitySelector` for the identity of each new TLS connection (once per
-dial, outside the pool lock), which gives a different identity per origin and
+`IClientIdentitySelector` for the identity of each new connection that presents one (once per
+dial, outside the pool lock, with the host and port of the peer that gets it), which gives a different identity per origin and
 certificate rotation; with it installed the pool key carries the identity
-fingerprint. `WithProxyClientIdentity` answers an `https://` proxy that
-requires a client certificate, and the identity goes to that proxy only. See
-[mtls](mtls.md). `WithObserver` installs an `IHttp2Observer` for connection,
+fingerprint. See [mtls](mtls.md). `WithObserver` installs an `IHttp2Observer` for connection,
 stream, and frame-level events — see [testing-observability](testing-observability.md).
 
 `WithRequestObserver` installs an `IHttpClientObserver`, the request-level
