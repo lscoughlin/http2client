@@ -398,6 +398,16 @@ is swallowed and reported to `WithLogger` if it raises. A response that is
 never read and never released keeps its attempt open. See
 `doc/design/request-observability.md`.
 
+A Server-Sent Events request (`SseRequest`) is an attempt of kind `akSse`, and
+the connections of one `TSseReconnectLoop` share a `StreamId` and carry a
+`Reconnect` count. Its outcome counts events rather than frames and times them
+at the wire: `MessagesIn`, `FirstMessageUs`, `MaxGapUs` and the other
+aggregates give time to first event, inter-event latency and stalls. An
+observer that also implements `IHttpMessageObserver` and answers
+`[mkSseEvent]` from `WantsMessages` receives each event with its type, id,
+size, arrival time and the gap since the previous one; without that opt-in no
+per-event work is done. See `doc/design/server-sent-events.md`.
+
 ## Examples
 
 The `examples/` directory has eight small programs. Build them all with:

@@ -53,6 +53,6 @@ Recorded in the owning note; listed here only as a lookup index.
 | The client does not remember that an origin declined the h2c upgrade; each new connection sends the probe again, and the request is still sent once. `ctHttp1` avoids the probe | [fallback](fallback.md) |
 | SSE reconnect: wrapper, not transport; clean end or transient failure reconnects, a protocol error is terminal | [server-sent-events](server-sent-events.md) |
 | WebSocket: RFC 6455 over HTTP/1.1 only (RFC 8441 and `permessage-deflate` are not implemented); demand-driven delivery; a dedicated unpooled connection per socket; the observer sees nothing of it | [websocket](websocket.md) |
-| SSE emits no observer event per message (frame/stream-level observer only); push support is caller-owned | [server-sent-events](server-sent-events.md) |
+| The transport observer (`IHttp2Observer`) sees no SSE message, and SSE push support is caller-owned. The request observer can opt in to one callback per event through `IHttpMessageObserver`; without the opt-in an SSE stream costs it only the aggregates | [server-sent-events](server-sent-events.md), [request-observability](request-observability.md) |
 | SSE over the HTTP/1.1 fallback is best-effort: liveness bounded by the socket read timeout, no cancel path | [server-sent-events](server-sent-events.md), [fallback](fallback.md) |
 | SSE sends `accept-encoding: identity` and rejects any other `content-encoding` | [server-sent-events](server-sent-events.md) |

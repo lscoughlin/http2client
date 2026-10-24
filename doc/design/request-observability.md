@@ -37,13 +37,13 @@ Built: the monotonic clock (`Http2.Clock`), the observer vocabulary
 logger surface, the attempt lifecycle for plain requests over HTTP/2, h2c and
 HTTP/1.1 (start, response headers, redirect, retry, end), the pool
 statistics snapshot, wire arrival stamps (`TFrame.ArrivedUs`,
-`IStampedBodyStream`) and the timing and message aggregates of
-`THttpOutcome` for plain responses.
+`IStampedBodyStream`), the timing and message aggregates of `THttpOutcome`,
+Server-Sent Events attempts (`akSse`, the loop's `StreamId` and `Reconnect`,
+per-event aggregates, `IAttemptProgress`) and the per-message observer
+(`IHttpMessageObserver`) for SSE events.
 
-Not built yet: the per-message observer (`IHttpMessageObserver`), Server-Sent
-Events and WebSocket
-attempts (`akSse` and `akWebSocket` are declared but only `akRequest` is
-produced), and the WebSocket outcome fields.
+Not built yet: WebSocket attempts (`akWebSocket` is declared but never
+produced) and the WebSocket outcome fields.
 
 ## Goals
 
@@ -229,6 +229,49 @@ counters only, and SSE reports per-event callbacks only when the observer's
 
 `OnMessage` runs inline on the thread that finishes reading the message (the
 caller's thread for SSE, the reader thread for WebSocket). It must be fast.
+
+The library asks `WantsMessages` once per attempt, right after
+`OnAttemptStart`. `TCompositeObserver` asks each member that implements
+`IHttpMessageObserver` at that point, keeps the answers in the attempt's token
+and forwards `OnMessage` only to the members whose set holds the message's
+kind. When the combined answer is empty no `TMessageInfo` is built for the
+attempt. `Index` and `SinceLastUs` count every message of a direction, while
+`MessagesIn` and `MessagesOut` count data messages only (an SSE event, a
+WebSocket text or binary message).
+
+### Reporting from a reader
+
+A reader of a response body (the SSE source, later the WebSocket) reports to
+the attempt through an interface the response exposes:
+
+```pascal
+IAttemptProgress = interface
+  function WantedKinds: TMessageKinds;
+  procedure ReportMessage(const AKind: TMessageKind;
+    const ADirection: TDirection; const AArrivedUs: Int64;
+    const ASize: Integer; const ASse: PSseEvent);
+  procedure ReadBegin;
+  procedure ReadEnd;
+  procedure Finish(const ABytesIn: Int64);
+end;
+```
+
+`Supports(Response, IAttemptProgress)` finds it on every response, also behind
+a content-decoding wrapper. A response that is not observed answers with an
+implementation that ignores every call. `ReportMessage` takes the arrival stamp
+the reader read from the wire; the attempt keeps the count, the first and last
+stamp and the gaps, and builds the `TMessageInfo` only for a kind the observers
+asked for. When a reader reported any inbound data message, those aggregates
+replace the per-frame ones the codec gathers, because a message is an event
+there and not a DATA frame.
+
+The codec ends the exchange inside the `Read` that returns the last bytes of
+the body. A reader therefore brackets each read with `ReadBegin` and `ReadEnd`:
+a clean end that happens in between is held until `ReadEnd`, so the messages
+that last read delivered are counted before `OnAttemptEnd`. An end with an
+error or an abandonment is never held. `Finish` ends the attempt at once as a
+deliberate local end (`Abandoned = False`) and is a no-op once the attempt has
+ended.
 
 ### Installing observers
 

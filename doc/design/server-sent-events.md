@@ -18,8 +18,9 @@ related:
   - "[transport](transport.md)"
   - "[fallback](fallback.md)"
   - "[testing-observability](testing-observability.md)"
+  - "[request-observability](request-observability.md)"
   - "[open-questions](open-questions.md)"
-updated: 2026-10-13
+updated: 2026-10-24
 ---
 
 # Server-Sent Events
@@ -356,8 +357,9 @@ type
   /// reconnect + resume wrapper
   TSseReconnectLoop = class
   public
-    /// NO observer argument: IHttp2Observer is frame/stream level, so one
-    /// event per message would be high-cardinality
+    /// NO transport-observer argument: IHttp2Observer is frame/stream level.
+    /// Observation goes through the client's request observer instead
+    /// (see "Observability" below)
     constructor Create(const AClient: IHttpClient;
       const ARequest: THttpRequest;
       const AMaxRetries: Integer = cSseDefaultMaxRetries);
@@ -367,6 +369,8 @@ type
     function RetryMs: Integer;
     /// reconnects performed so far; the FIRST connection is not counted
     function Reconnects: Integer;
+    /// the id the library gave this loop, shared by every attempt it makes
+    property StreamId: Int64 read FStreamId;
   end;
 
 /// build an SSE GET request (accept + cache-control + identity encoding)
@@ -377,15 +381,42 @@ Two consumption styles, matching the two the library already has:
 
 - **Pull** — `ReadEvent` blocks until an event or the stream end; the
   caller's thread loops. This is the primitive.
-- **Push** — not provided. The source emits no observer event per parsed
-  event, so "push" means a caller-owned thread that wraps `ReadEvent` (for a
-  UI or a queue).
+- **Push** — not provided. "Push" means a caller-owned thread that wraps
+  `ReadEvent` (for a UI or a queue). An observer that wants every event as it
+  is parsed uses `IHttpMessageObserver` (see "Observability").
 
 `TSseSource` reads `IHttpResponse.Body` in chunks, feeds
 `TSseEventParser`, and buffers completed events in a bounded queue so a
 single `Read` call can produce several events. `Body.Eof` (`END_STREAM`)
 ends the source cleanly; `EHttpStreamError` mid-body surfaces from
 `ReadEvent`, not from the `Send` that returned the response.
+
+## Observability
+
+A client with a request observer (`WithRequestObserver`) sees an SSE stream as
+attempts of kind `akSse`. `SseRequest` marks its request, and
+`TSseReconnectLoop` gives the whole loop one `StreamId` and stamps a
+`Reconnect` count (0 for the first connection) on each request it sends, so
+the connections of one logical stream can be linked. A context attached with
+`WithContext` reaches every reconnect. An attempt lasts as long as its stream:
+it ends at EOF, on `Close`, on release or on failure. `Close` ends it as a
+deliberate stop (`Abandoned = False`); a source dropped without being read to
+its end reports `Abandoned = True`.
+
+`TSseSource` counts events and reports them, with the wire arrival stamp of
+the chunk that completed each one, to the attempt, so `THttpOutcome` carries
+`MessagesIn`, `FirstMessageUs`, `LastMessageUs`, `MaxGapUs` and `SumGapUs` per
+event rather than per DATA frame. Events that arrive in one chunk share its
+stamp and report no gap between them; the counts and sizes stay exact. The
+stamps come from the wire, so a slow consumer does not change them.
+
+An observer that also implements `IHttpMessageObserver` and answers
+`[mkSseEvent]` from `WantsMessages` receives one `OnMessage` per event, with
+`EventType`, `EventId`, `Size` (the data bytes), `Index`, `ArrivedUs`,
+`SinceLastUs` and `Sse`, a pointer to the parsed event that is valid only
+during the call. Without that opt-in no per-event record is built. The
+transport observer `IHttp2Observer` is unchanged and sees no event. See
+[request-observability](request-observability.md).
 
 ## Error model
 
@@ -453,10 +484,11 @@ These choices are also indexed in [open-questions](open-questions.md).
    content-type, non-identity coding) is terminal and propagates.
    `EHttpTooManySseRetries` bounds the reconnects (`AMaxRetries = 0` retries
    forever).
-2. **Observer cardinality.** SSE emits no per-event observer event.
-   `IHttp2Observer` stays frame/stream-level; per-message observability
-   belongs to the caller's own callback, because a chatty stream would be
-   high-cardinality noise.
+2. **Observer cardinality.** The transport observer `IHttp2Observer` stays
+   frame/stream-level and sees no event. The request observer collects
+   per-event aggregates always and delivers one callback per event only to an
+   observer that opts in with `IHttpMessageObserver`, so a chatty stream is
+   high-cardinality only for a consumer that asked for it.
 3. **SSE over the HTTP/1.1 fallback.** Supported but best-effort, not
    rejected. Liveness is bounded by the socket read timeout
    (`THttp1Connection.Create` sets `FSocket.ReadTimeoutMs := ATimeoutMs`) and
