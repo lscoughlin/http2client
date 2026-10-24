@@ -412,9 +412,46 @@ observer that also implements `IHttpMessageObserver` and answers
 size, arrival time and the gap since the previous one; without that opt-in no
 per-event work is done. See `doc/design/server-sent-events.md`.
 
+### Observability
+
+The request observer is the seam for tracing, metrics and logging. The library
+depends on none of them: it hands an adapter the attempt, the headers to
+inject into and the outcome, and the adapter turns those into spans,
+instruments and log lines. Three working adapters are in `examples/`, over
+small in-memory stand-ins for the tracer and the metric registry, so a
+consumer can copy one and swap the stand-in for OpenTelemetry, Prometheus or a
+logging framework:
+
+| Unit | What it does |
+|---|---|
+| `observer_tracing.pas` | reads the parent span from `WithContext`, injects a W3C `traceparent` per attempt (redirect hops and retries are sibling spans), sets status and error, ends the span |
+| `observer_metrics.pas` | derives time to first byte, time to first event, mean inter-event latency, max gap, event and byte rates and total latency from the outcome; counts requests by status; keeps an in-flight gauge; reads `PoolStats` for pool gauges; and feeds an inter-event histogram per event when you switch the gate on |
+| `observer_logging.pas` | writes one structured line from every callback, including redirect, retry, abandoned and error |
+
+Install them side by side. The observer registered first wraps the others:
+start callbacks run in registration order and end callbacks in reverse.
+
+```pascal
+Client := THttpClientFactory.Create
+  .WithRequestObserver(TTracingObserver.Create(Tracer))
+  .WithRequestObserver(TMetricsObserver.Create(Registry))
+  .WithRequestObserver(TLoggingObserver.Create(Logger))
+  .Build;
+Registry.AddCollector(TPoolStatsCollector.Create(Client));
+Response := Client.Send(THttpRequest.Create(hmGet, Url).WithContext(ParentSpan));
+```
+
+`examples/observer_all.pas` runs a plain request, an SSE stream with a
+reconnect and a WebSocket session through all three against the reference
+servers in `tools/validate`, and prints the trace, the metrics and the log.
+`make measure-observer` measures what the observers cost on loopback; the
+method and the results are in `doc/verification/observer-overhead.md`. See
+`doc/design/request-observability.md`, "Writing an adapter".
+
 ## Examples
 
-The `examples/` directory has eight small programs. Build them all with:
+The `examples/` directory has ten small programs and three adapter units. Build
+them all with:
 
 ```sh
 make examples      # or: task examples
@@ -433,6 +470,8 @@ bin/threaded_get   https://nghttp2.org/ 8 25
 bin/sse_stream     http://127.0.0.1:8091/events   # tools/validate/sse_server.py
 https_proxy=http://proxy.corp:3128 bin/proxy_env https://nghttp2.org/
 bin/websocket_echo ws://127.0.0.1:8601/echo hello   # tools/validate/ws_servers.py
+bin/observer_all   http://127.0.0.1:8091 ws://127.0.0.1:8601/echo   # both fixtures
+make measure-observer                                # observer overhead on loopback
 ```
 
 | Program | Shows |
@@ -445,13 +484,16 @@ bin/websocket_echo ws://127.0.0.1:8601/echo hello   # tools/validate/ws_servers.
 | `sse_stream.pas` | `SseRequest` + `TSseReconnectLoop` over an event stream. |
 | `proxy_env.pas` | A GET routed by the proxy environment variables. |
 | `websocket_echo.pas` | Open a WebSocket, send a message, print the echo, close. |
+| `observer_all.pas` | The tracing, metrics and logging adapters together on a request, an SSE stream with a reconnect and a WebSocket. |
+| `observer_overhead.pas` | What the observers cost on a loopback request. |
+| `observer_tracing.pas`, `observer_metrics.pas`, `observer_logging.pas` | The adapter units the two programs above use (not programs). |
 
 ## Project layout
 
 | Path | Content |
 |---|---|
 | `src/` | The library units. |
-| `examples/` | Eight small, runnable programs. See [Examples](#examples). |
+| `examples/` | Ten small, runnable programs and three observer adapters. See [Examples](#examples). |
 | `test/` | The unit suite, the mock socket, and the `h2probe` CLI. |
 | `tools/validate/` | The interop, sanity, and harness scripts. |
 | `bin/` | The build output. |
@@ -509,6 +551,8 @@ The connection speaks HTTP/1.1 (RFC 6455); a WebSocket is not pooled. See
 - `doc/design/server-sent-events.md` gives the SSE parser, source, and
   reconnect/resume loop.
 - `doc/design/errors-redirects.md` gives the exceptions and the timeouts.
+- `doc/design/request-observability.md` gives the request observer, the
+  timing and the adapters.
 - `doc/verification/validation.md` gives the validation results and the reasons.
 - `doc/verification/toolchain.md` gives the exact tool versions and revisions.
 
@@ -534,6 +578,22 @@ The validation record refers to the generated table at
 - WebSockets are RFC 6455 over HTTP/1.1 only: no RFC 8441, no
   `permessage-deflate`, no automatic reconnection. See
   `doc/design/websocket.md`.
+
+- The observer seam has no event for a whole SSE reconnect loop: each
+  connection is an attempt, linked by `StreamId` and `Reconnect`, and a span
+  for the whole stream is the caller's. The outcome does not say which kind of
+  attempt ended, so an adapter keeps the kind in its token. A response, SSE
+  source or WebSocket that is never read to its end and never released holds
+  its attempt open.
+- Arrival times are taken where the library first sees the data. Events packed
+  into one frame share a stamp, so a per-event gap histogram is quantised to
+  frames, and a consumer that stops reading for a full inbound queue delays the
+  stamps of every stream on that connection. A WebSocket reads on demand, so
+  its stamps include the consumer's wait unless `WithAutoRequest` is on. See
+  `doc/design/request-observability.md`, "Limits".
+- The observer overhead has no committed bound yet; the measurement is
+  `make measure-observer` and the record is
+  `doc/verification/observer-overhead.md`.
 
 - Proxies are reached by `CONNECT` tunnel only. An `http_proxy` for an
   `http://` origin tunnels instead of forwarding, and many proxies refuse

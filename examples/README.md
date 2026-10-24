@@ -1,7 +1,7 @@
 # Examples
 
-Eight small programs showing how to use `http2client`. They are smoke builds:
-the build compiles them, it does not run them.
+Ten small programs and three adapter units showing how to use `http2client`.
+They are smoke builds: the build compiles them, it does not run them.
 
 ## Build
 
@@ -32,6 +32,8 @@ https_proxy=http://proxy.corp:3128 bin/proxy_env https://nghttp2.org/
 bin/threaded_get   https://nghttp2.org/ 8 25
 bin/sse_stream     https://example.com/events
 bin/websocket_echo wss://echo.example/ hello
+bin/observer_all   http://127.0.0.1:8091 ws://127.0.0.1:8601/echo
+make measure-observer
 # or against the reference event-stream server (cleartext; an http:// URL
 # enables the h2c-upgrade policy automatically):
 #   python3 tools/validate/sse_server.py --port 8091 &
@@ -47,6 +49,9 @@ bin/websocket_echo wss://echo.example/ hello
 | `threaded_get.pas` | Eight threads sharing one client and its connection pool. |
 | `sse_stream.pas` | `SseRequest` + `TSseReconnectLoop`: read an event stream and resume from `last-event-id`. |
 | `websocket_echo.pas` | `TWebSocketRequest` + a `TWebSocketListener` descendant: open a WebSocket, `Request` demand, send a message, close. |
+| `observer_all.pas` | `WithRequestObserver` with the tracing, metrics and logging adapters together: a plain request, an SSE stream with a reconnect and a WebSocket session against the `tools/validate` servers; prints one trace, the derived metrics and the log lines. |
+| `observer_overhead.pas` | The cost of the observers on a loopback request (no observer, the three adapters, the per-event gate on); starts its own server. Run with `make measure-observer`. |
+| `observer_tracing.pas`, `observer_metrics.pas`, `observer_logging.pas` | Adapter units, not programs: a tracer, a metrics registry and a structured logger over `IHttpClientObserver`, with in-memory stand-ins for the tracer and the registry. The tests compile against them. |
 | `proxy_env.pas` | `WithProxyEnvironmentVars` + `WithNoProxy`: route a GET by `http_proxy` / `https_proxy` / `all_proxy` / `no_proxy`. |
 
 ## Notes

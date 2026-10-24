@@ -109,18 +109,28 @@ tasks:
       - '{{.FPC}} {{.FPCFLAGS}} -FE{{.BIN}} examples/xml_request.pas'
       - '{{.FPC}} {{.FPCFLAGS}} -FE{{.BIN}} examples/threaded_get.pas'
       - '{{.FPC}} {{.FPCFLAGS}} -FE{{.BIN}} examples/sse_stream.pas'
+      - '{{.FPC}} {{.FPCFLAGS}} -Fu./examples -FE{{.BIN}} examples/observer_all.pas'
+      - '{{.FPC}} {{.FPCFLAGS}} -Fu./examples -FE{{.BIN}} examples/observer_overhead.pas'
     sources:
       - src/*.pas
       - examples/*.pas
     generates:
       - '{{.BIN}}/basic_get'
 
+  measure-observer:
+    desc: Opt-in observer overhead measurement on loopback (see doc/verification/observer-overhead.md)
+    cmds:
+      - mkdir -p {{.BIN}}
+      - '{{.FPC}} {{.FPCFLAGS}} -Cn -FE{{.BIN}} src/Http2.pas'
+      - '{{.FPC}} {{.FPCFLAGS}} -Fu./examples -FE{{.BIN}} examples/observer_overhead.pas'
+      - '{{.BIN}}/observer_overhead'
+
   test:
     desc: Build the library units and run the fpcunit suite
     cmds:
       - mkdir -p {{.BIN}}
       - '{{.FPC}} {{.FPCFLAGS}} -Cn -FE{{.BIN}} src/Http2.pas'
-      - '{{.FPC}} {{.FPCFLAGS}} -Fu./test -FE{{.BIN}} test/Http2.RunTests.pas'
+      - '{{.FPC}} {{.FPCFLAGS}} -Fu./test -Fu./examples -FE{{.BIN}} test/Http2.RunTests.pas'
       - '{{.BIN}}/Http2.RunTests --all --format=plain --sparse'
 
   validate:interop:

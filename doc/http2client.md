@@ -53,7 +53,7 @@ flowchart TB
 | [errors-redirects](design/errors-redirects.md) | exception hierarchy, timeouts, cancellation, redirects |
 | [server-sent-events](design/server-sent-events.md) | Server-Sent Events: event-stream parser, SSE source, reconnect/resume, body-read timeout |
 | [testing-observability](design/testing-observability.md) | test seams, `fpcunit`, `IHttp2Observer` |
-| [request-observability](design/request-observability.md) | request-level observer: trace-context injection, attempt lifecycle, wire-stamped timing, SSE and WebSocket coverage, pool statistics (plain-request lifecycle and pool statistics built; the rest proposed) |
+| [request-observability](design/request-observability.md) | request-level observer: trace-context injection, attempt lifecycle, wire-stamped timing, SSE and WebSocket coverage, pool statistics, and the tracing, metrics and logging adapters in `examples/` |
 | [open-questions](design/open-questions.md) | single source of truth for unresolved decisions |
 
 ## Verification
@@ -62,6 +62,7 @@ flowchart TB
 | --- | --- |
 | [validation](verification/validation.md) | the validation record: what is gate, what is oracle, the commands, and the results |
 | [toolchain](verification/toolchain.md) | locked, externally verified tool and library revisions |
+| [observer-overhead](verification/observer-overhead.md) | how the observer overhead is measured on loopback, and the results table |
 
 ## Quick start
 

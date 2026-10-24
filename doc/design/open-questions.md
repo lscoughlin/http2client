@@ -16,7 +16,7 @@ related:
   - "[fallback](fallback.md)"
   - "[proxy](proxy.md)"
   - "[errors-redirects](errors-redirects.md)"
-updated: 2026-10-13
+updated: 2026-10-24
 ---
 
 # Open Questions
@@ -31,6 +31,23 @@ is recorded) and is not restated here.
    one warning per cleartext origin" is not implemented, so a cleartext
    request is silent. See [fallback](fallback.md) and
    [testing-observability](testing-observability.md).
+2. `THttpOutcome` does not say which kind of attempt ended. An adapter that
+   must treat a stream differently from a request at the end (a request-latency
+   histogram that excludes event streams) keeps `THttpAttempt.Kind` in its
+   token, as the metrics example does. Adding `Kind` to the outcome would save
+   every adapter that bookkeeping. See
+   [request-observability](request-observability.md), "Writing an adapter".
+3. A `TSseReconnectLoop` is many attempts with no callback of its own, so
+   there is no event for "the stream started" or "the stream gave up". An
+   adapter links the attempts through `StreamId` and `Reconnect`, and a span
+   for the whole stream is the caller's. Loop-level callbacks on the observer
+   seam would let an adapter own that span. See
+   [request-observability](request-observability.md), "Server-Sent Events".
+4. The overhead of the observers has no committed bound yet. The measurement
+   (a loopback request with no observer, with the three example adapters, and
+   with the per-event gate on) is a program and a recorded method, and the
+   bound is stated when the results are recorded in
+   [observer-overhead](../verification/observer-overhead.md).
 
 ## Settled decisions
 

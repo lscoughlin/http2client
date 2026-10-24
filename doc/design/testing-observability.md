@@ -125,6 +125,44 @@ tests for it use `TRecordingRequestObserver` in `Http2.RequestObserver.Test`, a
 sibling of `TRecordingObserver` that records the attempts, the outcomes and the
 order of the callbacks.
 
+## Observer adapter tests
+
+`Http2.ObserverAdapters.Test` is the integration test for the request observer
+seam. It compiles against the example adapters in `examples/`
+(`observer_tracing`, `observer_metrics`, `observer_logging`), which the test
+target reaches through `-Fu./examples`, and drives them through the real client
+and the scripted peers, so nothing needs a live server.
+
+- **Tracing.** A redirect chain under a caller's span gives sibling child
+  spans in one trace; the DECODED request headers the peer captured show
+  exactly one `traceparent` per hop, naming that hop's span and replacing a
+  value the caller set. Status and error, a stream failure, a retry, an SSE
+  reconnect loop and an abandoned response are each asserted from the spans.
+- **Metrics.** A scripted SSE stream runs under the injectable clock
+  (`SetNowUsHook`): the attempt starts at one instant, a ticker observer moves
+  the clock before the request is written, and the peer delivers frames at
+  stamped instants. Every derived number is then compared with what the script
+  fixes: time to first byte, time to first event, mean inter-event latency, max
+  gap, stream duration, event and byte rates and total latency. The per-event
+  histogram's bucket counts are compared with the scripted gaps and the
+  histogram does not exist while the gate is off. Counters by status, the
+  in-flight gauge and the pool gauge (one `PoolStats` snapshot per collection)
+  are asserted around held and released responses.
+- **Logging.** A frozen clock makes every time in a line 0, so the lines of a
+  redirect are compared whole. The retry, abandoned, stream-failure and
+  refused-before-send cases check the line, its level and its fields.
+- **Composition.** The three adapters are installed together. Each behind a
+  forwarding spy that notes its callbacks in one log, the order is start and
+  headers in registration order and end in reverse. A tracer registered first
+  records a header a later observer injected, and a later observer sees the
+  `traceparent` the tracer injected. A WebSocket session against the scripted
+  loopback server is observed by all three.
+
+The recording observer in these tests is registered first, so its end callback
+runs last and a wait on it means the adapters have finished. The overhead
+measurement is not a test: it is `examples/observer_overhead.pas`, run by
+`make measure-observer` (see [observer-overhead](../verification/observer-overhead.md)).
+
 ## WebSocket tests
 
 `Http2.WebSocket.Test` covers the pure unit: the RFC 6455 section 5.7 frames

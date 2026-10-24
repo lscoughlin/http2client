@@ -6,7 +6,7 @@ tags:
   - http2client
   - design
   - observability
-status: partial
+status: done
 up: "[http2client](../http2client.md)"
 related:
   - "[testing-observability](testing-observability.md)"
@@ -40,9 +40,11 @@ statistics snapshot, wire arrival stamps (`TFrame.ArrivedUs`,
 `IStampedBodyStream`), the timing and message aggregates of `THttpOutcome`,
 Server-Sent Events attempts (`akSse`, the loop's `StreamId` and `Reconnect`,
 per-event aggregates, `IAttemptProgress`) and the per-message observer
-(`IHttpMessageObserver`) for SSE events, and WebSocket attempts (`akWebSocket`:
+(`IHttpMessageObserver`) for SSE events, WebSocket attempts (`akWebSocket`:
 handshake header injection, one attempt per session, close details, counters,
-wire stamps and the per-message callbacks).
+wire stamps and the per-message callbacks), and three adapters outside the
+core that prove the seam is enough: tracing, metrics and logging
+([Writing an adapter](#writing-an-adapter)).
 
 ## Goals
 
@@ -676,11 +678,28 @@ requested.
 
 ## Writing an adapter
 
+Three working adapters live in `examples/`, outside the library and its
+package. They use small in-memory stand-ins for the tracer and the metric
+registry, so they show the shape of an adapter without pulling in
+OpenTelemetry, Prometheus or a logging framework. A consumer replaces the
+stand-in with its own library and keeps the observer.
+
+| Unit | Adapter | Shows |
+|---|---|---|
+| `examples/observer_tracing.pas` | `TTracingObserver` over `TTracer` | the parent span from `A.Context`, one `traceparent` per attempt through `A.Headers.SetValue`, status and error, the span ended in `OnAttemptEnd` |
+| `examples/observer_metrics.pas` | `TMetricsObserver` over `TMetricRegistry` | the table in [Metrics an adapter derives](#metrics-an-adapter-derives) computed in `OnAttemptEnd`, an in-flight gauge, a pull gauge over `PoolStats` (`TPoolStatsCollector`), and an `IHttpMessageObserver` that feeds an inter-event histogram from `SinceLastUs` |
+| `examples/observer_logging.pas` | `TLoggingObserver` | one `key=value` line from every callback, with the redirect, retry, abandoned and error cases, written to an `IHttpLogger` |
+| `examples/observer_all.pas` | all three installed together | a plain request, an SSE stream with a reconnect and a WebSocket session; it prints one trace, the metrics and the log lines |
+| `examples/observer_overhead.pas` | none | what the observers cost on loopback; see [observer-overhead](../verification/observer-overhead.md) |
+
 An adapter for a tracer implements `IHttpClientObserver`:
 
 - `OnAttemptStart` reads `A.Context` for the parent span, starts a client
   span, and calls `A.Headers.SetValue('traceparent', ...)`. It returns an
-  `IInterface` holding the span.
+  `IInterface` holding the span. Every attempt (a redirect hop, a retry, an SSE
+  reconnect) shares the request's context, so the spans are siblings under the
+  caller's span; a stream-level span for a whole reconnect loop is the
+  caller's own, and `StreamId` and `Reconnect` link the attempts to it.
 - `OnResponseHeaders` sets the status attribute.
 - `OnAttemptEnd` records the outcome attributes, sets the error status from
   `O.Error`, and ends the span.
@@ -690,6 +709,27 @@ A metrics adapter derives the table above in `OnAttemptEnd`, reads
 to feed an inter-event histogram. A logging adapter writes a line from each
 callback. The three can be installed side by side through
 `WithRequestObserver`.
+
+Points an adapter author meets:
+
+- The outcome does not carry the attempt's `Kind`. An adapter that needs it at
+  the end (to keep a stream out of a request-latency histogram) keeps it in
+  its token, as `TMetricsObserver` does.
+- The `IHeaderSink` an adapter receives stays readable for the life of the
+  attempt, but only what is set during `OnAttemptStart` reaches the wire. An
+  adapter that registered first and wants to record the headers later
+  observers injected reads them after the start callbacks, for example in
+  `OnResponseHeaders`; `TTracingObserver.RecordRequestHeader` does this.
+- The token is the adapter's own object; the composite never shares it with
+  another member. An adapter with nothing to carry may return `nil`.
+- `O.Error` is borrowed: take its class name and message inside the callback.
+- A callback that raises is swallowed and logged at `llWarn`, so an adapter bug
+  cannot fail a request; test the adapter on its own.
+- `PoolStats` is on `THttpClient`, not on `IHttpClient`: the adapter casts the
+  client it was given.
+- Per-event work is opt-in. An adapter that has no use for events answers an
+  empty set from `WantsMessages`, and then the library builds no per-message
+  record for the attempt.
 
 ## Settled decisions
 
