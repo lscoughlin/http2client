@@ -2046,9 +2046,12 @@ begin
   AssertTrue(Obs.WaitForEnds(1, 5000));
   O := Obs.Outcome(0).O;
   AssertEquals('six messages', 6, O.MessagesIn);
-  // the consumer lags 100 ms per frame; the wire spacing is about 10 ms
+  // the consumer lags 100 ms per frame; the wire spacing is about 10 ms. The
+  // upper bound sits below the consumer's lag, not tight against the wire
+  // spacing, so scheduler jitter on a loaded machine cannot fail it while a
+  // gap measured at the consumer (100 ms or more) still would.
   AssertTrue('gap reflects the wire, not the consumer: ' + IntToStr(O.MaxGapUs),
-    (O.MaxGapUs >= 9000) and (O.MaxGapUs < 50000));
+    (O.MaxGapUs >= 9000) and (O.MaxGapUs < 90000));
   R := nil;
   Client.Close;
 end;

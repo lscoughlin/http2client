@@ -107,6 +107,11 @@ type
     function RequestAt(const AIndex: Integer): TReqRecord;
     function WrittenFrames: TArray<TFrame>;
     function WaitForRequests(const ACount, ATimeoutMs: Integer): Boolean;
+    /// bounded wait until request AIndex has received at least ALength body
+    /// bytes. A request is recorded at its HEADERS frame and its body arrives
+    /// in later DATA frames, so WaitForRequests alone does not cover the body.
+    function WaitForRequestBody(const AIndex, ALength,
+      ATimeoutMs: Integer): Boolean;
     /// bounded wait until a written frame of AType appears.  A posted frame is
     /// flushed by the connection thread asynchronously, so a caller that
     /// observes a request failing (e.g. a cancel) may still race the wire.
@@ -568,6 +573,21 @@ begin
   Result := True;
 end;
 
+function TFakeFrameSocket.WaitForRequestBody(const AIndex, ALength,
+  ATimeoutMs: Integer): Boolean;
+var
+  Deadline: QWord;
+begin
+  Deadline := GetTickCount64 + QWord(ATimeoutMs);
+  while (RequestCount <= AIndex) or (Length(RequestAt(AIndex).Body) < ALength) do
+  begin
+    if GetTickCount64 >= Deadline then
+      Exit(False);
+    Sleep(2);
+  end;
+  Result := True;
+end;
+
 function TFakeFrameSocket.WaitForWrittenFrame(const AType: TFrameType;
   const ATimeoutMs: Integer): Boolean;
 var
@@ -899,6 +919,7 @@ begin
   Sock := Factory.SocketAt(0);
   AssertTrue('two requests were issued', Sock.WaitForRequests(2, 2000));
   AssertEquals('hop 2 method preserved', 'POST', Sock.RequestAt(1).Method);
+  AssertTrue('hop 2 body arrived', Sock.WaitForRequestBody(1, 7, 2000));
   AssertEquals('hop 2 body replayed', 'payload', StrOf(Sock.RequestAt(1).Body));
   Client.Close;
 end;
@@ -921,6 +942,7 @@ begin
   Sock := Factory.SocketAt(0);
   AssertTrue('two requests were issued', Sock.WaitForRequests(2, 2000));
   AssertEquals('hop 2 method preserved', 'POST', Sock.RequestAt(1).Method);
+  AssertTrue('hop 2 body arrived', Sock.WaitForRequestBody(1, 7, 2000));
   AssertEquals('hop 2 body replayed', 'payload', StrOf(Sock.RequestAt(1).Body));
   Client.Close;
 end;
