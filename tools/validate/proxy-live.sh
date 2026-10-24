@@ -78,6 +78,14 @@ if [ -n "$NGHTTPD" ]; then
     "$ROOT/test/certs/other.key" "$ROOT/test/certs/other.crt" \
     >"$WORK/nghttpd.log" 2>&1 &
   PIDS+=($!)
+  # nghttpd binds asynchronously: a CONNECT that reaches it before it listens
+  # is refused and the proxy just closes the tunnel ("proxy closed the
+  # connection during CONNECT"), so wait until the port accepts
+  for _ in $(seq 1 50); do
+    python3 -c "import socket,sys; socket.create_connection(('127.0.0.1',$H2_PORT),timeout=1).close()" \
+      2>/dev/null && break
+    sleep 0.1
+  done
   start "$H2_BASE" "$LOG_H2" --origin-tls-port "$H2_PORT" --external-tls-origin \
     || exit 2
   H2_ENV="$H2_BASE"
