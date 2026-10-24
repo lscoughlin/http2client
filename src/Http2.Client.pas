@@ -23,7 +23,8 @@ uses
   Sockets,
   Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack,
   Http2.Tls, Http2.Connection, Http2.Stream, Http2.Observer, Http2.Messages,
-  Http2.Http1, Http2.Encoding, Http2.Proxy, Http2.WebSocket;
+  Http2.Http1, Http2.Encoding, Http2.Proxy, Http2.WebSocket,
+  Http2.Clock, Http2.RequestObserver;
 
 const
   /// documented factory defaults (doc/design/client-api.md "HttpClientFactory")
@@ -150,6 +151,7 @@ type
     FHeaderTimeoutMs: Integer; // per-request override; 0 = factory default
     FBodyReadTimeoutMs: Integer; // per-request body-read deadline
     FBodyReadTimeoutSet: Boolean;
+    FContext: IInterface;      // opaque, handed back in THttpAttempt.Context
     function GetMethodToken: string;
     function GetAuthority: string;
     function GetPath: string;
@@ -180,6 +182,12 @@ type
     ///   request keeps the header timeout as its body deadline (historic
     ///   behaviour). Use this only for a stream you intend to read lazily.
     function WithSseReadTimeout(const AMs: Integer): THttpRequest;
+    /// attach an opaque context object.  The library never inspects it: an
+    /// IHttpClientObserver receives it in THttpAttempt.Context for every
+    /// attempt (each redirect hop and retry), so an adapter can find its
+    /// parent span without a thread-local.  Clone, WithUrl, DropBody and
+    /// WithMethodToken keep it.
+    function WithContext(const AContext: IInterface): THttpRequest;
     /// re-target the request at AUrl (used by the redirect loop)
     function WithUrl(const AUrl: string): THttpRequest;
     /// an independent copy, including a deep copy of the headers
@@ -208,6 +216,8 @@ type
     property Path: string read GetPath;
     /// the cancellation token (nil when none was supplied)
     property CancelToken: ICancellationToken read FCancelToken;
+    /// the context set with WithContext (nil when none)
+    property Context: IInterface read FContext;
     /// this request's header timeout in ms; 0 means "use the factory default"
     property HeaderTimeoutMs: Integer read FHeaderTimeoutMs;
   end;
@@ -248,6 +258,8 @@ type
     FProxyEnvVars: Boolean;
     FNoProxy: string;
     FEnvLookup: TEnvLookup;
+    FRequestObservers: TArray<IHttpClientObserver>;
+    FLogger: IHttpLogger;
   public
     class function Create: THttpClientFactory; static;
     /// compatibility shim: sets BOTH the per-host and the total cap to AMax,
@@ -305,6 +317,15 @@ type
     /// connection/stream/frame events to AObserver (doc/design/
     /// testing-observability.md). Nil disables observation.
     function WithObserver(const AObserver: IHttp2Observer): THttpClientFactory;
+    /// request-level observability (doc/design/request-observability.md):
+    /// AObserver is told when each attempt starts, gets response headers,
+    /// redirects, retries and ends, and may inject headers into every attempt.
+    /// Each call adds an observer; start callbacks run in registration order
+    /// and end callbacks in reverse.  A nil observer is ignored.
+    function WithRequestObserver(
+      const AObserver: IHttpClientObserver): THttpClientFactory;
+    /// receives library diagnostics, such as an observer that raised
+    function WithLogger(const ALogger: IHttpLogger): THttpClientFactory;
     function Build: IHttpClient;
 
     /// compatibility alias for MaxConnectionsPerHost
@@ -326,6 +347,9 @@ type
     property CACertFile: string read FCACertFile;
     property InsecureTls: Boolean read FInsecure;
     property Observer: IHttp2Observer read FObserver;
+    property RequestObservers: TArray<IHttpClientObserver>
+      read FRequestObservers;
+    property Logger: IHttpLogger read FLogger;
     property Http1Fallback: Boolean read FHttp1Fallback;
     property ClearTextPolicy: TClearTextPolicy read FClearTextPolicy;
   end;
@@ -380,9 +404,10 @@ type
   private
     FInner: IHttpBodyStream;
     FLock: TCriticalSection;
+    FLease: TStreamLease;    // weak; the response keeps the lease alive
   public
     constructor Create(const AInner: IHttpBodyStream;
-      const ALock: TCriticalSection);
+      const ALock: TCriticalSection; const ALease: TStreamLease = nil);
     function Read(var ABuffer; const ACount: LongInt): LongInt;
     function Eof: Boolean;
   end;
@@ -673,7 +698,11 @@ type
     FProxySelector: IProxySelector;
     FFactory: IHttp2SocketFactory;
     FConnectTimeoutMs: Integer;
-    function SendOnce(const ARequest: THttpRequest): IHttpResponse;
+    /// the request observers folded into one (nil when none is installed)
+    FRequestObserver: IHttpClientObserver;
+    FClonedAttempts: Integer;
+    function SendOnce(const ARequest: THttpRequest;
+      const AExchange: IExchangeObserver): IHttpResponse;
   public
     constructor Create(const AFactory: IHttp2SocketFactory;
       const AMaxConnectionsPerHost, AMaxTotalConnections,
@@ -691,8 +720,15 @@ type
     /// a snapshot of the connection pool for polling gauges; all zeros once the
     /// client is closed.  Safe from any thread.
     function PoolStats: TPoolStats;
+    /// install the request-level observers and logger (called by Build)
+    procedure InstallRequestObservers(
+      const AObservers: TArray<IHttpClientObserver>;
+      const ALogger: IHttpLogger);
     /// the pool (test seam)
     property Pool: TConnectionPool read FPool;
+    /// attempts that were cloned for an observer (test seam): stays 0 for a
+    /// client with no request observer
+    property ClonedAttempts: Integer read FClonedAttempts;
   end;
 
   /// reads a whole response body and decodes it to T. Under {$mode delphi} a
@@ -1173,6 +1209,245 @@ begin
   Result := True;
 end;
 
+
+type
+  /// follows one observed attempt from OnAttemptStart to OnAttemptEnd
+  // - the codecs report the end of the exchange through IExchangeObserver
+  //   from whichever thread finishes the body or releases the response; Send
+  //   reports the start, the headers and any failure.  OnAttemptEnd fires
+  //   once, after OnResponseHeaders: an end that arrives before Send has
+  //   armed the tracker (a bodyless response, a connection failure in that
+  //   window) is held until Arm.
+  TAttemptTracker = class(TInterfacedObject, IExchangeObserver)
+  private
+    FObserver: IHttpClientObserver;
+    FToken: IInterface;
+    FStartUs: Int64;
+    FCancelToken: ICancellationToken;
+    FStatus: LongInt;
+    FProtocol: TNegotiatedProtocol;
+    FReused: Boolean;
+    FBytesOut: Int64;
+    FRequestSentUs: Int64;
+    FHeadersUs: Int64;
+    // an end reported before Send armed the tracker
+    FEndAbandoned: Boolean;
+    FEndBytesIn: Int64;
+    FEndBytesOut: Int64;
+    FEndHasError: Boolean;
+    FEndErrorText: string;
+    FArmed: LongInt;
+    FEnded: LongInt;
+    FFired: LongInt;
+    procedure Dispatch(const AError: Exception; const AAbandoned: Boolean;
+      const ABytesIn, ABytesOut: Int64);
+    procedure TryFireEarly;
+  public
+    constructor Create(const AObserver: IHttpClientObserver);
+    /// build the attempt for ARequest (whose headers are a private clone) and
+    /// run OnAttemptStart
+    procedure Start(const ARequest: THttpRequest; const AHop,
+      ARetry: Integer);
+    procedure GotResponse(const AResponse: IHttpResponse);
+    procedure NotifyRedirect(const AFromUrl, AToUrl: string;
+      const AStatus: LongInt);
+    procedure NotifyRetry(const AReason: string);
+    /// the attempt failed in Send: end it with AError (a no-op once ended)
+    procedure Fail(const AError: Exception);
+    /// Send is done reporting headers (and redirect): an end may now fire
+    procedure Arm(const AResponse: IHttpResponse);
+    /// Send dropped the response itself (a redirect hop): end now if the
+    /// response's release did not
+    procedure Drop;
+    // IExchangeObserver
+    procedure RouteChosen(const AProtocol: TNegotiatedProtocol;
+      const AReused: Boolean);
+    procedure RequestWritten(const ABytesOut: Int64);
+    procedure ExchangeEnded(const AEnd: TExchangeEnd);
+  end;
+
+constructor TAttemptTracker.Create(const AObserver: IHttpClientObserver);
+begin
+  inherited Create;
+  FObserver := AObserver;
+  FStartUs := NowUs;
+end;
+
+procedure TAttemptTracker.Start(const ARequest: THttpRequest; const AHop,
+  ARetry: Integer);
+var
+  A: THttpAttempt;
+  Path: string;
+begin
+  FCancelToken := ARequest.CancelToken;
+  A.Kind := akRequest;
+  A.Method := ARequest.MethodToken;
+  A.Url := ARequest.Url;
+  A.Host := '';
+  A.Port := 0;
+  try
+    ParseHttpUrl(ARequest.Url, A.Host, A.Port, Path);
+  except
+    // SendOnce raises the same error and the attempt then ends with it
+  end;
+  A.Hop := AHop;
+  A.Retry := ARetry;
+  A.StreamId := 0;
+  A.Reconnect := 0;
+  A.Context := ARequest.Context;
+  A.Headers := THeaderSink.Create(ARequest.Headers);
+  try
+    FToken := FObserver.OnAttemptStart(A);
+  except
+    FToken := nil;
+  end;
+end;
+
+procedure TAttemptTracker.GotResponse(const AResponse: IHttpResponse);
+begin
+  FStatus := AResponse.StatusCode;
+  FHeadersUs := NowUs - FStartUs;
+  try
+    FObserver.OnResponseHeaders(FToken, AResponse);
+  except
+    // the composite guards its members; this is the last line of defence
+  end;
+end;
+
+procedure TAttemptTracker.NotifyRedirect(const AFromUrl, AToUrl: string;
+  const AStatus: LongInt);
+begin
+  try
+    FObserver.OnRedirect(FToken, AFromUrl, AToUrl, AStatus);
+  except
+  end;
+end;
+
+procedure TAttemptTracker.NotifyRetry(const AReason: string);
+begin
+  try
+    FObserver.OnRetry(FToken, AReason);
+  except
+  end;
+end;
+
+procedure TAttemptTracker.Dispatch(const AError: Exception;
+  const AAbandoned: Boolean; const ABytesIn, ABytesOut: Int64);
+var
+  O: THttpOutcome;
+begin
+  FillChar(O, SizeOf(O), 0);
+  O.Subprotocol := '';
+  O.CloseReason := '';
+  O.StatusCode := FStatus;
+  O.Protocol := FProtocol;
+  O.ConnectionReused := FReused;
+  O.Error := AError;
+  O.Abandoned := AAbandoned;
+  O.Cancelled := (AError <> nil) and (
+    ((AError is EHttpStreamError) and
+     (EHttpStreamError(AError).ErrorCode = ecCancel)) or
+    ((FCancelToken <> nil) and FCancelToken.IsCancelled));
+  O.BytesIn := ABytesIn;
+  O.BytesOut := ABytesOut;
+  if O.BytesOut < FBytesOut then
+    O.BytesOut := FBytesOut;
+  O.RequestSentUs := FRequestSentUs;
+  O.HeadersUs := FHeadersUs;
+  O.EndUs := NowUs - FStartUs;
+  try
+    FObserver.OnAttemptEnd(FToken, O);
+  except
+  end;
+end;
+
+procedure TAttemptTracker.Fail(const AError: Exception);
+begin
+  if InterlockedCompareExchange(FFired, 1, 0) = 0 then
+    Dispatch(AError, False, 0, 0);
+end;
+
+procedure TAttemptTracker.TryFireEarly;
+var
+  E: Exception;
+begin
+  if InterlockedCompareExchange(FFired, 1, 0) <> 0 then
+    Exit;
+  E := nil;
+  if FEndHasError then
+    // the original exception is gone; a connection failure that raced the
+    // arming is reported by its text
+    E := EHttpError.Create(FEndErrorText, ecInternalError);
+  try
+    Dispatch(E, FEndAbandoned, FEndBytesIn, FEndBytesOut);
+  finally
+    E.Free;
+  end;
+end;
+
+procedure TAttemptTracker.Arm(const AResponse: IHttpResponse);
+var
+  Done: Boolean;
+begin
+  // a response that is already complete (HEAD, 204, END_STREAM on the
+  // headers) has nothing left to read: end it now rather than at release
+  Done := False;
+  if (AResponse <> nil) and (AResponse.Body <> nil) then
+    Done := AResponse.Body.Eof;
+  if Done and (InterlockedCompareExchange(FEnded, 0, 0) = 0) then
+  begin
+    FEndAbandoned := False;
+    FEndBytesIn := 0;
+    FEndBytesOut := 0;
+    FEndHasError := False;
+    InterlockedExchange(FEnded, 1);
+  end;
+  InterlockedExchange(FArmed, 1);
+  if InterlockedCompareExchange(FEnded, 0, 0) = 1 then
+    TryFireEarly;
+end;
+
+procedure TAttemptTracker.Drop;
+begin
+  // the response was dropped; if nothing reported its end, it ends abandoned
+  if InterlockedCompareExchange(FFired, 1, 0) = 0 then
+    Dispatch(nil, True, 0, 0);
+end;
+
+procedure TAttemptTracker.RouteChosen(const AProtocol: TNegotiatedProtocol;
+  const AReused: Boolean);
+begin
+  FProtocol := AProtocol;
+  FReused := AReused;
+end;
+
+procedure TAttemptTracker.RequestWritten(const ABytesOut: Int64);
+begin
+  FBytesOut := ABytesOut;
+  FRequestSentUs := NowUs - FStartUs;
+end;
+
+procedure TAttemptTracker.ExchangeEnded(const AEnd: TExchangeEnd);
+begin
+  if InterlockedCompareExchange(FArmed, 0, 0) = 1 then
+  begin
+    // armed: report with the live exception
+    if InterlockedCompareExchange(FFired, 1, 0) = 0 then
+      Dispatch(AEnd.Error, AEnd.Abandoned, AEnd.BytesIn, AEnd.BytesOut);
+    Exit;
+  end;
+  FEndAbandoned := AEnd.Abandoned;
+  FEndBytesIn := AEnd.BytesIn;
+  FEndBytesOut := AEnd.BytesOut;
+  FEndHasError := AEnd.Error <> nil;
+  if FEndHasError then
+    FEndErrorText := AEnd.Error.ClassName + ': ' + AEnd.Error.Message;
+  InterlockedExchange(FEnded, 1);
+  // Arm may have run between the check above and the store: look again
+  if InterlockedCompareExchange(FArmed, 0, 0) = 1 then
+    TryFireEarly;
+end;
+
 function HttpMethodIsIdempotent(const AToken: string): Boolean;
 begin
   Result := (AToken = 'GET') or (AToken = 'HEAD') or (AToken = 'PUT') or
@@ -1289,6 +1564,7 @@ begin
   Result.FBodyReadTimeoutMs := 0;
   Result.FBodyReadTimeoutSet := False;
   Result.FHeaderTimeoutMs := 0;
+  Result.FContext := nil;
 end;
 
 function THttpRequest.GetMethodToken: string;
@@ -1388,6 +1664,12 @@ begin
   Result := Self;
   Result.FBodyReadTimeoutMs := AMs;
   Result.FBodyReadTimeoutSet := True;
+end;
+
+function THttpRequest.WithContext(const AContext: IInterface): THttpRequest;
+begin
+  Result := Self;
+  Result.FContext := AContext;
 end;
 
 function THttpRequest.WithUrl(const AUrl: string): THttpRequest;
@@ -1499,6 +1781,8 @@ begin
   Result.FCACertFile := '';
   Result.FInsecure := False;
   Result.FObserver := nil;
+  Result.FRequestObservers := nil;
+  Result.FLogger := nil;
   Result.FHttp1Fallback := cDefaultHttp1Fallback;
   Result.FClearTextPolicy := ctReject;   // strict by default
   Result.FSocketFactory := TDefaultSocketFactory.Create;
@@ -1653,6 +1937,29 @@ begin
   Result.FObserver := AObserver;
 end;
 
+function THttpClientFactory.WithRequestObserver(
+  const AObserver: IHttpClientObserver): THttpClientFactory;
+var
+  N: Integer;
+begin
+  Result := Self;
+  if AObserver = nil then
+    Exit;
+  // the array is shared by value copies of the record: copy before appending
+  // so a forked factory never sees its sibling's observers
+  N := Length(FRequestObservers);
+  Result.FRequestObservers := Copy(FRequestObservers, 0, N);
+  SetLength(Result.FRequestObservers, N + 1);
+  Result.FRequestObservers[N] := AObserver;
+end;
+
+function THttpClientFactory.WithLogger(
+  const ALogger: IHttpLogger): THttpClientFactory;
+begin
+  Result := Self;
+  Result.FLogger := ALogger;
+end;
+
 function THttpClientFactory.WithHttp1Fallback(
   const AEnable: Boolean): THttpClientFactory;
 begin
@@ -1672,6 +1979,7 @@ var
   Fixed: IProxy;
   Env: TProxyEnvironment;
   Selector: IProxySelector;
+  Client: THttpClient;
 begin
   // every proxy source collapses into one selector here (nil = all direct);
   // an unusable proxy value raises EHttpProxyConfigError before any request
@@ -1686,29 +1994,39 @@ begin
       Env := ReadProxyEnvironment;
   Selector := BuildProxySelector(FProxySelector, Fixed, FAllProxy,
     FProxyEnvVars, Env, FNoProxy);
-  Result := THttpClient.Create(FSocketFactory, FMaxConnectionsPerHost,
+  Client := THttpClient.Create(FSocketFactory, FMaxConnectionsPerHost,
     FMaxTotalConnections, FMaxStreamsPerConnection, FFollowRedirects,
     FMaxRedirects, FConnectTimeoutMs, FHeaderTimeoutMs, FIdleTimeoutMs,
     FObserver, FHttp1Fallback, FClearTextPolicy, Selector);
+  Client.InstallRequestObservers(FRequestObservers, FLogger);
+  Result := Client;
 end;
 
 { TGuardedBody }
 
 constructor TGuardedBody.Create(const AInner: IHttpBodyStream;
-  const ALock: TCriticalSection);
+  const ALock: TCriticalSection; const ALease: TStreamLease);
 begin
   inherited Create;
   FInner := AInner;
   FLock := ALock;
+  FLease := ALease;
 end;
 
 function TGuardedBody.Read(var ABuffer; const ACount: LongInt): LongInt;
 begin
-  FLock.Acquire;
   try
-    Result := FInner.Read(ABuffer, ACount);
+    FLock.Acquire;
+    try
+      Result := FInner.Read(ABuffer, ACount);
+    finally
+      FLock.Release;
+    end;
   finally
-    FLock.Release;
+    // the lease only records the end of the exchange under the connection
+    // lock; the observer is told here, once the lock is released
+    if FLease <> nil then
+      FLease.DeliverEnd;
   end;
 end;
 
@@ -1727,11 +2045,15 @@ begin
   FKeepAlive := AKeepAlive;
   FConnRef := AConnRef;
   FHeaders := ALease.ResponseHeaders;
-  FBody := TGuardedBody.Create(ALease.Body, AConnRef.Lock);
+  ALease.DeferDelivery := True;
+  FBody := TGuardedBody.Create(ALease.Body, AConnRef.Lock, ALease);
 end;
 
 destructor THttpResponse.Destroy;
 begin
+  // a response released before its body was read ends the attempt as
+  // abandoned; this runs outside the connection lock
+  FLease.AbandonExchange;
   FLease.ReleaseLease;
   if FConnRef <> nil then
     FConnRef.ReleaseIfIdle;
@@ -1847,6 +2169,8 @@ begin
     Lease.TimeoutMs := ATimeoutMs;
     Lease.Start;
     AAcquired := True;
+    if ARequest.Exchange <> nil then
+      ARequest.Exchange.RequestWritten(Lease.BytesSent);
     Deadline := GetTickCount64 + QWord(ATimeoutMs);
     Ok := False;
     while True do
@@ -2633,7 +2957,8 @@ var
   Acquired, Upgraded: Boolean;
   Sliced: Integer;
   First: IHttpResponse;
-  Waiting: Boolean;
+  Waiting, Opened: Boolean;
+  Protocol: TNegotiatedProtocol;
 begin
   Deadline := GetTickCount64 + QWord(AHeaderTimeoutMs);
   Waiting := False;
@@ -2644,6 +2969,7 @@ begin
         raise EHttpStreamError.Create('request cancelled', 0, ecCancel);
       Upgraded := False;
       First := nil;
+      Opened := False;
       FLock.Acquire;
       try
         ReapClosed;
@@ -2655,6 +2981,7 @@ begin
           // vs HTTP/1.1 codec (doc/design/fallback.md "Negotiation")
           OpenForTxn(AOrigin, AHost, APort, ARequest, AHeaderTimeoutMs,
             ARequest.Scheme, AProxy, Conn, Upgraded, First);
+          Opened := Conn <> nil;
         end;
         // a caller with no connection and no answer parks below: count it so
         // PoolStats can report the queue
@@ -2677,6 +3004,11 @@ begin
       begin
         // a declined h2c upgrade: the probe carried the request, so its
         // response is the answer and the request is not written again
+        if ARequest.Exchange <> nil then
+        begin
+          ARequest.Exchange.RouteChosen(npHttp1Cleartext, False);
+          ARequest.Exchange.RequestWritten(0);
+        end;
         Result := First;
         Exit;
       end;
@@ -2687,6 +3019,11 @@ begin
         // adopt stream 1 and wait for its response (RFC 7540 section 3.2: the
         // request is never re-sent).  FLock is released so a slow stream-1
         // response never blocks other origins.
+        if ARequest.Exchange <> nil then
+        begin
+          ARequest.Exchange.RouteChosen(npHttp2Cleartext, False);
+          ARequest.Exchange.RequestWritten(0);
+        end;
         Result := (Conn as THttpConnection).AcquireUpgraded(ARequest,
           AHeaderTimeoutMs);
         Exit;
@@ -2694,6 +3031,17 @@ begin
 
       if Conn <> nil then
       begin
+        if ARequest.Exchange <> nil then
+        begin
+          // the codec follows the connection; the scheme picks TLS or not
+          if Conn.Conn <> nil then
+            Protocol := npHttp2Tls
+          else
+            Protocol := npHttp1Tls;
+          if ARequest.Scheme <> 'https' then
+            Inc(Protocol);
+          ARequest.Exchange.RouteChosen(Protocol, not Opened);
+        end;
         // an HTTP/1.1 pooled connection has no cancellable path (one request in
         // flight, no RST_STREAM); Acquire either returns at once or raises
         if (AToken <> nil) and (Conn.Conn <> nil) then
@@ -2990,13 +3338,24 @@ begin
   Result := FPool.Stats;
 end;
 
+procedure THttpClient.InstallRequestObservers(
+  const AObservers: TArray<IHttpClientObserver>; const ALogger: IHttpLogger);
+begin
+  if Length(AObservers) = 0 then
+    FRequestObserver := nil
+  else
+    FRequestObserver := TCompositeObserver.Create(AObservers, ALogger);
+end;
+
 function THttpClient.Send(const ARequest: THttpRequest): IHttpResponse;
 var
-  Current: THttpRequest;
+  Current, Req: THttpRequest;
   Method: string;
   Location, Target: string;
-  Redirects, Retries: Integer;
-  Idempotent: Boolean;
+  Redirects, Retries, Hop, HopRetries, Status: Integer;
+  Idempotent, RetryIt: Boolean;
+  Tracker: TAttemptTracker;
+  TrackerRef: IExchangeObserver;
 begin
   if ARequest.Url = '' then
     raise EHttpProtocolError.Create('request URL is empty', ecProtocolError);
@@ -3013,69 +3372,123 @@ begin
   Idempotent := HttpMethodIsIdempotent(Method);
   Redirects := 0;
   Retries := 0;
+  Hop := 0;
+  HopRetries := 0;
   while True do
   begin
+    Req := Current;
+    Tracker := nil;
+    TrackerRef := nil;
+    if FRequestObserver <> nil then
+    begin
+      // the observer injects into a private copy of the headers, so the
+      // caller's request and the next hop never carry this attempt's values
+      Req := Current.Clone;
+      InterlockedIncrement(FClonedAttempts);
+      Tracker := TAttemptTracker.Create(FRequestObserver);
+      TrackerRef := Tracker;
+      Tracker.Start(Req, Hop, HopRetries);
+    end;
     try
-      Result := SendOnce(Current);
+      Result := SendOnce(Req, TrackerRef);
     except
       // transparent retry: only an idempotent request with no body writer,
       // and only when the peer refused the stream or sent GOAWAY so the
       // stream was never processed (plan S10 task 10.9)
-      on E: EHttpStreamError do
-        if Idempotent and (E.ErrorCode = ecRefusedStream) and
-          (Current.BodyWriter = nil) and
-          (Retries < cMaxTransparentRetries) then
+      on E: Exception do
+      begin
+        RetryIt := (E is EHttpStreamError) and Idempotent and
+          (EHttpStreamError(E).ErrorCode = ecRefusedStream) and
+          (Current.BodyWriter = nil) and (Retries < cMaxTransparentRetries);
+        if Tracker <> nil then
         begin
-          Inc(Retries);
-          Sleep(1);
-          Continue;
-        end
-        else
+          if RetryIt then
+            Tracker.NotifyRetry('REFUSED_STREAM');
+          Tracker.Fail(E);
+        end;
+        if not RetryIt then
           raise;
+        Inc(Retries);
+        Inc(HopRetries);
+        Sleep(1);
+        Continue;
+      end;
     end;
 
-    if (not FFollowRedirects) or (not HttpStatusIsRedirect(Result.StatusCode)) then
-      Break;
-    Location := Result.Headers.GetFirst('location');
-    if Location = '' then
-      Break;
+    try
+      if Tracker <> nil then
+        Tracker.GotResponse(Result);
+      if (not FFollowRedirects) or (not HttpStatusIsRedirect(Result.StatusCode)) then
+      begin
+        if Tracker <> nil then
+          Tracker.Arm(Result);
+        Break;
+      end;
+      Location := Result.Headers.GetFirst('location');
+      if Location = '' then
+      begin
+        if Tracker <> nil then
+          Tracker.Arm(Result);
+        Break;
+      end;
 
-    Inc(Redirects);
-    if Redirects > FMaxRedirects then
-      raise EHttpTooManyRedirects.CreateFmt(
-        'redirect chain exceeded MaxRedirects (%d)', [FMaxRedirects]);
+      Inc(Redirects);
+      if Redirects > FMaxRedirects then
+        raise EHttpTooManyRedirects.CreateFmt(
+          'redirect chain exceeded MaxRedirects (%d)', [FMaxRedirects]);
 
-    Target := ResolveLocation(Current.Url, Location);
-    case Result.StatusCode of
-      303:
-        begin
-          Method := 'GET';
-          Current := Current.DropBody;
-        end;
-      301, 302:
-        begin
-          // spec errors-redirects.md leaves 301/302 method rewriting to the
-          // "standard rules"; these preserve the method for GET/HEAD and
-          // rewrite every other method to GET, dropping the body (the
-          // behaviour every browser and curl use for a POST -> 301/302)
-          if (Method <> 'GET') and (Method <> 'HEAD') then
+      Target := ResolveLocation(Current.Url, Location);
+      Status := Result.StatusCode;
+      case Status of
+        303:
           begin
             Method := 'GET';
             Current := Current.DropBody;
           end;
-        end;
-      307, 308:
-        if Current.BodyWriter <> nil then
-          raise EHttpNotReplayable.Create(
-            'a body writer cannot be replayed on a ' +
-            IntToStr(Result.StatusCode) + ' redirect');
+        301, 302:
+          begin
+            // spec errors-redirects.md leaves 301/302 method rewriting to the
+            // "standard rules"; these preserve the method for GET/HEAD and
+            // rewrite every other method to GET, dropping the body (the
+            // behaviour every browser and curl use for a POST -> 301/302)
+            if (Method <> 'GET') and (Method <> 'HEAD') then
+            begin
+              Method := 'GET';
+              Current := Current.DropBody;
+            end;
+          end;
+        307, 308:
+          if Current.BodyWriter <> nil then
+            raise EHttpNotReplayable.Create(
+              'a body writer cannot be replayed on a ' +
+              IntToStr(Status) + ' redirect');
+      end;
+      Current := Current.WithMethodToken(Method);
+      Current := Current.WithUrl(Target);
+      if Tracker <> nil then
+      begin
+        // the finished hop ends before the next one starts; its body is
+        // discarded, so it ends abandoned unless it was already complete
+        Tracker.NotifyRedirect(Req.Url, Target, Status);
+        Tracker.Arm(Result);
+        Result := nil;
+        Tracker.Drop;
+      end;
+      Inc(Hop);
+      HopRetries := 0;
+    except
+      on E: Exception do
+      begin
+        if Tracker <> nil then
+          Tracker.Fail(E);
+        raise;
+      end;
     end;
-    Current := Current.WithMethodToken(Method);
-    Current := Current.WithUrl(Target);
   end;
 end;
 
-function THttpClient.SendOnce(const ARequest: THttpRequest): IHttpResponse;
+function THttpClient.SendOnce(const ARequest: THttpRequest;
+  const AExchange: IExchangeObserver): IHttpResponse;
 var
   Origin, Host, Path: string;
   Port: Word;
@@ -3104,6 +3517,8 @@ begin
   // the direct key stays the plain origin; a proxied route is its own bucket
   Origin := Origin + ProxyRouteKey(Proxy);
   R := ARequest.ToStreamRequest;
+  if AExchange <> nil then
+    R := R.WithExchange(AExchange);
   Timeout := FHeaderTimeoutMs;
   if ARequest.HeaderTimeoutMs > 0 then
     Timeout := ARequest.HeaderTimeoutMs;

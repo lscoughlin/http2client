@@ -22,7 +22,8 @@ interface
 
 uses
   SysUtils, Classes, SyncObjs, Generics.Collections,
-  Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack, Http2.Connection;
+  Http2.Errors, Http2.Frames, Http2.Headers, Http2.Hpack, Http2.Tls,
+  Http2.Connection;
 
 const
   /// polls as often as this many milliseconds while waiting for a cancel
@@ -77,6 +78,34 @@ type
     function Data: TBytes;
   end;
 
+  /// how one exchange ended, as the codec saw it
+  TExchangeEnd = record
+    /// borrowed for the duration of the call; nil on a clean end
+    Error: Exception;
+    /// the response was released before its body was read to the end
+    Abandoned: Boolean;
+    /// body payload bytes sent and received on the wire
+    BytesOut, BytesIn: Int64;
+  end;
+
+  /// the per-attempt hook a codec reports to (doc/design/
+  /// request-observability.md "Attempt end").  A request carries it in
+  /// TStreamRequest.Exchange; nil costs nothing.  The codec never calls it
+  /// while it holds a lock of its own on the consumer's thread, but the
+  /// connection thread may (a connection failure), so an implementation must
+  /// be thread-safe and fast.
+  IExchangeObserver = interface
+    ['{7D1E5A02-3B94-4C6F-8E21-5A0C9B3D6F10}']
+    /// the pool picked the transport for this exchange
+    procedure RouteChosen(const AProtocol: TNegotiatedProtocol;
+      const AReused: Boolean);
+    /// the request (head and body) has been handed to the transport
+    procedure RequestWritten(const ABytesOut: Int64);
+    /// the body reached its end, the exchange failed or it was released;
+    /// reported at most once per codec exchange
+    procedure ExchangeEnded(const AEnd: TExchangeEnd);
+  end;
+
   /// the wire method token plus the parsed request fields one lease emits.
   /// Pseudo-header mapping happens at encode time; Method is stored uppercase.
   TStreamRequest = record
@@ -96,6 +125,8 @@ type
     /// a Server-Sent Events source relies on.
     BodyReadTimeoutMs: Integer;
     BodyReadTimeoutSet: Boolean;
+    /// the observed attempt this request belongs to (nil when unobserved)
+    Exchange: IExchangeObserver;
     /// build a request with default scheme 'https', path '/', empty headers
     class function Create(const AMethod, AAuthority: string): TStreamRequest; static;
     class function WithMethod(const AMethod: THttpMethod;
@@ -108,6 +139,8 @@ type
     function WithCancelToken(const AToken: ICancellationToken): TStreamRequest;
     /// set the body read deadline explicitly (0 = wait indefinitely)
     function WithBodyReadTimeout(const AMs: Integer): TStreamRequest;
+    /// attach the per-attempt end hook
+    function WithExchange(const AExchange: IExchangeObserver): TStreamRequest;
   end;
 
   /// a response body stream (matches doc/design/messages.md IHttpBodyStream)
@@ -141,6 +174,9 @@ type
 
   /// the response (receive) side assembly state
   TResponseState = (rsIdle, rsBodyOpen, rsBodyComplete, rsFailed);
+
+  /// why a lease's exchange is due to be reported (first reason wins)
+  TLeaseEndDue = (edNone, edEof, edFailed, edCancelled);
 
   TStreamLease = class;
 
@@ -217,6 +253,19 @@ type
 
     FTimeoutMs: Integer;
 
+    // observed-attempt hook (doc/design/request-observability.md)
+    FExchange: IExchangeObserver;
+    FBytesSent: Int64;
+    FEndDue: TLeaseEndDue;
+    FEndFired: LongInt;
+    FDeferDelivery: Boolean;
+    /// record that the exchange ended for AReason; the first reason wins.  It
+    /// only records, so it is safe under the pooled connection's lock
+    procedure NoteEnd(const AReason: TLeaseEndDue);
+    /// tell the hook, once, outside any lock the caller controls
+    procedure FireExchange(const AReason: TLeaseEndDue;
+      const AAbandoned: Boolean);
+
     function MaxFrameSize: LongWord;
     /// reserve up to AWant bytes of the peer's SEND window for this stream,
     /// blocking until credit arrives or the lease deadline expires. Raises
@@ -276,6 +325,12 @@ type
     function BodyEof: Boolean;
     /// blocking body read; a read after EOF raises deterministically
     function ReadBody(var ABuffer; const ACount: LongInt): LongInt;
+    /// report a recorded end to the attempt hook (idempotent).  ReadBody only
+    /// records; the caller delivers once it holds no lock
+    procedure DeliverEnd;
+    /// the response was released: report the recorded end, or an abandoned
+    /// one when the body was never finished
+    procedure AbandonExchange;
 
     // IConnectionStream
     procedure OnConnectionFailed(const AMessage: string;
@@ -300,6 +355,10 @@ type
     property RstCode: THttp2ErrorCode read FRstCode;
     property GoAwayLastStreamId: LongWord read FGoAwayLastStreamId;
     property Retryable: Boolean read FRetryable;
+    /// True when the owner calls DeliverEnd itself, after releasing its lock
+    property DeferDelivery: Boolean read FDeferDelivery write FDeferDelivery;
+    /// request body bytes emitted as DATA so far
+    property BytesSent: Int64 read FBytesSent;
   end;
 
 implementation
@@ -386,6 +445,7 @@ begin
   Result.CancelToken := nil;
   Result.BodyReadTimeoutMs := 0;
   Result.BodyReadTimeoutSet := False;
+  Result.Exchange := nil;
 end;
 
 function TStreamRequest.WithScheme(const AScheme: string): TStreamRequest;
@@ -441,6 +501,13 @@ begin
   Result.BodyReadTimeoutSet := True;
 end;
 
+function TStreamRequest.WithExchange(
+  const AExchange: IExchangeObserver): TStreamRequest;
+begin
+  Result := Self;
+  Result.Exchange := AExchange;
+end;
+
 { TIStreamBody }
 
 constructor TIStreamBody.Create(const ALease: TStreamLease);
@@ -451,7 +518,13 @@ end;
 
 function TIStreamBody.Read(var ABuffer; const ACount: LongInt): LongInt;
 begin
-  Result := FLease.ReadBody(ABuffer, ACount);
+  try
+    Result := FLease.ReadBody(ABuffer, ACount);
+  finally
+    // a pooled response defers this until its connection lock is released
+    if not FLease.DeferDelivery then
+      FLease.DeliverEnd;
+  end;
 end;
 
 function TIStreamBody.Eof: Boolean;
@@ -572,6 +645,7 @@ begin
   FExpectedLength := -1;
   FTimeoutMs := 30000;
   FGoAwayLastStreamId := MaxStreamId;
+  FExchange := ARequest.Exchange;
 end;
 
 destructor TStreamLease.Destroy;
@@ -709,6 +783,7 @@ begin
     FOutbound.Push(BuildDataFrame(FStreamId, nil, AEndStream));
     Exit;
   end;
+  Inc(FBytesSent, Length(AData));
   Ofs := 0;
   while Ofs < Length(AData) do
   begin
@@ -1207,16 +1282,23 @@ begin
         N := Avail;
       Move(FBodyPending[FBodyPendingOfs], P^, N);
       Inc(FBodyPendingOfs, N);
+      if FBodyEof and (FBodyPendingOfs >= Length(FBodyPending)) and
+         (not FFailed) then
+        NoteEnd(edEof);
       Exit(N);
     end;
     if FFailed then
+    begin
+      NoteEnd(edFailed);
       raise MakeStreamError;
+    end;
     if FBodyEof then
     begin
       if FBodyEofObserved then
         raise EHttpStreamError.Create('read after end of stream', FStreamId,
           ecStreamClosed);
       FBodyEofObserved := True;
+      NoteEnd(edEof);
       Exit(0);
     end;
     // A body read waits with its OWN deadline when the request set one
@@ -1233,10 +1315,14 @@ begin
       // cannot distinguish a dead connection from a slow peer (mirrors
       // WaitForResponseHeader)
       if FFailed then
+      begin
+        NoteEnd(edFailed);
         raise MakeStreamError;
+      end;
       if (FRequest.CancelToken <> nil) and
          FRequest.CancelToken.IsCancelled then
       begin
+        NoteEnd(edCancelled);
         // abandon the stream the same way a cancelled Send does: reset it,
         // never orphan it (doc/design/errors-redirects.md "Cancellation")
         FConnection.PostFrame(BuildRstStreamFrame(FStreamId, ecCancel));
@@ -1280,6 +1366,10 @@ begin
   end;
   FInbound.Shutdown;
   ReleaseLease;
+  // the connection thread holds no lock here (TConnection.FailWith fans out
+  // after releasing its own), so the hook may run now
+  if FFailed then
+    FireExchange(edFailed, False);
 end;
 
 procedure TStreamLease.OnConnectionGoAway(const ALastStreamId: LongWord);
@@ -1298,7 +1388,62 @@ begin
     FResponseState := rsFailed;
     FInbound.Shutdown;
     ReleaseLease;
+    FireExchange(edFailed, False);
   end;
+end;
+
+procedure TStreamLease.NoteEnd(const AReason: TLeaseEndDue);
+begin
+  if (FExchange <> nil) and (FEndDue = edNone) then
+    FEndDue := AReason;
+end;
+
+procedure TStreamLease.FireExchange(const AReason: TLeaseEndDue;
+  const AAbandoned: Boolean);
+var
+  Info: TExchangeEnd;
+  E: Exception;
+begin
+  if FExchange = nil then
+    Exit;
+  if InterlockedCompareExchange(FEndFired, 1, 0) <> 0 then
+    Exit;
+  Info.Abandoned := AAbandoned;
+  Info.BytesIn := FBodyReceived;
+  Info.BytesOut := FBytesSent;
+  Info.Error := nil;
+  E := nil;
+  case AReason of
+    edFailed:    E := MakeStreamError;
+    edCancelled: E := EHttpStreamError.Create('body read cancelled',
+                   FStreamId, ecCancel);
+  end;
+  Info.Error := E;
+  try
+    try
+      FExchange.ExchangeEnded(Info);
+    except
+      // the hook is the attempt tracker, which already guards its observers
+    end;
+  finally
+    E.Free;
+  end;
+end;
+
+procedure TStreamLease.DeliverEnd;
+begin
+  if (FExchange <> nil) and (FEndDue <> edNone) then
+    FireExchange(FEndDue, False);
+end;
+
+procedure TStreamLease.AbandonExchange;
+begin
+  if FExchange = nil then
+    Exit;
+  if FEndDue <> edNone then
+    FireExchange(FEndDue, False)
+  else
+    FireExchange(edNone, True);
 end;
 
 procedure TStreamLease.OnStreamFrame(const AFrame: TFrame);

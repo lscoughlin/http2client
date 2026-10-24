@@ -86,6 +86,13 @@ type
     FDone: Boolean;
     FObservedEof: Boolean;
     FTrailers: IHttpHeaders;    // filled when the chunked terminator is parsed
+    // observed-attempt hook (doc/design/request-observability.md)
+    FExchange: IExchangeObserver;
+    FBytesIn: Int64;
+    FBytesOut: Int64;
+    FEnded: LongInt;
+    procedure EndExchange(const AError: Exception; const AAbandoned: Boolean);
+    function ReadFramed(var ABuffer; const ACount: LongInt): LongInt;
     procedure ReadTrailers;
     function ReadContentLength(var ABuffer; const ACount: LongInt): LongInt;
     function ReadChunked(var ABuffer; const ACount: LongInt): LongInt;
@@ -96,6 +103,13 @@ type
       const ATrailers: IHttpHeaders);
     function Read(var ABuffer; const ACount: LongInt): LongInt;
     function Eof: Boolean;
+    /// report the end of this body (EOF, a failed read or release) to AExchange
+    /// exactly once; ABytesOut is the request body size for the report
+    procedure AttachExchange(const AExchange: IExchangeObserver;
+      const ABytesOut: Int64);
+    /// the response was released: report an abandoned end unless the body was
+    /// already finished
+    procedure ReleaseExchange;
     property Trailers: IHttpHeaders read FTrailers;
   end;
 
@@ -110,10 +124,14 @@ type
     FStatusCode: LongInt;
     FHeaders: IHttpHeaders;
     FBody: IHttpBodyStream;
+    FStream: THttp1BodyStream;   // weak: FBody holds it
   public
     constructor Create(const AVersion: string; const AStatusCode: LongInt;
       const AReason: string; const AHeaders: IHttpHeaders;
       const ABody: IHttpBodyStream);
+    destructor Destroy; override;
+    /// let the response report an abandoned body when it is released
+    procedure BindStream(const AStream: THttp1BodyStream);
     function GetStatusCode: LongInt;
     function GetHeaders: IHttpHeaders;
     function GetBody: IHttpBodyStream;
@@ -142,6 +160,7 @@ type
     FFields: TArray<THttp1HeaderField>;
     FHeaders: IHttpHeaders;
     FSendRequest: TStreamRequest;
+    FSentBodyBytes: Int64;
     procedure WriteAll(const ABytes: TBytes);
     function GetReaderBuffered: Integer;
   public
@@ -569,7 +588,57 @@ begin
   end;
 end;
 
+procedure THttp1BodyStream.AttachExchange(const AExchange: IExchangeObserver;
+  const ABytesOut: Int64);
+begin
+  FExchange := AExchange;
+  FBytesOut := ABytesOut;
+end;
+
+procedure THttp1BodyStream.EndExchange(const AError: Exception;
+  const AAbandoned: Boolean);
+var
+  Info: TExchangeEnd;
+begin
+  if FExchange = nil then
+    Exit;
+  if InterlockedCompareExchange(FEnded, 1, 0) <> 0 then
+    Exit;
+  Info.Error := AError;
+  Info.Abandoned := AAbandoned;
+  Info.BytesIn := FBytesIn;
+  Info.BytesOut := FBytesOut;
+  try
+    FExchange.ExchangeEnded(Info);
+  except
+    // the hook is the attempt tracker, which already guards its observers
+  end;
+end;
+
+procedure THttp1BodyStream.ReleaseExchange;
+begin
+  EndExchange(nil, not FDone);
+end;
+
 function THttp1BodyStream.Read(var ABuffer; const ACount: LongInt): LongInt;
+begin
+  try
+    Result := ReadFramed(ABuffer, ACount);
+  except
+    on E: Exception do
+    begin
+      EndExchange(E, False);
+      raise;
+    end;
+  end;
+  if Result > 0 then
+    Inc(FBytesIn, Result);
+  if FDone then
+    EndExchange(nil, False);
+end;
+
+function THttp1BodyStream.ReadFramed(var ABuffer;
+  const ACount: LongInt): LongInt;
 begin
   Result := 0;
   if ACount <= 0 then
@@ -602,6 +671,18 @@ begin
 end;
 
 { THttp1Response }
+
+destructor THttp1Response.Destroy;
+begin
+  if FStream <> nil then
+    FStream.ReleaseExchange;
+  inherited Destroy;
+end;
+
+procedure THttp1Response.BindStream(const AStream: THttp1BodyStream);
+begin
+  FStream := AStream;
+end;
 
 constructor THttp1Response.Create(const AVersion: string;
   const AStatusCode: LongInt; const AReason: string;
@@ -948,6 +1029,8 @@ end;
 function THttp1Connection.BeginResponse(const ARequest: TStreamRequest): Boolean;
 var
   Line: string;
+  Wire: TBytes;
+  I: Integer;
 begin
   // one request in flight at a time: the previous body must be drained
   if (FLastBody <> nil) and (not FLastBody.Eof) then
@@ -958,7 +1041,21 @@ begin
       'HTTP/1.1 connection cannot be reused (Connection: close or EOF body)',
       ecProtocolError);
 
-  WriteAll(BuildHttp1Request(ARequest));
+  Wire := BuildHttp1Request(ARequest);
+  WriteAll(Wire);
+  FSentBodyBytes := 0;
+  if ARequest.Exchange <> nil then
+  begin
+    // the head ends at the first blank line; everything after it is body
+    for I := 0 to Length(Wire) - 4 do
+      if (Wire[I] = 13) and (Wire[I + 1] = 10) and (Wire[I + 2] = 13) and
+         (Wire[I + 3] = 10) then
+      begin
+        FSentBodyBytes := Length(Wire) - (I + 4);
+        Break;
+      end;
+    ARequest.Exchange.RequestWritten(FSentBodyBytes);
+  end;
   Inc(FRequestCount);
   FSendRequest := ARequest;
   FBeginDone := False;
@@ -985,6 +1082,7 @@ var
   Bodyless: Boolean;
   Body: THttp1BodyStream;
   Trailers: IHttpHeaders;
+  Resp: THttp1Response;
 begin
   if not FBeginDone then
     raise EHttpProtocolError.Create(
@@ -1052,8 +1150,11 @@ begin
     ((FVersion = 'HTTP/1.1') or
      (Pos('keep-alive', LowerCase(Connection)) > 0));
 
-  Result := THttp1Response.Create(FVersion, FStatusCode, FReason, Headers,
+  Body.AttachExchange(FSendRequest.Exchange, FSentBodyBytes);
+  Resp := THttp1Response.Create(FVersion, FStatusCode, FReason, Headers,
     Body);
+  Resp.BindStream(Body);
+  Result := Resp;
 end;
 
 function THttp1Connection.ResumeResponse(const ARequest: TStreamRequest;
@@ -1061,6 +1162,7 @@ function THttp1Connection.ResumeResponse(const ARequest: TStreamRequest;
 begin
   Inc(FRequestCount);
   FSendRequest := ARequest;
+  FSentBodyBytes := 0;
   ParseStatusLine(AStatusLine, FVersion, FStatusCode, FReason);
   FBeginDone := True;
   Result := FinishResponse;
