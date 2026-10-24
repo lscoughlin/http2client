@@ -216,8 +216,14 @@ Not run on Linux: the Autobahn client run, the harness sweep and any load or
 overhead measurement.
 
 Linux differences the code handles: `clock_gettime` is declared in
-`Http2.Clock`; SIGPIPE is ignored in `Http2.Tls` because there is no
-`SO_NOSIGPIPE`; and an expired socket deadline is recognised from OpenSSL's
+`Http2.Clock`; SIGPIPE is never ignored or handled, because the library does
+not change a signal disposition: there is no `SO_NOSIGPIPE`, so plain sends use
+`send` with `MSG_NOSIGNAL` (`cMsgNoSignal` in `Http2.SigPipe`), and each OpenSSL
+call that can write (`SSL_connect`, `SSL_read`, `SSL_write`, `SSL_shutdown`)
+runs inside a shield that blocks SIGPIPE in the calling thread only, consumes
+any SIGPIPE the call raised with a zero-timeout `sigtimedwait`, and restores
+the thread's mask (a TLS layer over another transport writes through that
+transport, which is covered the same way); an expired socket deadline is recognised from OpenSSL's
 want-read or want-write result as well as `errno`. The live-gate servers set
 `TCP_NODELAY`, because Nagle plus the client's delayed ACK adds about 40 ms to
 the timed WebSocket cases.

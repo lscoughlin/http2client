@@ -69,7 +69,7 @@ function sigismember(const ASet: TLibcSigSet; signo: Integer): Integer; cdecl;
 function sigpending(var ASet: TLibcSigSet): Integer; cdecl;
   external 'c' name 'sigpending';
 function sigtimedwait(const ASet: TLibcSigSet; info: Pointer;
-  const timeout: TTimeSpec): Integer; cdecl; external 'c' name 'sigtimedwait';
+  timeout: Pointer): Integer; cdecl; external 'c' name 'sigtimedwait';
 
 procedure PipeSet(out ASet: TLibcSigSet);
 begin
@@ -112,7 +112,7 @@ begin
     Zero.tv_sec := 0;
     Zero.tv_nsec := 0;
     repeat
-      R := sigtimedwait(S, nil, Zero);   // consumes at most one pending SIGPIPE
+      R := sigtimedwait(S, nil, @Zero);   // consumes at most one pending SIGPIPE
     until (R >= 0) or (fpGetErrno <> ESysEINTR);
   end;
   if not AShield.WasBlocked then

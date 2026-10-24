@@ -26,8 +26,12 @@ type
   private
     FMask: TRawSigSet;
     FPending: TRawSigSet;
+    FRunnerMask: TRawSigSet;
     procedure Snapshot;
     procedure AssertUnchanged;
+  protected
+    procedure SetUp; override;
+    procedure TearDown; override;
   published
     procedure TestDispositionIsDefaultAtStart;
     procedure TestPlainWritesToClosedPeer;
@@ -44,6 +48,22 @@ function c_sigpending(SigSet: Pointer): Integer; cdecl;
 {$IFDEF LINUX}
 function c_raise(Sig: Integer): Integer; cdecl; external 'c' name 'raise';
 {$ENDIF}
+
+procedure TSigPipeTest.SetUp;
+var
+  S: TRawSigSet;
+begin
+  // the runner blocks SIGPIPE for the in-process test servers; these tests
+  // need the signal deliverable in this thread, as in a host program
+  FillChar(S, SizeOf(S), 0);
+  S[(SIGPIPE - 1) div 8] := 1 shl ((SIGPIPE - 1) mod 8);
+  c_pthread_sigmask(SIG_UNBLOCK, @S, @FRunnerMask);
+end;
+
+procedure TSigPipeTest.TearDown;
+begin
+  c_pthread_sigmask(SIG_SETMASK, @FRunnerMask, nil);
+end;
 
 procedure TSigPipeTest.Snapshot;
 begin

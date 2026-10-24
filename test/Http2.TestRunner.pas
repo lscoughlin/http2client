@@ -27,6 +27,24 @@ uses
   Http2.PoolStats.Test, Http2.RequestObserver.Test, Http2.ObserverAdapters.Test,
   Http2.ClientCert.Test, Http2.MutualTls.Test, Http2.SigPipe.Test;
 
+{$IFDEF LINUX}
+function pthread_sigmask(How: Integer; NewSet, OldSet: Pointer): Integer;
+  cdecl; external 'c' name 'pthread_sigmask';
+
+/// block SIGPIPE in the runner thread (and so in the threads it creates):
+// the in-process test servers write to peers that have already closed, and
+// the library under test no longer ignores the signal process-wide.
+// TSigPipeTest unblocks it for its own thread to prove the library is safe.
+procedure BlockSigPipeForFixtures;
+var
+  S: array[0..127] of Byte;
+begin
+  FillChar(S, SizeOf(S), 0);
+  S[(13 - 1) div 8] := 1 shl ((13 - 1) mod 8);   // SIGPIPE = 13
+  pthread_sigmask(0, @S, nil);                   // SIG_BLOCK
+end;
+{$ENDIF}
+
 type
   TTestProbe = class(TTestCase)
   published
@@ -39,5 +57,8 @@ begin
 end;
 
 initialization
+{$IFDEF LINUX}
+  BlockSigPipeForFixtures;
+{$ENDIF}
   RegisterTest(TTestProbe);
 end.
