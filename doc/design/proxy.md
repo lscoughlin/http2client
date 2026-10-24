@@ -252,11 +252,11 @@ A proxied route appends the proxy identity, `origin via [user@]host:port`
 - the password is not part of the key; the user name is.
 
 Because each route is a separate pool bucket, `MaxConnectionsPerHost` counts
-connections **per origin and route** (and, with a client identity selector
-installed or a request carrying its own identity, per origin identity: see
-[mtls](mtls.md); the proxy identity is fixed per client and never varies the
-key). `MaxTotalConnections` still
-bounds the whole pool.
+connections **per origin and route**, across every client identity: a client
+identity selector or a request's own identity adds an identity part to the
+pool key, but the cap does not follow it (see [mtls](mtls.md) "Pooling"). The
+proxy identity is fixed per client and never varies the key.
+`MaxTotalConnections` still bounds the whole pool.
 
 ## TLS to the proxy
 

@@ -2784,12 +2784,11 @@ var
   Stats: TPoolStats;
   Id2: IClientIdentity;
 begin
-  StartServer(mkHttp1, cTls13);
+  StartServer(mkH2, cTls13);
   Client := RouteVia(THttpClientFactory.Create
     .WithCACertFile(Fixture('ca.crt'))
     .WithConnectTimeout(3000)
     .WithHeaderTimeout(1500)
-    .WithHttp1Fallback(True)
     .WithMaxConnectionsPerHost(1)).Build;
   Id2 := Client2Identity;
   AssertEquals('first body', 'ok', ReadBody(Client.Send(
@@ -2814,12 +2813,11 @@ var
   Stats: TPoolStats;
   Id2: IClientIdentity;
 begin
-  StartServer(mkHttp1, cTls13);
+  StartServer(mkH2, cTls13);
   Client := RouteVia(THttpClientFactory.Create
     .WithCACertFile(Fixture('ca.crt'))
     .WithConnectTimeout(3000)
     .WithHeaderTimeout(1500)
-    .WithHttp1Fallback(True)
     .WithMaxTotalConnections(1)).Build;
   Id2 := Client2Identity;
   AssertEquals('first body', 'ok', ReadBody(Client.Send(
