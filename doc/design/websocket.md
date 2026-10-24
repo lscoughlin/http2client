@@ -89,6 +89,7 @@ scheme or an unusable authority raises `EHttpWebSocketError`.
 | `WithMaxMessageBytes(n)` | bound on one message summed across its fragments, default 16 MiB, `0` for none |
 | `WithPingIntervalMs(n)` | when above `0`, a ping is sent after that much silence and a connection silent for twice as long fails with `EHttpTimeout`; default off |
 | `WithAutoRequest(b)` | requests one more notification after each delivery, and one at the start |
+| `WithContext(o)` | an opaque object the request observer receives as `THttpAttempt.Context` |
 
 ### Listener
 
@@ -329,12 +330,41 @@ Behaviour of the reference code that shapes the design:
   frame header. RFC 6455 allows a zero key, so the mask bit alone decides
   here.
 
+## Observing a session
+
+A client built with `WithRequestObserver` sees a WebSocket as one attempt of
+kind `akWebSocket` (see [request-observability](request-observability.md)):
+
+- `IWebSocketRequest.WithContext` attaches the context the observer receives.
+- The attempt starts before the dial, and the observer may inject handshake
+  headers through `Headers`; the headers the handshake owns are refused with
+  `EHttpWebSocketError`, as `WithHeader` refuses them.
+- `OnResponseHeaders` fires at the `101`; a refused handshake ends the attempt
+  with the error and the refusal's status.
+- The attempt ends once: after the close handshake, on `Abort`, on a failure,
+  or (only for a connection that never started) on release. `ClosedBy`,
+  `CloseCode` and `CloseReason` say how. The end does not wait for the
+  listener's `OnClose`.
+- Counters (`MessagesIn`, `MessagesOut`, `BytesIn`, `BytesOut`, first, last and
+  gap times) are always kept; an observer that implements
+  `IHttpMessageObserver` and asks for `mkWs*` kinds gets one `OnMessage` per
+  text, binary, ping, pong and close message, in each direction.
+
+Stamps are taken where the reader thread reads the socket. Delivery is demand
+driven, so a reader that has no demand is not reading: without
+`WithAutoRequest` and with no outstanding `Request(n)`, the stamp of a message
+includes the time the consumer took to ask for the one before it. With
+`WithAutoRequest` the reader keeps reading while the listener runs and the
+stamps are the server's. Delivery itself is unchanged.
+
 ## Known limits
 
 - HTTP/1.1 only; RFC 8441 is not implemented.
 - No extension, including `permessage-deflate`.
 - No automatic reconnection; reopening is the caller's decision.
-- No observer events per frame; the observer sees nothing of a WebSocket.
+- No transport-observer events per frame (`IHttp2Observer` sees nothing of a
+  WebSocket). The request observer covers a session: see
+  [Observing a session](#observing-a-session).
 - Total handshake time is bounded per step (the dial, then each response
   read), not as one budget.
 - The Autobahn|Testsuite fuzzing client run needs Docker; see

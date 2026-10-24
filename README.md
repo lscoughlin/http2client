@@ -391,7 +391,11 @@ Response := Client.Send(THttpRequest.Create(hmGet, Url).WithContext(ParentSpan))
 ```
 
 `OnAttemptEnd` fires once per attempt, when the body ends, fails or the
-response is released (an unread response reports `Abandoned`). The outcome
+response is released (an unread response reports `Abandoned`; a deliberate
+`Close` or `Abort`, and any failure, do not). A WebSocket session is one
+attempt of kind `akWebSocket`: the handshake accepts injected headers, and the
+outcome carries the message and byte counters, `ClosedBy`, `CloseCode` and
+`CloseReason`. The outcome
 carries the status, protocol, whether the connection was reused, byte counts
 and timings. A callback runs outside every library lock, must not block, and
 is swallowed and reported to `WithLogger` if it raises. A response that is

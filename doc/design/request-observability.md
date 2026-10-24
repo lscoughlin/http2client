@@ -40,10 +40,9 @@ statistics snapshot, wire arrival stamps (`TFrame.ArrivedUs`,
 `IStampedBodyStream`), the timing and message aggregates of `THttpOutcome`,
 Server-Sent Events attempts (`akSse`, the loop's `StreamId` and `Reconnect`,
 per-event aggregates, `IAttemptProgress`) and the per-message observer
-(`IHttpMessageObserver`) for SSE events.
-
-Not built yet: WebSocket attempts (`akWebSocket` is declared but never
-produced) and the WebSocket outcome fields.
+(`IHttpMessageObserver`) for SSE events, and WebSocket attempts (`akWebSocket`:
+handshake header injection, one attempt per session, close details, counters,
+wire stamps and the per-message callbacks).
 
 ## Goals
 
@@ -417,12 +416,23 @@ headers.
 |---|---|
 | Plain request | the body reaches EOF, the response is released, or the stream fails |
 | SSE | the stream reaches EOF, `Close` is called, the response is released, or the stream fails |
-| WebSocket | the close handshake completes, `Abort` is called, the connection fails, or the socket object is released |
+| WebSocket | the close handshake completes, `Abort` is called, the connection fails, or the connection object is released without any of those |
 
-A response or socket that is never read to its end and never released holds
-its attempt open. Release (the response's last reference being dropped, or
-`Close`) ends it with `Abandoned = True`. This is documented behaviour: a
-leaked response is a leaked span.
+One rule covers plain responses, SSE and WebSocket. An explicit local end is a
+deliberate end and reports `Abandoned = False`: `Close` on an SSE source,
+`Close` and `Abort` on a WebSocket, and a failure of any kind (a stream error,
+a refused handshake, a dropped connection). Only a response, source or socket
+that is released with none of those having happened, and without being read to
+its end, reports `Abandoned = True`. A response or socket that is never read to
+its end and never released holds its attempt open: a leaked response is a
+leaked span. This is documented behaviour.
+
+A WebSocket is the one object whose reader thread holds a reference to the
+connection until the session ends, so dropping the caller's last reference to
+an open socket does not release it: the session keeps delivering and its
+attempt stays open until a close handshake, an abort or a failure ends it.
+`Abandoned = True` therefore reports only a connection destroyed with no end
+recorded (one that never started its reader).
 
 The codecs report the end through a per-attempt hook carried on the request
 (`IExchangeObserver` in `Http2.Stream`): the HTTP/2 lease and the HTTP/1.1 body
@@ -504,11 +514,17 @@ called from the reader thread, so it must be thread-safe.
 
 ### WebSocket
 
-The reader thread stamps each socket read. A message takes the stamp of the
-read that completed its final frame. Reads are demand-driven: with no
-outstanding `Request(n)` the reader thread does not read the socket, so the
-stamp includes the consumer's wait. `WithAutoRequest` removes the effect. This
-is documented as a limitation.
+The reader thread stamps each socket read (`TBufferedReader.LastReadUs`, so
+bytes that arrived with the `101` head keep that read's stamp). A message takes
+the stamp of the read that completed its final frame, and is reported to the
+attempt when that frame has been parsed, before the listener is asked for it.
+Reads are demand-driven: with no outstanding `Request(n)` the reader thread
+does not read the socket, so the stamp includes the consumer's wait, and the
+next message is stamped when the consumer finally asks for the one before it.
+`WithAutoRequest` removes the effect, because the reader then keeps reading
+while the listener runs. This is documented as a limitation and the delivery
+rule is not changed: a consumer that wants wire-accurate timing uses
+`WithAutoRequest` and does its own queueing.
 
 ### Limits
 
@@ -576,20 +592,65 @@ requested.
 
 ## WebSocket
 
+- `IWebSocketRequest.WithContext` attaches the context, and the request stays
+  immutable: every `With*` returns a new request that keeps it.
 - `Send(IWebSocketRequest)` starts an attempt with `Kind = akWebSocket` before
-  dialling. The observer injects handshake headers through `Headers`.
-- `OnResponseHeaders` fires at the `101`, with `Outcome.Subprotocol` set at
-  the end.
+  dialling (`Method = 'GET'`, `Url`, `Host`, `Port`, `Context`, `Headers`). The
+  observer injects handshake headers through `Headers`. The sink starts as the
+  request's own headers, `SetValue` replaces every value of a name, and a name
+  the handshake owns (`sec-websocket-*`, `upgrade`, `connection`, `host`, and
+  the framing headers `WithHeader` also refuses) raises `EHttpWebSocketError`.
+  An observer that raises there is swallowed like any other.
+- `OnResponseHeaders` fires at the `101`, before the reader thread starts, with
+  the response headers and `Outcome.Subprotocol` set at the end. The request is
+  reported as written once the handshake bytes are out (`RequestSentUs`).
 - A handshake that fails produces `OnAttemptStart` and `OnAttemptEnd` with the
-  error and no response headers.
-- The attempt ends once, however the session ends. `ClosedBy`, `CloseCode` and
-  `CloseReason` say how. The reader thread and callers both drive the
-  connection, so counters are atomic and the end is latched.
+  error and no `OnResponseHeaders`. A refusal carries the status the server
+  answered in `StatusCode` (403, say) and `ClosedBy = ciError`; a dial or
+  proxy failure has `StatusCode = 0`.
+- The attempt ends once, however the session ends. The reader thread and
+  callers both drive the connection, so the end is taken under an atomic latch
+  and the callback runs outside every lock. `OnAttemptEnd` follows the end of
+  the close handshake (before the listener has asked for `OnClose`, which waits
+  for demand and may never come), not the listener's callback.
+- `ClosedBy`, `CloseCode` and `CloseReason`:
+
+| The session ends with | `ClosedBy` | `CloseCode`, `CloseReason` | `Error` |
+|---|---|---|---|
+| `Close` and the server's reply | `ciLocal` | the server's close frame | nil |
+| a close frame from the server | `ciRemote` | the server's close frame | nil |
+| `Abort` | `ciAbort` | 1006, empty | nil |
+| a failed handshake | `ciError` | 0, empty | the failure |
+| a protocol violation | `ciError` | the code this side closed with | the violation |
+| EOF without a close frame, a failed write, a timeout (close or ping) | `ciError` | 1006, empty | the failure |
+| a listener callback that raises | `ciError` | 1006, empty | the exception |
+| a connection destroyed with none of the above | `ciNone` | 0, empty | nil (`Abandoned`) |
+
+  A close frame with no payload reports 1005. `Error` is borrowed for the
+  callback, as everywhere.
 - A WebSocket uses a dedicated unpooled connection, so
-  `ConnectionReused = False`.
+  `ConnectionReused = False` and `Protocol` is HTTP/1.1 (`npHttp1Cleartext`
+  for `ws`, `npHttp1Tls` for `wss`); a proxy route is not an outcome field.
+- Counters are always collected and are atomic. `MessagesIn` and `MessagesOut`
+  count data messages (a fragmented message counts once, when its last
+  fragment is read or written); ping, pong and close are not counted.
+  `BytesIn` and `BytesOut` are the payload bytes of those data messages, not
+  frame headers, control frames or the handshake. The first, last and gap
+  aggregates come from the inbound data messages' wire stamps.
 - Per-message callbacks are off unless `WantsMessages` includes `mkWs*` kinds.
-  Ping and pong are distinct kinds so liveness can be logged separately from
-  payload.
+  Every frame this side reads or writes is reported to the attempt, which
+  builds a `TMessageInfo` only for a kind an observer asked for: inbound text,
+  binary, ping, pong and close, and outbound text, binary, ping, pong (the
+  automatic answer to a ping included) and close (the echo included).
+  `Size` is the payload bytes of the whole message (code plus reason for
+  close). `Index` and `SinceLastUs` count every kind per direction, so a ping
+  between two texts takes an index and shortens the next gap. Outbound stamps
+  are taken when the write completes; senders on several threads may report
+  them out of order, and a negative `SinceLastUs` is reported as 0.
+  `OnMessage` for inbound messages runs on the reader thread, and for outbound
+  ones on the thread that sent.
+- A message reported after the attempt has ended is not delivered, so
+  `OnMessage` never follows `OnAttemptEnd`.
 
 ## Threading and failure
 
