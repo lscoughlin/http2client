@@ -90,6 +90,7 @@ scheme or an unusable authority raises `EHttpWebSocketError`.
 | `WithPingIntervalMs(n)` | when above `0`, a ping is sent after that much silence and a connection silent for twice as long fails with `EHttpTimeout`; default off |
 | `WithAutoRequest(b)` | requests one more notification after each delivery, and one at the start |
 | `WithContext(o)` | an opaque object the request observer receives as `THttpAttempt.Context` |
+| `WithClientIdentity(id)` | the origin identity for a `wss` connection, ahead of the client's selector and fixed identity; see [mtls](mtls.md) |
 
 ### Listener
 

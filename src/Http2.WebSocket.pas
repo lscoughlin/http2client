@@ -11,7 +11,7 @@ unit Http2.WebSocket;
 interface
 
 uses
-  SysUtils, sha1, base64, Http2.Errors;
+  SysUtils, sha1, base64, Http2.Errors, Http2.IdentityHandle;
 
 const
   /// frame opcodes (RFC 6455 section 5.2)
@@ -227,6 +227,12 @@ type
     /// attach an opaque object that the request observer receives as
     /// THttpAttempt.Context (a parent span, a tenant); nil clears it
     function WithContext(const AContext: IInterface): IWebSocketRequest;
+    /// present AIdentity to the origin on the wss connection, ahead of the
+    /// client's selector and fixed identity (doc/design/mtls.md "Per-request
+    /// identity"); never to a proxy.  Send raises EHttpTlsConfigError before
+    /// dialling when it has expired.  nil clears it; ws ignores it
+    function WithClientIdentity(const AIdentity: IClientIdentityHandle): IWebSocketRequest;
+    function GetClientIdentity: IClientIdentityHandle;
     function GetUrl: string;
     function GetListener: IWebSocketListener;
     function GetHeaders: TArray<TWsHeaderField>;
@@ -237,6 +243,7 @@ type
     function GetPingIntervalMs: Integer;
     function GetAutoRequest: Boolean;
     function GetContext: IInterface;
+    property ClientIdentity: IClientIdentityHandle read GetClientIdentity;
     property Url: string read GetUrl;
     property Listener: IWebSocketListener read GetListener;
     property Headers: TArray<TWsHeaderField> read GetHeaders;
@@ -277,6 +284,7 @@ type
     FPingIntervalMs: Integer;
     FAutoRequest: Boolean;
     FContext: IInterface;
+    FIdentity: IClientIdentityHandle;
     function Clone: TWebSocketRequest;
   public
     /// AUrl is ws, wss, http or https; AListener is required
@@ -290,6 +298,12 @@ type
     function WithPingIntervalMs(const AMs: Integer): IWebSocketRequest;
     function WithAutoRequest(const AEnable: Boolean = True): IWebSocketRequest;
     function WithContext(const AContext: IInterface): IWebSocketRequest;
+    /// present AIdentity to the origin on the wss connection, ahead of the
+    /// client's selector and fixed identity (doc/design/mtls.md "Per-request
+    /// identity"); never to a proxy.  Send raises EHttpTlsConfigError before
+    /// dialling when it has expired.  nil clears it; ws ignores it
+    function WithClientIdentity(const AIdentity: IClientIdentityHandle): IWebSocketRequest;
+    function GetClientIdentity: IClientIdentityHandle;
     function GetUrl: string;
     function GetListener: IWebSocketListener;
     function GetHeaders: TArray<TWsHeaderField>;
@@ -1044,6 +1058,7 @@ begin
   Result.FPingIntervalMs := FPingIntervalMs;
   Result.FAutoRequest := FAutoRequest;
   Result.FContext := FContext;
+  Result.FIdentity := FIdentity;
 end;
 
 function TWebSocketRequest.WithConnectTimeoutMs(
@@ -1159,6 +1174,21 @@ begin
   R := Clone;
   R.FContext := AContext;
   Result := R;
+end;
+
+function TWebSocketRequest.WithClientIdentity(
+  const AIdentity: IClientIdentityHandle): IWebSocketRequest;
+var
+  R: TWebSocketRequest;
+begin
+  R := Clone;
+  R.FIdentity := AIdentity;
+  Result := R;
+end;
+
+function TWebSocketRequest.GetClientIdentity: IClientIdentityHandle;
+begin
+  Result := FIdentity;
 end;
 
 function TWebSocketRequest.GetUrl: string;

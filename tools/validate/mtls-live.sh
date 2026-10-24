@@ -15,13 +15,16 @@
 # any connection).  The Python servers also serve /events and wss, and their
 # logs prove what each connection did on the server side.
 #
-# Then the selector case (doc/design/mtls.md "Selector"): two origins that each
-# serve one identity only, reached by one client whose selector picks the
-# identity per origin.  Then the proxy cases (doc/design/mtls.md "Where it
-# applies"): an https proxy (mtls_server.py --proxy) that requires a client
-# certificate receives the identity and the origin behind it sees none, with a
-# fixed identity and with a selector; an http proxy (--plain-proxy) receives
-# it nowhere, so an origin that requires a certificate is unreachable through it.
+# Then the selector, proxy and per-request cases (doc/design/mtls.md "Where it
+# applies", "Per-request identity"): two origins that each serve one identity
+# only, reached by one client whose selector picks the identity per origin; an
+# https proxy (mtls_server.py --proxy) that requires its own client
+# certificate while the origin behind it sees the origin identity (the proxy
+# sees the proxy identity only); an HTTP CONNECT proxy
+# (mtls_server.py --plain-proxy) through which the origin still sees
+# the origin identity; and an identity attached to the request, directly and
+# through the https proxy, where the origin sees that identity and the proxy
+# the proxy identity.
 #
 #   bash tools/validate/mtls-live.sh          # or: make validate-mtls
 #
@@ -173,66 +176,95 @@ run_get "https://localhost:$ORIGIN_B/" "$GOOD_CERT" "$GOOD_KEY"
 contains "fixed identity at the other origin: forbidden" "status: 403" "$OUT"
 contains "fixed identity at the other origin: logged" "forbid " "$(cat "$WORK/origin-b.log")"
 
-# proxies: the identity goes to the TLS leg of an https proxy and to nothing
-# else.  The origin asks for a certificate without requiring one
-# (--optional-cert), so it completes the handshake and its log shows whether
-# the client offered any: through every proxy it must log "accept nocert".
-PROXY_ORIGIN=$((BASE + 5)); HTTPS_PROXY_PORT=$((BASE + 6))
-HTTP_PROXY_PORT=$((BASE + 7)); STRICT_ORIGIN=$((BASE + 8))
-start_python "$PROXY_ORIGIN" 1.3 "$WORK/proxy-origin.log" --optional-cert
-start_python "$HTTPS_PROXY_PORT" 1.3 "$WORK/https-proxy.log" --proxy
-start_python "$HTTP_PROXY_PORT" 1.3 "$WORK/http-proxy.log" --plain-proxy
-start_python "$STRICT_ORIGIN" 1.3 "$WORK/strict-origin.log"
-
-# https proxy, fixed identity: the proxy sees it, the origin sees none
-OUT="$(MTLS_PROXY="https:$HTTPS_PROXY_PORT" "$GET" "https://localhost:$PROXY_ORIGIN/" \
+# the proxy identity: an https proxy that requires a client certificate in front
+# of an origin that requires another; each must see its own identity only
+PROXY_ORIGIN=$((BASE + 5)); PROXY_PORT=$((BASE + 6))
+start_python "$PROXY_ORIGIN" 1.3 "$WORK/proxy-origin.log"
+start_python "$PROXY_PORT" 1.3 "$WORK/proxy.log" --proxy
+OUT="$(MTLS_PROXY="$PROXY_PORT" MTLS_PROXY_CERT="$CERTS/client2-chain.pem" \
+  MTLS_PROXY_KEY="$CERTS/client2.key" "$GET" "https://localhost:$PROXY_ORIGIN/" \
   "$GOOD_CERT" "$GOOD_KEY" "$CERTS/ca.crt" 2>&1)"
 RC=$?
-check "https proxy: exit" 0 "$RC"
-contains "https proxy: status" "status: 200" "$OUT"
-check "https proxy accepted the identity" 1 "$(grep -c 'commonName=mtls client$' "$WORK/https-proxy.log")"
-contains "https proxy tunnelled to the origin" "tunnel localhost:$PROXY_ORIGIN" "$(cat "$WORK/https-proxy.log")"
-check "origin behind the https proxy saw no certificate" 1 "$(grep -c '^accept nocert' "$WORK/proxy-origin.log")"
-check "origin behind the https proxy saw no subject" 0 "$(grep -c 'subject=' "$WORK/proxy-origin.log")"
-
-# https proxy, selector: asked for the proxy's port; the entry for the origin's
-# port would present an identity there, and must not be used
-: > "$WORK/https-proxy.log"
-SELECT="$HTTPS_PROXY_PORT:$CERTS/client2-chain.pem:$CERTS/client2.key;$PROXY_ORIGIN:$GOOD_CERT:$GOOD_KEY"
-OUT="$(MTLS_SELECT="$SELECT" MTLS_PROXY="https:$HTTPS_PROXY_PORT" "$GET" \
-  "https://localhost:$PROXY_ORIGIN/" - - "$CERTS/ca.crt" 2>&1)"
-RC=$?
-check "https proxy selector: exit" 0 "$RC"
-check "https proxy selector: the proxy's identity" 1 "$(grep -c 'commonName=mtls client two$' "$WORK/https-proxy.log")"
-check "https proxy selector: origin saw no certificate (two connections, both nocert)" 2 \
-  "$(grep -c '^accept nocert' "$WORK/proxy-origin.log")"
-check "https proxy selector: origin never saw a subject" 0 "$(grep -c 'subject=' "$WORK/proxy-origin.log")"
-
-# https proxy, no identity: it asks for one and refuses; no tunnel is opened
-OUT="$(MTLS_PROXY="https:$HTTPS_PROXY_PORT" "$GET" "https://localhost:$PROXY_ORIGIN/" \
-  - - "$CERTS/ca.crt" 2>&1)"
-RC=$?
-check "https proxy without an identity: refused" 1 "$([ "$RC" -ne 0 ] && echo 1 || echo 0)"
-check "https proxy without an identity: no new tunnel" 1 \
-  "$(grep -c '^tunnel ' "$WORK/https-proxy.log")"
-
-# http:// proxy: no TLS to it, so the identity is presented nowhere
-OUT="$(MTLS_PROXY="http:$HTTP_PROXY_PORT" "$GET" "https://localhost:$PROXY_ORIGIN/" \
+check "proxy identity: exit" 0 "$RC"
+contains "proxy identity: status" "status: 200" "$OUT"
+check "proxy accepted the proxy identity" 1 "$(grep -c 'commonName=mtls client two$' "$WORK/proxy.log")"
+contains "proxy tunnelled to the origin" "tunnel localhost:$PROXY_ORIGIN" "$(cat "$WORK/proxy.log")"
+check "origin accepted the origin identity" 1 "$(grep -c 'commonName=mtls client$' "$WORK/proxy-origin.log")"
+check "origin never saw the proxy identity" 0 "$(grep -c 'client two' "$WORK/proxy-origin.log")"
+check "proxy never saw the origin identity" 0 "$(grep -c 'commonName=mtls client$' "$WORK/proxy.log")"
+# the origin identity does not satisfy the proxy
+OUT="$(MTLS_PROXY="$PROXY_PORT" "$GET" "https://localhost:$PROXY_ORIGIN/" \
   "$GOOD_CERT" "$GOOD_KEY" "$CERTS/ca.crt" 2>&1)"
 RC=$?
-check "http proxy: exit" 0 "$RC"
-contains "http proxy: status" "status: 200" "$OUT"
-contains "http proxy tunnelled to the origin" "tunnel localhost:$PROXY_ORIGIN" "$(cat "$WORK/http-proxy.log")"
-check "origin behind the http proxy saw no certificate" 3 "$(grep -c '^accept nocert' "$WORK/proxy-origin.log")"
-check "origin behind the http proxy saw no subject" 0 "$(grep -c 'subject=' "$WORK/proxy-origin.log")"
-# the consequence: an origin that requires a client certificate cannot be
-# reached through an http proxy, whatever identity the client holds
-OUT="$(MTLS_PROXY="http:$HTTP_PROXY_PORT" "$GET" "https://localhost:$STRICT_ORIGIN/" \
-  "$GOOD_CERT" "$GOOD_KEY" "$CERTS/ca.crt" 2>&1)"
+check "proxy without its identity: refused" 1 "$([ "$RC" -ne 0 ] && echo 1 || echo 0)"
+check "proxy without its identity: no second tunnel" 1 \
+  "$(grep -c '^tunnel ' "$WORK/proxy.log")"
+
+# HTTP CONNECT proxy: no TLS leg, so there is no proxy identity, and the origin
+# identity still reaches the origin through the tunnel
+CONNECT_PORT=$((BASE + 7))
+start_python "$CONNECT_PORT" 1.3 "$WORK/connect.log" --plain-proxy
+OUT="$(MTLS_PROXY="$CONNECT_PORT" MTLS_PROXY_KIND=http "$GET" \
+  "https://localhost:$PROXY_ORIGIN/" "$GOOD_CERT" "$GOOD_KEY" "$CERTS/ca.crt" 2>&1)"
 RC=$?
-check "http proxy to a strict origin: refused" 1 "$([ "$RC" -ne 0 ] && echo 1 || echo 0)"
-check "strict origin refused the handshake" 1 "$(grep -c '^reject ' "$WORK/strict-origin.log")"
-check "strict origin accepted nothing" 0 "$(grep -c '^accept ' "$WORK/strict-origin.log")"
+check "connect proxy: exit" 0 "$RC"
+contains "connect proxy: status" "status: 200" "$OUT"
+contains "connect proxy tunnelled to the origin" "tunnel localhost:$PROXY_ORIGIN" "$(cat "$WORK/connect.log")"
+check "connect proxy: the origin saw the origin identity again" 2 \
+  "$(grep -c 'commonName=mtls client$' "$WORK/proxy-origin.log")"
+check "connect proxy: no certificate reached the proxy" 0 "$(grep -c '^accept ' "$WORK/connect.log")"
+
+# the selector through the https proxy is asked for the origin (its port picks
+# the identity), and the proxy identity still goes to the proxy only
+ORIGIN_C=$((BASE + 8))
+start_python "$ORIGIN_C" 1.3 "$WORK/origin-c.log" --only-subject "mtls client two"
+PROXY2=$((BASE + 9))
+start_python "$PROXY2" 1.3 "$WORK/proxy2.log" --proxy
+OUT="$(MTLS_PROXY="$PROXY2" MTLS_PROXY_CERT="$GOOD_CERT" MTLS_PROXY_KEY="$GOOD_KEY" \
+  MTLS_SELECT="$ORIGIN_C:$CERTS/client2-chain.pem:$CERTS/client2.key" "$GET" \
+  "https://localhost:$ORIGIN_C/" - - "$CERTS/ca.crt" 2>&1)"
+RC=$?
+check "selector through the https proxy: exit" 0 "$RC"
+contains "selector through the https proxy: status" "status: 200" "$OUT"
+check "selector through the https proxy: origin saw the selected identity" 1 \
+  "$(grep -c 'commonName=mtls client two$' "$WORK/origin-c.log")"
+check "selector through the https proxy: proxy saw the proxy identity only" 1 \
+  "$(grep -c 'commonName=mtls client$' "$WORK/proxy2.log")"
+check "selector through the https proxy: proxy never saw the selected identity" 0 \
+  "$(grep -c 'client two' "$WORK/proxy2.log")"
+
+# a per-request identity: no client identity is configured, the request names
+# one.  Origin C serves "mtls client two" only
+OUT="$(MTLS_REQUEST_CERT="$CERTS/client2-chain.pem" MTLS_REQUEST_KEY="$CERTS/client2.key" \
+  "$GET" "https://localhost:$ORIGIN_C/" - - "$CERTS/ca.crt" 2>&1)"
+RC=$?
+check "request identity direct: exit" 0 "$RC"
+contains "request identity direct: status" "status: 200" "$OUT"
+check "request identity direct: origin saw the request identity" 2 \
+  "$(grep -c 'commonName=mtls client two$' "$WORK/origin-c.log")"
+# through the https proxy: the request identity reaches the origin, the proxy
+# identity the proxy, neither the other
+: > "$WORK/proxy2.log"
+OUT="$(MTLS_REQUEST_CERT="$CERTS/client2-chain.pem" MTLS_REQUEST_KEY="$CERTS/client2.key" \
+  MTLS_PROXY="$PROXY2" MTLS_PROXY_CERT="$GOOD_CERT" MTLS_PROXY_KEY="$GOOD_KEY" \
+  "$GET" "https://localhost:$ORIGIN_C/" - - "$CERTS/ca.crt" 2>&1)"
+RC=$?
+check "request identity through the https proxy: exit" 0 "$RC"
+contains "request identity through the https proxy: status" "status: 200" "$OUT"
+check "request identity through the https proxy: origin saw it" 3 \
+  "$(grep -c 'commonName=mtls client two$' "$WORK/origin-c.log")"
+check "request identity through the https proxy: proxy saw the proxy identity only" 1 \
+  "$(grep -c 'commonName=mtls client$' "$WORK/proxy2.log")"
+check "request identity through the https proxy: proxy never saw the request identity" 0 \
+  "$(grep -c 'client two' "$WORK/proxy2.log")"
+# an expired request identity is refused before any connection
+before="$(grep -c '^accept ' "$WORK/origin-c.log")"
+OUT="$(MTLS_REQUEST_CERT="$CERTS/expired.crt" MTLS_REQUEST_KEY="$CERTS/expired.key" \
+  "$GET" "https://localhost:$ORIGIN_C/" - - "$CERTS/ca.crt" 2>&1)"
+RC=$?
+check "expired request identity: exit" 1 "$RC"
+contains "expired request identity: refused" "expired" "$OUT"
+check "expired request identity: nothing dialled" "$before" "$(grep -c '^accept ' "$WORK/origin-c.log")"
 
 if [ "$FAIL" -ne 0 ]; then
   echo "mtls-live: FAILED"; exit 1

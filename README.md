@@ -117,7 +117,7 @@ has its own task.
 | `task validate:harness` | The RFC conformance harness. 146 case ids. | About 30 minutes |
 | `task validate:sse` | The opt-in live SSE case against `tools/validate/sse_server.py`. | Seconds |
 | `task validate:websocket` | The opt-in live WebSocket case: `ws` and `wss`, directly and through an HTTP `CONNECT`, https and SOCKS5 proxy, against `tools/validate/ws_servers.py`, plus a check of the servers' logs (mask bit on every client frame, close codes, route). `task validate:websocket:autobahn` runs the Autobahn|Testsuite client cases (Docker). | Seconds |
-| `task validate:mtls` | The opt-in live mutual TLS case: an accepted identity, none, one from another CA and an expired one, against `tools/validate/mtls_server.py` (HTTP/1.1, an event stream and `wss`, pinned to TLS 1.2 and to TLS 1.3) and `nghttpd --verify-client` (HTTP/2). The expired identity is refused by the client at `Build`. It also runs a selector against two origins that each serve one identity, an `https` proxy that requires a client certificate in front of an origin that sees none (with a fixed identity and with a selector), and an `http` proxy through which the origin sees none. | Seconds |
+| `task validate:mtls` | The opt-in live mutual TLS case: an accepted identity, none, one from another CA and an expired one, against `tools/validate/mtls_server.py` (HTTP/1.1, an event stream and `wss`, pinned to TLS 1.2 and to TLS 1.3) and `nghttpd --verify-client` (HTTP/2). The expired identity is refused by the client at `Build`. It also runs a selector against two origins that each serve one identity, an `https` proxy that requires its own client certificate in front of an origin that requires another, an HTTP `CONNECT` proxy through which the origin still sees the origin identity, and a per-request identity. | Seconds |
 | `task validate:cleartext` | The opt-in live cleartext case: a bodyless `GET`, `POST`, `DELETE` and `HEAD` under `ctUpgrade` and `ctHttp1` against `tools/validate/h1_counter_server.py`, an HTTP/1.1-only server that logs each request; every request arrives once. | Seconds |
 | `task validate:proxy` | The opt-in live proxy case: HTTP `CONNECT`, https and SOCKS5 proxies from `tools/validate/proxy_servers.py`, with and without credentials, HTTP/2 through each proxy kind when `nghttpd` is installed, plus a check of the proxy logs. | Seconds |
 
@@ -313,9 +313,11 @@ For a self-signed certificate, use `WithInsecureTls`.
 
 A server that asks for a client certificate is answered with an identity: a
 certificate chain and its private key, loaded from PEM files, PEM in memory or
-a PKCS#12 bundle. The client presents it on the TLS connection to an origin
-(HTTP/2, the HTTP/1.1 fallback, SSE and `wss`) when the route is direct, and on
-the TLS connection to an `https://` proxy when the route goes through one.
+a PKCS#12 bundle. The client presents it on every TLS connection to an origin:
+HTTP/2, the HTTP/1.1 fallback, SSE and `wss`, directly or inside an HTTP
+`CONNECT`, SOCKS5 or `https://` proxy tunnel. A proxy that requires a client
+certificate of its own is answered with `WithProxyClientIdentity`, a separate
+identity that goes to an `https://` proxy only and never to the origin.
 
 ```pascal
 Client := THttpClientFactory.Create
@@ -335,18 +337,14 @@ the certificate, an expired certificate) raises `EHttpTlsConfigError` from
 certificate raises `EHttpTlsClientAuthError` with the TLS alert in `Alert`
 (`certificate required`, `unknown ca`, `certificate expired`, ...), under TLS
 1.2 and TLS 1.3 alike. It is never retried and never falls back to HTTP/1.1.
-Cleartext (`http`, `ws`) connections ignore the identity. Through a proxy the
-identity goes to an `https://` proxy only, on the TLS leg to the proxy; the
-origin inside the tunnel never sees it, and through an `http://` or
-`socks5://` proxy it is presented nowhere, so an origin that requires a client
-certificate is not reachable through such a proxy (dial it directly). With an
+Cleartext (`http`, `ws`) connections ignore the identity. With an
 `IHttpLogger` installed, a debug line names the identity's subject and
 fingerprint, and nothing else about it. `examples/mtls_get.pas` is a short
 program; see `doc/design/mtls.md`.
 
 A different identity per origin, or a certificate that is replaced while the
 process runs, comes from a selector that is asked for each new TLS
-connection that presents an identity (not for a request that reuses one):
+connection (not for a request that reuses one):
 
 ```pascal
 type
@@ -365,14 +363,30 @@ end;
 
 Client := THttpClientFactory.Create
   .WithClientIdentitySelector(TByOrigin.Create)
+  .WithProxyClientIdentity(ProxyIdentity)   // for an https proxy that asks for one
   .Build;
 ```
 
 The pool keeps connections that used different identities apart; connections
-that used a replaced certificate serve until they close. On a route through an
-`https://` proxy the selector is asked with the proxy's host and port, because
-the proxy is the peer that receives the identity; through an `http://` or
-`socks5://` proxy it is not asked.
+that used a replaced certificate serve until they close. The selector is asked
+with the origin's host and port on every route, direct or through a tunnel.
+The identity given with `WithProxyClientIdentity` goes to an `https://` proxy
+only, and the origin identity never goes to the proxy.
+
+When the services are configured outside the client and only the caller knows
+which one needs which certificate, attach the identity to the request. It wins
+over the selector and the client's fixed identity, works through every route
+and goes to the origin only:
+
+```pascal
+Resp := Client.Send(THttpRequest.Create(hmGet, 'https://billing.example/')
+  .WithClientIdentity(BillingIdentity));                 // also IWebSocketRequest, SseRequest
+```
+
+Connections that used different request identities never share a connection. A
+redirect to the same origin keeps the request identity; a redirect to another
+origin drops it. `Send` raises `EHttpTlsConfigError` before dialling when the
+identity has expired.
 
 ### Text, JSON, and XML helpers
 
@@ -549,7 +563,7 @@ make measure-observer                                # observer overhead on loop
 | `threaded_get.pas` | Many threads sharing one client and its pool. |
 | `sse_stream.pas` | `SseRequest` + `TSseReconnectLoop` over an event stream. |
 | `proxy_env.pas` | A GET routed by the proxy environment variables. |
-| `mtls_get.pas` | GETs, or a `wss` session, with a client certificate, a per-origin selector, or through an `http` or `https` proxy; reports a rejection. |
+| `mtls_get.pas` | GETs, or a `wss` session, with a client certificate, a per-origin selector, a per-request identity or an `https` proxy identity; reports a rejection. |
 | `websocket_echo.pas` | Open a WebSocket, send a message, print the echo, close. |
 | `observer_all.pas` | The tracing, metrics and logging adapters together on a request, an SSE stream with a reconnect and a WebSocket. |
 | `observer_overhead.pas` | What the observers cost on a loopback request. |
@@ -613,8 +627,8 @@ The connection speaks HTTP/1.1 (RFC 6455); a WebSocket is not pooled. See
 - `doc/design/proxy.md` gives the proxy routing: environment variables,
   the no-proxy list, and `IProxySelector`.
 - `doc/design/mtls.md` gives mutual TLS: the identity loaders, where the
-  identity is presented (and through which proxies it is not), the per-origin
-  selector and certificate rotation, and how a rejection is reported.
+  identity is presented, the per-origin selector and certificate rotation, the
+  proxy identity, and how a rejection is reported.
 - `doc/design/websocket.md` gives the WebSocket client: handshake, framing,
   delivery and demand, closing, and the reference implementations.
 - `doc/design/messages.md` gives the request and response types.

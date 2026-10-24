@@ -979,8 +979,11 @@ begin
           Break;
       end;
     end;
-    AssertTrue('RTL and Errors only: ' + Uses_,
-      Pos('Http2.', StringReplace(Uses_, 'Http2.Errors', '', [])) = 0);
+    // Http2.IdentityHandle is the TLS-free marker a request carries for a
+    // client identity; it depends on nothing
+    AssertTrue('RTL, Errors and the identity handle only: ' + Uses_,
+      Pos('Http2.', StringReplace(StringReplace(Uses_, 'Http2.Errors', '', []),
+        'Http2.IdentityHandle', '', [])) = 0);
     AssertTrue('does not call Random', Pos('Random(', L.Text) = 0);
   finally
     L.Free;
