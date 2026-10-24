@@ -377,6 +377,8 @@ type
     property StatusCode: LongInt read FStatusCode;
     property ResponseHeaders: IHttpHeaders read FResponseHeaders;
     property Body: IHttpBodyStream read FBodyStream;
+    /// the per-attempt hook the request carried (nil when unobserved)
+    property Exchange: IExchangeObserver read FExchange;
     property RequestMethod: string read FRequest.Method;
     /// response/body read deadline (ms); default 30000
     property TimeoutMs: Integer read FTimeoutMs write FTimeoutMs;

@@ -152,6 +152,9 @@ type
     FBodyReadTimeoutMs: Integer; // per-request body-read deadline
     FBodyReadTimeoutSet: Boolean;
     FContext: IInterface;      // opaque, handed back in THttpAttempt.Context
+    FAttemptKind: TAttemptKind;
+    FStreamId: Int64;          // SSE reconnect loop id, 0 otherwise
+    FReconnect: Integer;
     function GetMethodToken: string;
     function GetAuthority: string;
     function GetPath: string;
@@ -188,6 +191,15 @@ type
     /// parent span without a thread-local.  Clone, WithUrl, DropBody and
     /// WithMethodToken keep it.
     function WithContext(const AContext: IInterface): THttpRequest;
+    /// mark what an observer sees as THttpAttempt.Kind (akRequest by default).
+    /// SseRequest marks its request akSse.  Clone, WithUrl, DropBody and
+    /// WithMethodToken keep it.
+    function WithAttemptKind(const AKind: TAttemptKind): THttpRequest;
+    /// stamp the identity of an SSE reconnect loop: AStreamId is shared by
+    /// every connection of the loop and AReconnect counts them from 0.  They
+    /// reach THttpAttempt.StreamId and Reconnect.  Kept like the context.
+    function WithStream(const AStreamId: Int64;
+      const AReconnect: Integer): THttpRequest;
     /// re-target the request at AUrl (used by the redirect loop)
     function WithUrl(const AUrl: string): THttpRequest;
     /// an independent copy, including a deep copy of the headers
@@ -218,6 +230,11 @@ type
     property CancelToken: ICancellationToken read FCancelToken;
     /// the context set with WithContext (nil when none)
     property Context: IInterface read FContext;
+    /// what an observer sees as THttpAttempt.Kind
+    property AttemptKind: TAttemptKind read FAttemptKind;
+    /// the SSE loop id and reconnect count (0 for any other request)
+    property StreamId: Int64 read FStreamId;
+    property Reconnect: Integer read FReconnect;
     /// this request's header timeout in ms; 0 means "use the factory default"
     property HeaderTimeoutMs: Integer read FHeaderTimeoutMs;
   end;
@@ -418,9 +435,10 @@ type
   /// the concrete response: typed status/headers plus a streamed body. It
   /// holds the pooled connection by interface so the underlying TConnection
   /// outlives the pool release while the body is still being read.
-  THttpResponse = class(TInterfacedObject, IHttpResponse)
+  THttpResponse = class(TInterfacedObject, IHttpResponse, IAttemptProgress)
   private
     FLease: TStreamLease;
+    FProgress: IAttemptProgress;
     FKeepAlive: IConnectionStream;   // keeps the lease alive after unregister
     FConnRef: IPooledConnection;     // keeps the TConnection alive
     FHeaders: IHttpHeaders;
@@ -433,6 +451,10 @@ type
     constructor Create(const ALease: TStreamLease;
       const AKeepAlive: IConnectionStream; const AConnRef: IPooledConnection);
     destructor Destroy; override;
+    /// the reporter a reader of the body uses (Supports(Response,
+    /// IAttemptProgress)); it does nothing when the request is not observed
+    property Progress: IAttemptProgress read FProgress
+      implements IAttemptProgress;
     /// the wire stream id (test seam)
     property StreamId: LongWord read GetStreamId;
   end;
@@ -1221,7 +1243,15 @@ type
   //   once, after OnResponseHeaders: an end that arrives before Send has
   //   armed the tracker (a bodyless response, a connection failure in that
   //   window) is held until Arm.
-  TAttemptTracker = class(TInterfacedObject, IExchangeObserver)
+  // - a reader of the body (the SSE source) reports its own messages through
+  //   IAttemptProgress, which the response exposes.  Those aggregates replace
+  //   the codec's per-frame ones, and a message observer that asked for the
+  //   kind is called for each.  Because the codec delivers a clean end inside
+  //   the Read that returns the last bytes, a reader brackets its reads with
+  //   ReadBegin and ReadEnd and the end is held until ReadEnd, so the last
+  //   messages are counted before OnAttemptEnd.
+  TAttemptTracker = class(TInterfacedObject, IExchangeObserver,
+    IAttemptProgress)
   private
     FObserver: IHttpClientObserver;
     FToken: IInterface;
@@ -1244,11 +1274,26 @@ type
     FArmed: LongInt;
     FEnded: LongInt;
     FFired: LongInt;
+    // the per-message path: asked once per attempt in Start
+    FMessages: IHttpMessageObserver;
+    FWanted: TMessageKinds;
+    // what a reader reported; guarded by FProgressLock
+    FProgressLock: TCriticalSection;
+    FReaderIn: TArrivalStats;
+    FReaderOut: Int64;
+    FInIndex, FOutIndex: Int64;
+    FInLastUs, FOutLastUs: Int64;
+    // a clean end held back while a reader is inside a Read
+    FInRead: LongInt;
+    FHeld: LongInt;            // 0 none, 1 held, 2 claimed
+    FHeldEnd: TExchangeEnd;
+    procedure TryFireHeld;
     procedure Dispatch(const AError: Exception; const AAbandoned: Boolean;
       const ABytesIn, ABytesOut: Int64);
     procedure TryFireEarly;
   public
     constructor Create(const AObserver: IHttpClientObserver);
+    destructor Destroy; override;
     /// build the attempt for ARequest (whose headers are a private clone) and
     /// run OnAttemptStart
     procedure Start(const ARequest: THttpRequest; const AHop,
@@ -1269,13 +1314,28 @@ type
       const AReused: Boolean);
     procedure RequestWritten(const ABytesOut: Int64);
     procedure ExchangeEnded(const AEnd: TExchangeEnd);
+    // IAttemptProgress
+    function WantedKinds: TMessageKinds;
+    procedure ReportMessage(const AKind: TMessageKind;
+      const ADirection: TDirection; const AArrivedUs: Int64;
+      const ASize: Integer; const ASse: PSseEvent);
+    procedure ReadBegin;
+    procedure ReadEnd;
+    procedure Finish(const ABytesIn: Int64);
   end;
 
 constructor TAttemptTracker.Create(const AObserver: IHttpClientObserver);
 begin
   inherited Create;
   FObserver := AObserver;
+  FProgressLock := TCriticalSection.Create;
   FStartUs := NowUs;
+end;
+
+destructor TAttemptTracker.Destroy;
+begin
+  FProgressLock.Free;
+  inherited Destroy;
 end;
 
 procedure TAttemptTracker.Start(const ARequest: THttpRequest; const AHop,
@@ -1283,9 +1343,10 @@ procedure TAttemptTracker.Start(const ARequest: THttpRequest; const AHop,
 var
   A: THttpAttempt;
   Path: string;
+  Gate: IHttpMessageGate;
 begin
   FCancelToken := ARequest.CancelToken;
-  A.Kind := akRequest;
+  A.Kind := ARequest.AttemptKind;
   A.Method := ARequest.MethodToken;
   A.Url := ARequest.Url;
   A.Host := '';
@@ -1297,8 +1358,8 @@ begin
   end;
   A.Hop := AHop;
   A.Retry := ARetry;
-  A.StreamId := 0;
-  A.Reconnect := 0;
+  A.StreamId := ARequest.StreamId;
+  A.Reconnect := ARequest.Reconnect;
   A.Context := ARequest.Context;
   A.Headers := THeaderSink.Create(ARequest.Headers);
   try
@@ -1306,6 +1367,22 @@ begin
   except
     FToken := nil;
   end;
+  // the message observer is asked once per attempt.  A composite already
+  // collected its members' answers in OnAttemptStart; any other observer is
+  // asked here.  An empty answer leaves the per-message path switched off.
+  FWanted := [];
+  FMessages := nil;
+  try
+    if Supports(FObserver, IHttpMessageObserver, FMessages) then
+      if Supports(FObserver, IHttpMessageGate, Gate) then
+        FWanted := Gate.WantedFor(FToken)
+      else
+        FWanted := FMessages.WantsMessages(A);
+  except
+    FWanted := [];
+  end;
+  if FWanted = [] then
+    FMessages := nil;
 end;
 
 procedure TAttemptTracker.GotResponse(const AResponse: IHttpResponse);
@@ -1340,6 +1417,7 @@ procedure TAttemptTracker.Dispatch(const AError: Exception;
   const AAbandoned: Boolean; const ABytesIn, ABytesOut: Int64);
 var
   O: THttpOutcome;
+  Arrivals: TArrivalStats;
 begin
   FillChar(O, SizeOf(O), 0);
   O.Subprotocol := '';
@@ -1359,14 +1437,26 @@ begin
     O.BytesOut := FBytesOut;
   O.RequestSentUs := FRequestSentUs;
   O.HeadersUs := FHeadersUs;
-  if FArrivals.Count > 0 then
+  FProgressLock.Acquire;
+  try
+    // a reader that reported messages (an SSE event is a message, a DATA
+    // frame is not) wins over the codec's per-frame arrivals
+    if FReaderIn.Count > 0 then
+      Arrivals := FReaderIn
+    else
+      Arrivals := FArrivals;
+    O.MessagesOut := FReaderOut;
+  finally
+    FProgressLock.Release;
+  end;
+  if Arrivals.Count > 0 then
   begin
     // stamps are absolute clock values; the outcome is relative to the start
-    O.FirstMessageUs := FArrivals.FirstUs - FStartUs;
-    O.LastMessageUs := FArrivals.LastUs - FStartUs;
-    O.MessagesIn := FArrivals.Count;
-    O.MaxGapUs := FArrivals.MaxGapUs;
-    O.SumGapUs := FArrivals.SumGapUs;
+    O.FirstMessageUs := Arrivals.FirstUs - FStartUs;
+    O.LastMessageUs := Arrivals.LastUs - FStartUs;
+    O.MessagesIn := Arrivals.Count;
+    O.MaxGapUs := Arrivals.MaxGapUs;
+    O.SumGapUs := Arrivals.SumGapUs;
   end;
   O.EndUs := NowUs - FStartUs;
   try
@@ -1444,6 +1534,18 @@ end;
 procedure TAttemptTracker.ExchangeEnded(const AEnd: TExchangeEnd);
 begin
   FArrivals := AEnd.Arrivals;
+  if (AEnd.Error = nil) and (not AEnd.Abandoned) and
+     (InterlockedCompareExchange(FArmed, 0, 0) = 1) and
+     (InterlockedCompareExchange(FInRead, 0, 0) = 1) then
+  begin
+    // a reader is inside the Read that ended the body: let it report what
+    // that Read returned first
+    FHeldEnd := AEnd;
+    InterlockedExchange(FHeld, 1);
+    if InterlockedCompareExchange(FInRead, 0, 0) = 0 then
+      TryFireHeld;
+    Exit;
+  end;
   if InterlockedCompareExchange(FArmed, 0, 0) = 1 then
   begin
     // armed: report with the live exception
@@ -1461,6 +1563,96 @@ begin
   // Arm may have run between the check above and the store: look again
   if InterlockedCompareExchange(FArmed, 0, 0) = 1 then
     TryFireEarly;
+end;
+
+procedure TAttemptTracker.TryFireHeld;
+begin
+  if InterlockedCompareExchange(FHeld, 2, 1) <> 1 then
+    Exit;
+  if InterlockedCompareExchange(FFired, 1, 0) = 0 then
+    Dispatch(nil, False, FHeldEnd.BytesIn, FHeldEnd.BytesOut);
+end;
+
+function TAttemptTracker.WantedKinds: TMessageKinds;
+begin
+  Result := FWanted;
+end;
+
+procedure TAttemptTracker.ReportMessage(const AKind: TMessageKind;
+  const ADirection: TDirection; const AArrivedUs: Int64;
+  const ASize: Integer; const ASse: PSseEvent);
+var
+  M: TMessageInfo;
+  Deliver: Boolean;
+begin
+  Deliver := AKind in FWanted;
+  if Deliver then
+    FillChar(M, SizeOf(M), 0);
+  FProgressLock.Acquire;
+  try
+    if ADirection = mdIn then
+    begin
+      if Deliver then
+      begin
+        M.Index := FInIndex;
+        if FInIndex > 0 then
+          M.SinceLastUs := AArrivedUs - FInLastUs;
+      end;
+      Inc(FInIndex);
+      FInLastUs := AArrivedUs;
+      if AKind in [mkSseEvent, mkWsText, mkWsBinary] then
+        FReaderIn.Note(AArrivedUs);
+    end
+    else
+    begin
+      if Deliver then
+      begin
+        M.Index := FOutIndex;
+        if FOutIndex > 0 then
+          M.SinceLastUs := AArrivedUs - FOutLastUs;
+      end;
+      Inc(FOutIndex);
+      FOutLastUs := AArrivedUs;
+      if AKind in [mkSseEvent, mkWsText, mkWsBinary] then
+        Inc(FReaderOut);
+    end;
+  finally
+    FProgressLock.Release;
+  end;
+  if not Deliver then
+    Exit;
+  M.Kind := AKind;
+  M.Direction := ADirection;
+  M.Size := ASize;
+  M.ArrivedUs := AArrivedUs - FStartUs;
+  if (AKind = mkSseEvent) and (ASse <> nil) then
+  begin
+    M.EventType := ASse^.EventType;
+    M.EventId := ASse^.Id;
+    M.Sse := ASse;
+  end;
+  // outside every lock; the composite guards its members
+  try
+    FMessages.OnMessage(FToken, M);
+  except
+  end;
+end;
+
+procedure TAttemptTracker.ReadBegin;
+begin
+  InterlockedExchange(FInRead, 1);
+end;
+
+procedure TAttemptTracker.ReadEnd;
+begin
+  InterlockedExchange(FInRead, 0);
+  TryFireHeld;
+end;
+
+procedure TAttemptTracker.Finish(const ABytesIn: Int64);
+begin
+  if InterlockedCompareExchange(FFired, 1, 0) = 0 then
+    Dispatch(nil, False, ABytesIn, 0);
 end;
 
 function HttpMethodIsIdempotent(const AToken: string): Boolean;
@@ -1580,6 +1772,9 @@ begin
   Result.FBodyReadTimeoutSet := False;
   Result.FHeaderTimeoutMs := 0;
   Result.FContext := nil;
+  Result.FAttemptKind := akRequest;
+  Result.FStreamId := 0;
+  Result.FReconnect := 0;
 end;
 
 function THttpRequest.GetMethodToken: string;
@@ -1685,6 +1880,20 @@ function THttpRequest.WithContext(const AContext: IInterface): THttpRequest;
 begin
   Result := Self;
   Result.FContext := AContext;
+end;
+
+function THttpRequest.WithAttemptKind(const AKind: TAttemptKind): THttpRequest;
+begin
+  Result := Self;
+  Result.FAttemptKind := AKind;
+end;
+
+function THttpRequest.WithStream(const AStreamId: Int64;
+  const AReconnect: Integer): THttpRequest;
+begin
+  Result := Self;
+  Result.FStreamId := AStreamId;
+  Result.FReconnect := AReconnect;
 end;
 
 function THttpRequest.WithUrl(const AUrl: string): THttpRequest;
@@ -2070,6 +2279,7 @@ begin
   FKeepAlive := AKeepAlive;
   FConnRef := AConnRef;
   FHeaders := ALease.ResponseHeaders;
+  FProgress := ProgressOf(ALease.Exchange);
   ALease.DeferDelivery := True;
   FBody := TGuardedBody.Create(ALease.Body, AConnRef.Lock, ALease);
 end;

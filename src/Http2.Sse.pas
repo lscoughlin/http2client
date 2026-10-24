@@ -23,7 +23,8 @@ interface
 
 uses
   SysUtils, Classes, Generics.Collections,
-  Http2.Errors, Http2.Headers, Http2.Stream, Http2.Messages, Http2.Client;
+  Http2.Errors, Http2.Headers, Http2.Stream, Http2.Messages, Http2.Clock,
+  Http2.RequestObserver, Http2.Client;
 
 const
   /// the media type of an event stream (WHATWG / RFC 9110)
@@ -39,17 +40,10 @@ const
   cSseReadChunkSize = 8192;
 
 type
-  /// one dispatched event (WHATWG "Dispatch the event")
-  TSseEvent = record
-    /// the event type; 'message' when the stream sent no `event:` field
-    EventType: string;
-    /// the data payload, with the single trailing newline removed
-    Data: string;
-    /// the last-event-ID in force at dispatch time ('' when never set)
-    Id: string;
-    /// the `retry:` value in force at dispatch time, in ms (0 = none seen)
-    RetryMs: Integer;
-  end;
+  /// one dispatched event (WHATWG "Dispatch the event"); declared in
+  /// Http2.Messages so a per-message observer callback can point at it
+  TSseEvent = Http2.Messages.TSseEvent;
+  PSseEvent = Http2.Messages.PSseEvent;
 
   /// parses a text/event-stream byte stream into TSseEvent values
   // - pure and incremental: Feed may be called with any chunking, including
@@ -109,10 +103,19 @@ type
   //   chosen when the request is sent (THttpRequest.WithSseReadTimeout, which
   //   SseRequest sets to 0 = wait indefinitely). A constructor parameter
   //   could not change it, because the lease already owns the body stream.
+  // - it counts events for the attempt it belongs to: after each Read it
+  //   takes the arrival stamp of the chunk (IStampedBodyStream), so an event
+  //   is stamped with the chunk that completed it, and reports every event
+  //   through IAttemptProgress (doc/design/request-observability.md "Server-
+  //   Sent Events").  It does not own the lease, so Close ends the attempt
+  //   only by saying it is finished.
   TSseSource = class(TInterfacedObject, IHttpSseSource)
   private
     FResponse: IHttpResponse;    // keeps the response (and lease) alive
     FBody: IHttpBodyStream;
+    FStamped: IStampedBodyStream;   // nil when the body reports no stamps
+    FProgress: IAttemptProgress;    // the null reporter when unobserved
+    FBytesRead: Int64;
     FParser: TSseEventParser;
     FQueue: TQueue<TSseEvent>;
     FBuf: TBytes;
@@ -163,6 +166,7 @@ type
     FClosed: Boolean;
     FLastEventId: string;
     FLastDispatchedId: string;   // replay guard
+    FStreamId: Int64;
     procedure OpenSource;
   public
     constructor Create(const AClient: IHttpClient;
@@ -176,6 +180,9 @@ type
     function RetryMs: Integer;
     /// reconnects performed so far (the first connection is not counted)
     function Reconnects: Integer;
+    /// the id the library gave this loop; every request it sends carries it
+    /// (THttpAttempt.StreamId), with the reconnect count
+    property StreamId: Int64 read FStreamId;
   end;
 
 /// build an SSE GET request: accept, cache-control and identity encoding
@@ -282,6 +289,10 @@ begin
   if Length(B) > 0 then
     Move(B[0], Result[Length(A)], Length(B));
 end;
+
+var
+  /// the last StreamId handed to a reconnect loop (0 means "no stream")
+  GNextStreamId: Int64 = 0;
 
 { TSseEventParser }
 
@@ -578,6 +589,10 @@ begin
   ValidateResponse(AResponse);
   FResponse := AResponse;
   FBody := AResponse.Body;
+  if not Supports(FBody, IStampedBodyStream, FStamped) then
+    FStamped := nil;
+  if not Supports(AResponse, IAttemptProgress, FProgress) then
+    FProgress := NullAttemptProgress;
   FParser := TSseEventParser.Create;
   FQueue := TQueue<TSseEvent>.Create;
   SetLength(FBuf, cSseReadChunkSize);
@@ -595,30 +610,51 @@ var
   N: Integer;
   Chunk: TBytes;
   Events: TList<TSseEvent>;
+  E: TSseEvent;
+  StampUs: Int64;
 begin
   Result := False;
   if FEof then
     Exit;
-  N := FBody.Read(FBuf[0], Length(FBuf));
-  if N > 0 then
-  begin
-    SetLength(Chunk, N);
-    Move(FBuf[0], Chunk[0], N);
-    Events := TList<TSseEvent>.Create;
-    try
-      FParser.Feed(Chunk, Events);
-      while Events.Count > 0 do
-      begin
-        FQueue.Enqueue(Events[0]);
-        Events.Delete(0);
+  // the attempt may end inside this Read (the last bytes of the body); the
+  // bracket makes it wait until the events of this chunk are reported
+  FProgress.ReadBegin;
+  try
+    N := FBody.Read(FBuf[0], Length(FBuf));
+    if N > 0 then
+    begin
+      Inc(FBytesRead, N);
+      // an event takes the stamp of the chunk that completed it; a body that
+      // cannot stamp (a test stub) falls back to the clock at this read
+      if FStamped <> nil then
+        StampUs := FStamped.LastReadArrivedUs
+      else
+        StampUs := NowUs;
+      SetLength(Chunk, N);
+      Move(FBuf[0], Chunk[0], N);
+      Events := TList<TSseEvent>.Create;
+      try
+        FParser.Feed(Chunk, Events);
+        while Events.Count > 0 do
+        begin
+          E := Events[0];
+          Events.Delete(0);
+          // events packed into one chunk share its stamp, so the later ones
+          // report no gap; the count and size stay exact
+          FProgress.ReportMessage(mkSseEvent, mdIn, StampUs, Length(E.Data),
+            @E);
+          FQueue.Enqueue(E);
+        end;
+      finally
+        Events.Free;
       end;
-    finally
-      Events.Free;
-    end;
-    Result := True;
-  end
-  else
-    FEof := True;
+      Result := True;
+    end
+    else
+      FEof := True;
+  finally
+    FProgress.ReadEnd;
+  end;
 end;
 
 function TSseSource.Dequeue(out AEvent: TSseEvent): Boolean;
@@ -661,7 +697,12 @@ end;
 
 procedure TSseSource.Close;
 begin
+  if FClosed then
+    Exit;
   FClosed := True;
+  // a deliberate stop is a clean end of the attempt, not an abandoned one;
+  // a stream that already ended makes this a no-op
+  FProgress.Finish(FBytesRead);
 end;
 
 { TSseReconnectLoop }
@@ -682,6 +723,7 @@ begin
   FClosed := False;
   FLastEventId := '';
   FLastDispatchedId := '';
+  FStreamId := InterlockedIncrement64(GNextStreamId);
 end;
 
 destructor TSseReconnectLoop.Destroy;
@@ -701,7 +743,9 @@ var
 begin
   // clone: THttpRequest.Headers is a shared interface, so adding the resume
   // header to a plain copy would mutate the caller's request too
-  Req := FRequest.Clone;
+  // the context travels with the clone; the identity is stamped per connection
+  Req := FRequest.Clone.WithAttemptKind(akSse).WithStream(FStreamId,
+    FReconnects);
   if FLastEventId <> '' then
     Req := Req.WithHeader(HeaderLastEventId, FLastEventId);
   Resp := FClient.Send(Req);
@@ -795,6 +839,7 @@ begin
     .WithHeader(HeaderAccept, cSseContentType)
     .WithHeader(HeaderCacheControl, 'no-store')
     .WithAcceptEncoding('identity')
+    .WithAttemptKind(akSse)
     // an event stream is idle between events: wait indefinitely rather than
     // inherit the request header timeout (doc/design/server-sent-events.md)
     .WithSseReadTimeout(0);

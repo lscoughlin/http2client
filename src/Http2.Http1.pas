@@ -24,7 +24,7 @@ interface
 uses
   SysUtils, Classes, Generics.Collections,
   Http2.Errors, Http2.Headers, Http2.Tls, Http2.Stream, Http2.Messages,
-  Http2.Clock;
+  Http2.Clock, Http2.RequestObserver;
 
 const
   /// ceiling for the whole response head (status line + all header fields),
@@ -142,7 +142,7 @@ type
   /// Pseudo-headers do not exist in HTTP/1.1, so Headers carries every regular
   /// field except the connection-specific ones (Connection, Transfer-Encoding,
   /// Keep-Alive, Upgrade, Proxy-Connection), which are transport metadata.
-  THttp1Response = class(TInterfacedObject, IHttpResponse)
+  THttp1Response = class(TInterfacedObject, IHttpResponse, IAttemptProgress)
   private
     FVersion: string;
     FReason: string;
@@ -150,6 +150,7 @@ type
     FHeaders: IHttpHeaders;
     FBody: IHttpBodyStream;
     FStream: THttp1BodyStream;   // weak: FBody holds it
+    FProgress: IAttemptProgress;
   public
     constructor Create(const AVersion: string; const AStatusCode: LongInt;
       const AReason: string; const AHeaders: IHttpHeaders;
@@ -157,9 +158,14 @@ type
     destructor Destroy; override;
     /// let the response report an abandoned body when it is released
     procedure BindStream(const AStream: THttp1BodyStream);
+    /// let a reader of the body report its messages to the attempt AExchange
+    /// belongs to (nil leaves the null reporter)
+    procedure BindProgress(const AExchange: IExchangeObserver);
     function GetStatusCode: LongInt;
     function GetHeaders: IHttpHeaders;
     function GetBody: IHttpBodyStream;
+    property Progress: IAttemptProgress read FProgress
+      implements IAttemptProgress;
     property Version: string read FVersion;
     property Reason: string read FReason;
   end;
@@ -773,6 +779,11 @@ begin
   FStream := AStream;
 end;
 
+procedure THttp1Response.BindProgress(const AExchange: IExchangeObserver);
+begin
+  FProgress := ProgressOf(AExchange);
+end;
+
 constructor THttp1Response.Create(const AVersion: string;
   const AStatusCode: LongInt; const AReason: string;
   const AHeaders: IHttpHeaders; const ABody: IHttpBodyStream);
@@ -783,6 +794,7 @@ begin
   FReason := AReason;
   FHeaders := AHeaders;
   FBody := ABody;
+  FProgress := NullAttemptProgress;
 end;
 
 function THttp1Response.GetStatusCode: LongInt;
@@ -1243,6 +1255,7 @@ begin
   Resp := THttp1Response.Create(FVersion, FStatusCode, FReason, Headers,
     Body);
   Resp.BindStream(Body);
+  Resp.BindProgress(FSendRequest.Exchange);
   Result := Resp;
 end;
 

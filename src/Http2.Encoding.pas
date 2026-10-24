@@ -18,7 +18,7 @@ interface
 
 uses
   SysUtils, Classes,
-  Http2.Headers, Http2.Messages, Http2.Stream, zstream;
+  Http2.Headers, Http2.Messages, Http2.Stream, Http2.RequestObserver, zstream;
 
 type
   /// the content codings this client understands
@@ -111,9 +111,13 @@ type
   end;
 
   /// the response wrapper that decodes a body
-  TDecodingResponse = class(TInterfacedObject, IHttpResponse)
+  // - it forwards IAttemptProgress from the response it wraps, so
+  //   Supports(Response, IAttemptProgress) finds the attempt either way
+  TDecodingResponse = class(TInterfacedObject, IHttpResponse,
+    IAttemptProgress)
   private
     FAccessories: IHttpResponse;
+    FProgress: IAttemptProgress;
     FHeaders: IHttpHeaders;
     FBody: IHttpBodyStream;
     function GetStatusCode: LongInt;
@@ -122,6 +126,8 @@ type
   public
     constructor Create(const AResponse: IHttpResponse;
       const ACoding: TContentEncoding);
+    property Progress: IAttemptProgress read FProgress
+      implements IAttemptProgress;
   end;
 
 { helpers }
@@ -531,6 +537,8 @@ constructor TDecodingResponse.Create(const AResponse: IHttpResponse;
 begin
   inherited Create;
   FAccessories := AResponse;
+  if not Supports(AResponse, IAttemptProgress, FProgress) then
+    FProgress := NullAttemptProgress;
   FHeaders := AResponse.Headers;
   FBody := TDecodingBodyStream.Create(AResponse.Body, ACoding);
 end;

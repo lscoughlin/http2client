@@ -32,6 +32,21 @@ type
     property Body: IHttpBodyStream read GetBody;
   end;
 
+  /// one dispatched Server-Sent Event (WHATWG "Dispatch the event")
+  // - declared here, below the observer seam, so a per-message callback can
+  //   carry a pointer to it; Http2.Sse re-exports it under the same name.
+  TSseEvent = record
+    /// the event type; 'message' when the stream sent no `event:` field
+    EventType: string;
+    /// the data payload, with the single trailing newline removed
+    Data: string;
+    /// the last-event-ID in force at dispatch time ('' when never set)
+    Id: string;
+    /// the `retry:` value in force at dispatch time, in ms (0 = none seen)
+    RetryMs: Integer;
+  end;
+  PSseEvent = ^TSseEvent;
+
   /// bridges a response body into a value of T (doc/design/messages.md)
   IResponseReader<T> = interface
     function Read(const AResponse: IHttpResponse): T;
