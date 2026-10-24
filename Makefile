@@ -12,6 +12,7 @@
 #   make validate-websocket  opt-in live WebSocket gate against tools/validate/ws_servers.py
 #   make validate-websocket-autobahn  Autobahn|Testsuite client run (needs Docker)
 #   make validate-cleartext  opt-in live gate: cleartext requests are sent once
+#   make measure-observer  opt-in observer overhead measurement on loopback
 #   make clean    remove build outputs
 
 FPC        ?= fpc
@@ -26,10 +27,12 @@ export OPENSSL_LIBPATH
 FPCFLAGS   += -Fu$(MORMOT)/core -Fu$(MORMOT)/lib -Fu$(MORMOT)/net -Fu$(MORMOT)/crypt
 SRC        = $(wildcard src/*.pas)
 TESTSRC    = $(wildcard test/*.pas)
-EXAMPLESRC = $(wildcard examples/*.pas)
+# the observer adapters are units shared by the examples and the tests, not programs
+EXAMPLEUNITS = examples/observer_tracing.pas examples/observer_metrics.pas examples/observer_logging.pas
+EXAMPLESRC = $(filter-out $(EXAMPLEUNITS),$(wildcard examples/*.pas))
 BIN        = bin
 
-.PHONY: all test examples clean validate-interop validate-harness validate-sse validate-proxy validate-websocket validate-websocket-autobahn validate-cleartext validate
+.PHONY: all test examples measure-observer clean validate-interop validate-harness validate-sse validate-proxy validate-websocket validate-websocket-autobahn validate-cleartext validate
 
 all: $(BIN)/libhttp2.a
 
@@ -40,12 +43,22 @@ $(BIN):
 	mkdir -p $(BIN)
 
 test: all | $(BIN)
-	$(FPC) $(FPCFLAGS) -Fu./test -FE$(BIN) test/Http2.RunTests.pas
+	$(FPC) $(FPCFLAGS) -Fu./test -Fu./examples -FE$(BIN) test/Http2.RunTests.pas
 	$(BIN)/Http2.RunTests --all --format=plain --sparse
 
-# Compile the example programs (smoke build; they are not executed here).
+# Compile the example programs (smoke build; they are not executed here).  The
+# adapter units in examples/ are compiled as part of the programs that use them.
 examples: all | $(BIN)
-	for f in $(EXAMPLESRC); do $(FPC) $(FPCFLAGS) -FE$(BIN) $$f || exit 1; done
+	for f in $(EXAMPLESRC); do $(FPC) $(FPCFLAGS) -Fu./examples -FE$(BIN) $$f || exit 1; done
+	for f in $(EXAMPLEUNITS); do $(FPC) $(FPCFLAGS) -Fu./examples -FE$(BIN) $$f || exit 1; done
+
+# Opt-in observer overhead measurement (doc/verification/observer-overhead.md):
+# a loopback request with no observer, with the tracing, metrics and logging
+# adapters, and with the per-event gate on.  It starts its own loopback server;
+# it is not part of `make test`.
+measure-observer: all | $(BIN)
+	$(FPC) $(FPCFLAGS) -Fu./examples -FE$(BIN) examples/observer_overhead.pas
+	$(BIN)/observer_overhead
 
 clean:
 	rm -rf $(BIN) src/*.o src/*.ppu test/*.o test/*.ppu examples/*.o examples/*.ppu
