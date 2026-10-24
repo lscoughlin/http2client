@@ -519,6 +519,32 @@ type
     function GetKey: Pointer;
   end;
 
+  /// one pooled connection in a pool snapshot (doc/design/request-observability.md
+  /// "Pull-based pool statistics").  A value: it points at nothing in the pool.
+  TConnectionStats = record
+    Protocol: TNegotiatedProtocol;
+    State: TConnectionState;
+    AgeMs, IdleMs: Int64;
+    ActiveStreams: Integer;
+    /// the peer's settings; 0 for HTTP/1.1
+    PeerMaxConcurrentStreams: LongWord;
+    PeerInitialWindowSize: LongWord;
+    PeerMaxFrameSize: LongWord;
+  end;
+
+  /// one pool key in a snapshot: the origin, including the proxy route
+  TOriginStats = record
+    Origin: string;
+    Connections, IdleConnections, ActiveStreams, PendingAcquires: Integer;
+    Details: TArray<TConnectionStats>;
+  end;
+
+  /// a point-in-time copy of the pool's counts, taken under the pool lock
+  TPoolStats = record
+    Connections, IdleConnections, ActiveStreams, PendingAcquires: Integer;
+    PerOrigin: TArray<TOriginStats>;
+  end;
+
   /// the connection pool (doc/design/client-api.md "Lease acquisition"):
   /// a TDictionary<string,TList<IPooledConnection>> guarded by a critical
   /// section, with a per-origin connection cap (MaxConnectionsPerHost), a
@@ -543,6 +569,10 @@ type
     FClearTextPolicy: TClearTextPolicy;
     /// last time a pooled connection was used, keyed by IPooledConnection.Key
     FIdleSince: TDictionary<Pointer, QWord>;
+    /// when a pooled connection was registered, keyed like FIdleSince
+    FCreatedAt: TDictionary<Pointer, QWord>;
+    /// callers parked in Acquire waiting for a slot, per origin key
+    FPending: TDictionary<string, Integer>;
     /// the TCP+TLS-or-cleartext dial for ARequest's scheme (fallback on https,
     /// the policy on http); out AProtocol names the negotiated wire protocol.
     /// Uses the extended ICleartextSocketFactory contract when the factory
@@ -584,6 +614,8 @@ type
     procedure ReapClosed;
     procedure ReapIdleLocked;
     procedure MarkUsed(const C: IPooledConnection);
+    /// adjust the parked-caller count for AOrigin; the caller holds FLock
+    procedure AddPendingLocked(const AOrigin: string; const ADelta: Integer);
     function ListFor(const AOrigin: string): TList<IPooledConnection>;
     function PickEligible(const AOrigin: string): IPooledConnection;
     /// can a new connection be opened for AOrigin? False when the origin is
@@ -613,6 +645,8 @@ type
     /// the pool stays within MaxTotalConnections (plan S10 task 10.7).
     procedure ReapIdle;
     procedure Close;
+    /// a snapshot of the counts, copied under FLock and returned by value
+    function Stats: TPoolStats;
     // test seams
     function ConnectionCount: Integer;
     function ConnectionCountForOrigin(const AOrigin: string): Integer;
@@ -654,6 +688,9 @@ type
     function Send(const ARequest: THttpRequest): IHttpResponse; overload;
     function Send(const ARequest: IWebSocketRequest): IWebSocket; overload;
     procedure Close;
+    /// a snapshot of the connection pool for polling gauges; all zeros once the
+    /// client is closed.  Safe from any thread.
+    function PoolStats: TPoolStats;
     /// the pool (test seam)
     property Pool: TConnectionPool read FPool;
   end;
@@ -2217,6 +2254,8 @@ begin
   FLock := TCriticalSection.Create;
   FByOrigin := TDictionary<string, TList<IPooledConnection>>.Create;
   FIdleSince := TDictionary<Pointer, QWord>.Create;
+  FCreatedAt := TDictionary<Pointer, QWord>.Create;
+  FPending := TDictionary<string, Integer>.Create;
   FFactory := AFactory;
   FObserver := AObserver;
   FMaxConnectionsPerHost := AMaxConnectionsPerHost;
@@ -2236,6 +2275,7 @@ procedure TConnectionPool.Register(const AOrigin: string;
 begin
   ListFor(AOrigin).Add(AConn);
   Inc(FTotalConnections);
+  FCreatedAt.AddOrSetValue(AConn.Key, GetTickCount64);
   MarkUsed(AConn);
 end;
 
@@ -2248,6 +2288,8 @@ begin
     L.Free;
   FByOrigin.Free;
   FIdleSince.Free;
+  FCreatedAt.Free;
+  FPending.Free;
   FLock.Free;
   inherited Destroy;
 end;
@@ -2268,6 +2310,7 @@ begin
       if C.Closed and (C.ActiveStreams = 0) then
       begin
         FIdleSince.Remove(C.Key);
+        FCreatedAt.Remove(C.Key);
         L.Delete(I);
         Dec(FTotalConnections);
       end;
@@ -2278,6 +2321,20 @@ end;
 procedure TConnectionPool.MarkUsed(const C: IPooledConnection);
 begin
   FIdleSince.AddOrSetValue(C.Key, GetTickCount64);
+end;
+
+procedure TConnectionPool.AddPendingLocked(const AOrigin: string;
+  const ADelta: Integer);
+var
+  N: Integer;
+begin
+  if not FPending.TryGetValue(AOrigin, N) then
+    N := 0;
+  Inc(N, ADelta);
+  if N > 0 then
+    FPending.AddOrSetValue(AOrigin, N)
+  else
+    FPending.Remove(AOrigin);
 end;
 
 procedure TConnectionPool.ReapIdle;
@@ -2316,6 +2373,7 @@ begin
         Continue;
       C.Drain;                       // closes now, since it is idle
       FIdleSince.Remove(C.Key);
+      FCreatedAt.Remove(C.Key);
       L.Delete(I);
       Dec(FTotalConnections);
     end;
@@ -2574,85 +2632,112 @@ var
   Acquired, Upgraded: Boolean;
   Sliced: Integer;
   First: IHttpResponse;
+  Waiting: Boolean;
 begin
   Deadline := GetTickCount64 + QWord(AHeaderTimeoutMs);
-  while True do
-  begin
-    if (AToken <> nil) and AToken.IsCancelled then
-      raise EHttpStreamError.Create('request cancelled', 0, ecCancel);
-    Upgraded := False;
-    First := nil;
-    FLock.Acquire;
-    try
-      ReapClosed;
-      ReapIdleLocked;
-      Conn := PickEligible(AOrigin);
-      if (Conn = nil) and CanOpenNew(AOrigin) then
-      begin
-        // the one transport-selection point: TLS vs cleartext and the HTTP/2
-        // vs HTTP/1.1 codec (doc/design/fallback.md "Negotiation")
-        OpenForTxn(AOrigin, AHost, APort, ARequest, AHeaderTimeoutMs,
-          ARequest.Scheme, AProxy, Conn, Upgraded, First);
-      end;
-    finally
-      FLock.Release;
-    end;
-
-    if First <> nil then
+  Waiting := False;
+  try
+    while True do
     begin
-      // a declined h2c upgrade: the probe carried the request, so its
-      // response is the answer and the request is not written again
-      Result := First;
-      Exit;
-    end;
-
-    if Upgraded then
-    begin
-      // h2c upgrade: the 101 switch already happened inside the handshake, so
-      // adopt stream 1 and wait for its response (RFC 7540 section 3.2: the
-      // request is never re-sent).  FLock is released so a slow stream-1
-      // response never blocks other origins.
-      Result := (Conn as THttpConnection).AcquireUpgraded(ARequest,
-        AHeaderTimeoutMs);
-      Exit;
-    end;
-
-    if Conn <> nil then
-    begin
-      // an HTTP/1.1 pooled connection has no cancellable path (one request in
-      // flight, no RST_STREAM); Acquire either returns at once or raises
-      if (AToken <> nil) and (Conn.Conn <> nil) then
-      begin
-        Sliced := AHeaderTimeoutMs;
-        if Sliced <= 0 then
-          Sliced := cDefaultHeaderTimeoutMs;
-        Result := (Conn as THttpConnection).AcquireCancellable(ARequest,
-          Sliced, AToken, Acquired);
-      end
-      else
-        Result := Conn.Acquire(ARequest, AHeaderTimeoutMs, Acquired);
-      if Acquired then
-      begin
-        FLock.Acquire;
-        try
-          MarkUsed(Conn);
-        finally
-          FLock.Release;
+      if (AToken <> nil) and AToken.IsCancelled then
+        raise EHttpStreamError.Create('request cancelled', 0, ecCancel);
+      Upgraded := False;
+      First := nil;
+      FLock.Acquire;
+      try
+        ReapClosed;
+        ReapIdleLocked;
+        Conn := PickEligible(AOrigin);
+        if (Conn = nil) and CanOpenNew(AOrigin) then
+        begin
+          // the one transport-selection point: TLS vs cleartext and the HTTP/2
+          // vs HTTP/1.1 codec (doc/design/fallback.md "Negotiation")
+          OpenForTxn(AOrigin, AHost, APort, ARequest, AHeaderTimeoutMs,
+            ARequest.Scheme, AProxy, Conn, Upgraded, First);
         end;
+        // a caller with no connection and no answer parks below: count it so
+        // PoolStats can report the queue
+        if (Conn <> nil) or (First <> nil) then
+        begin
+          if Waiting then
+            AddPendingLocked(AOrigin, -1);
+          Waiting := False;
+        end
+        else if not Waiting then
+        begin
+          AddPendingLocked(AOrigin, 1);
+          Waiting := True;
+        end;
+      finally
+        FLock.Release;
+      end;
+
+      if First <> nil then
+      begin
+        // a declined h2c upgrade: the probe carried the request, so its
+        // response is the answer and the request is not written again
+        Result := First;
         Exit;
       end;
-      // the connection filled up between selection and registration; retry
-      Sleep(1);
-    end
-    else
+
+      if Upgraded then
+      begin
+        // h2c upgrade: the 101 switch already happened inside the handshake, so
+        // adopt stream 1 and wait for its response (RFC 7540 section 3.2: the
+        // request is never re-sent).  FLock is released so a slow stream-1
+        // response never blocks other origins.
+        Result := (Conn as THttpConnection).AcquireUpgraded(ARequest,
+          AHeaderTimeoutMs);
+        Exit;
+      end;
+
+      if Conn <> nil then
+      begin
+        // an HTTP/1.1 pooled connection has no cancellable path (one request in
+        // flight, no RST_STREAM); Acquire either returns at once or raises
+        if (AToken <> nil) and (Conn.Conn <> nil) then
+        begin
+          Sliced := AHeaderTimeoutMs;
+          if Sliced <= 0 then
+            Sliced := cDefaultHeaderTimeoutMs;
+          Result := (Conn as THttpConnection).AcquireCancellable(ARequest,
+            Sliced, AToken, Acquired);
+        end
+        else
+          Result := Conn.Acquire(ARequest, AHeaderTimeoutMs, Acquired);
+        if Acquired then
+        begin
+          FLock.Acquire;
+          try
+            MarkUsed(Conn);
+          finally
+            FLock.Release;
+          end;
+          Exit;
+        end;
+        // the connection filled up between selection and registration; retry
+        Sleep(1);
+      end
+      else
+      begin
+        if FClosed then
+          raise EHttpConnectionClosed.Create('client is closed');
+        if GetTickCount64 >= Deadline then
+          raise EHttpTimeout.Create(
+            'timed out waiting for a connection slot ' +
+            '(MaxConnectionsPerHost or MaxTotalConnections reached)');
+        Sleep(2);
+      end;
+    end;
+  finally
+    if Waiting then
     begin
-      if FClosed then
-        raise EHttpConnectionClosed.Create('client is closed');
-      if GetTickCount64 >= Deadline then
-        raise EHttpTimeout.Create(
-          'timed out waiting for a connection slot ' +
-          '(MaxConnectionsPerHost or MaxTotalConnections reached)');
-      Sleep(2);
+      FLock.Acquire;
+      try
+        AddPendingLocked(AOrigin, -1);
+      finally
+        FLock.Release;
+      end;
     end;
   end;
 end;
@@ -2676,6 +2761,110 @@ begin
     end;
   finally
     FLock.Release;
+  end;
+end;
+
+function TConnectionPool.Stats: TPoolStats;
+var
+  Origin: string;
+  L: TList<IPooledConnection>;
+  C: IPooledConnection;
+  O: TOriginStats;
+  D: TConnectionStats;
+  Peer: TConnectionSettings;
+  Now, T: QWord;
+  Pending, I, J: Integer;
+  Tmp: TOriginStats;
+
+  procedure AddOrigin;
+  begin
+    Inc(Result.Connections, O.Connections);
+    Inc(Result.IdleConnections, O.IdleConnections);
+    Inc(Result.ActiveStreams, O.ActiveStreams);
+    Inc(Result.PendingAcquires, O.PendingAcquires);
+    SetLength(Result.PerOrigin, Length(Result.PerOrigin) + 1);
+    Result.PerOrigin[High(Result.PerOrigin)] := O;
+  end;
+
+begin
+  Result := Default(TPoolStats);
+  FLock.Acquire;
+  try
+    Now := GetTickCount64;
+    for Origin in FByOrigin.Keys do
+    begin
+      L := FByOrigin[Origin];
+      if not FPending.TryGetValue(Origin, Pending) then
+        Pending := 0;
+      if (L.Count = 0) and (Pending = 0) then
+        Continue;
+      O := Default(TOriginStats);
+      O.Origin := Origin;
+      O.PendingAcquires := Pending;
+      SetLength(O.Details, L.Count);
+      for I := 0 to L.Count - 1 do
+      begin
+        C := L[I];
+        D := Default(TConnectionStats);
+        D.ActiveStreams := C.ActiveStreams;
+        if C.Conn <> nil then
+        begin
+          if Pos('http://', Origin) = 1 then
+            D.Protocol := npHttp2Cleartext
+          else
+            D.Protocol := npHttp2Tls;
+          D.State := C.Conn.State;
+          Peer := C.Conn.PeerSettings;
+          D.PeerMaxConcurrentStreams := Peer.MaxConcurrentStreams;
+          D.PeerInitialWindowSize := Peer.InitialWindowSize;
+          D.PeerMaxFrameSize := Peer.MaxFrameSize;
+        end
+        else
+        begin
+          if Pos('http://', Origin) = 1 then
+            D.Protocol := npHttp1Cleartext
+          else
+            D.Protocol := npHttp1Tls;
+          if C.Closed then
+            D.State := csClosed
+          else
+            D.State := csOpen;
+        end;
+        if FCreatedAt.TryGetValue(C.Key, T) then
+          D.AgeMs := Int64(Now - T);
+        if (D.ActiveStreams = 0) and FIdleSince.TryGetValue(C.Key, T) then
+          D.IdleMs := Int64(Now - T);
+        O.Details[I] := D;
+        Inc(O.Connections);
+        Inc(O.ActiveStreams, D.ActiveStreams);
+        if (D.ActiveStreams = 0) and (D.State <> csClosed) then
+          Inc(O.IdleConnections);
+      end;
+      AddOrigin;
+    end;
+    // a caller can be parked on an origin that holds no list yet
+    for Origin in FPending.Keys do
+      if not FByOrigin.ContainsKey(Origin) then
+      begin
+        O := Default(TOriginStats);
+        O.Origin := Origin;
+        O.PendingAcquires := FPending[Origin];
+        AddOrigin;
+      end;
+  finally
+    FLock.Release;
+  end;
+  // a stable order for the caller (insertion sort: a handful of origins)
+  for I := 1 to High(Result.PerOrigin) do
+  begin
+    Tmp := Result.PerOrigin[I];
+    J := I - 1;
+    while (J >= 0) and (Result.PerOrigin[J].Origin > Tmp.Origin) do
+    begin
+      Result.PerOrigin[J + 1] := Result.PerOrigin[J];
+      Dec(J);
+    end;
+    Result.PerOrigin[J + 1] := Tmp;
   end;
 end;
 
@@ -2743,6 +2932,7 @@ begin
   try
     ListFor(AOrigin).Add(AConn);
     Inc(FTotalConnections);
+    FCreatedAt.AddOrSetValue(AConn.Key, GetTickCount64);
   finally
     FLock.Release;
   end;
@@ -2782,6 +2972,21 @@ begin
   FPool.Free;
   FLock.Free;
   inherited Destroy;
+end;
+
+function THttpClient.PoolStats: TPoolStats;
+var
+  IsClosed: Boolean;
+begin
+  FLock.Acquire;
+  try
+    IsClosed := FClosed;
+  finally
+    FLock.Release;
+  end;
+  if IsClosed then
+    Exit(Default(TPoolStats));
+  Result := FPool.Stats;
 end;
 
 function THttpClient.Send(const ARequest: THttpRequest): IHttpResponse;
