@@ -51,6 +51,8 @@ type
     function ReadFrame: TWsFrame;
     function TryReadFrame(out F: TWsFrame): Boolean;
     procedure CloseConnection;
+    /// wake a script thread still blocked in accept
+    procedure ShutdownListener;
   end;
 
   /// records listener events; waits are bounded
@@ -352,6 +354,12 @@ begin
     fpclose(FFd);
     FFd := -1;
   end;
+end;
+
+procedure TWsTestServer.ShutdownListener;
+begin
+  if FListenFd >= 0 then
+    fpshutdown(FListenFd, SHUT_RDWR);
 end;
 
 { TRecorder }

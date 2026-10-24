@@ -23,6 +23,7 @@ uses
   Http2.ProbeOutcome.Test, Http2.ClearText.Test, Http2.Http1.Test,
   Http2.Encoding.Test, Http2.Sse.Test, Http2.Proxy.Test, Http2.Socks.Test, Http2.ProxyTransport.Test, Http2.ProxyClient.Test, Http2.ProxyLive.Test,
   Http2.WebSocket.Test, Http2.WebSocketClient.Test, Http2.WebSocketLive.Test,
+  Http2.WebSocketObservability.Test,
   Http2.PoolStats.Test, Http2.RequestObserver.Test;
 
 type
