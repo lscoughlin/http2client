@@ -1236,6 +1236,20 @@ end;
 
 
 type
+  /// the header sink over the headers of one WebSocket handshake: it starts
+  /// as the request's own list and keeps what the observers inject
+  // - the names the handshake owns are refused the way
+  //   IWebSocketRequest.WithHeader refuses them
+  TWsHandshakeSink = class(TInterfacedObject, IHeaderSink)
+  private
+    FFields: TArray<TWsHeaderField>;
+  public
+    constructor Create(const AFields: TArray<TWsHeaderField>);
+    procedure SetValue(const AName, AValue: string);
+    function GetFirst(const AName: string): string;
+    function Fields: TArray<TWsHeaderField>;
+  end;
+
   /// follows one observed attempt from OnAttemptStart to OnAttemptEnd
   // - the codecs report the end of the exchange through IExchangeObserver
   //   from whichever thread finishes the body or releases the response; Send
@@ -1250,8 +1264,11 @@ type
   //   the Read that returns the last bytes, a reader brackets its reads with
   //   ReadBegin and ReadEnd and the end is held until ReadEnd, so the last
   //   messages are counted before OnAttemptEnd.
+  // - a WebSocket session is one attempt too: the connection reports through
+  //   IWebSocketAttempt (the handshake and the end) and IAttemptProgress (each
+  //   message), and the end takes the same latch as every other end
   TAttemptTracker = class(TInterfacedObject, IExchangeObserver,
-    IAttemptProgress)
+    IAttemptProgress, IWebSocketAttempt)
   private
     FObserver: IHttpClientObserver;
     FToken: IInterface;
@@ -1287,10 +1304,19 @@ type
     FInRead: LongInt;
     FHeld: LongInt;            // 0 none, 1 held, 2 claimed
     FHeldEnd: TExchangeEnd;
+    // WebSocket: written by the thread that wins the end latch, or before
+    // the reader thread exists
+    FSink: TWsHandshakeSink;   // weak: FSinkRef holds it
+    FSinkRef: IHeaderSink;
+    FSubprotocol: string;
+    FWsClosedBy: TCloseInitiator;
+    FWsCloseCode: Integer;
+    FWsCloseReason: string;
     procedure TryFireHeld;
     procedure Dispatch(const AError: Exception; const AAbandoned: Boolean;
       const ABytesIn, ABytesOut: Int64);
     procedure TryFireEarly;
+    procedure BeginAttempt(const A: THttpAttempt);
   public
     constructor Create(const AObserver: IHttpClientObserver);
     destructor Destroy; override;
@@ -1298,6 +1324,12 @@ type
     /// run OnAttemptStart
     procedure Start(const ARequest: THttpRequest; const AHop,
       ARetry: Integer);
+    /// the same for a WebSocket request, before it dials
+    procedure StartSocket(const ARequest: IWebSocketRequest; const AHost: string;
+      const APort: Word; const ASecure: Boolean);
+    /// a WebSocket attempt failed before the session opened: end it with
+    /// AError and, for a refused handshake, the status the server answered
+    procedure FailHandshake(const AError: Exception);
     procedure GotResponse(const AResponse: IHttpResponse);
     procedure NotifyRedirect(const AFromUrl, AToUrl: string;
       const AStatus: LongInt);
@@ -1322,7 +1354,60 @@ type
     procedure ReadBegin;
     procedure ReadEnd;
     procedure Finish(const ABytesIn: Int64);
+    // IWebSocketAttempt
+    function HandshakeHeaders: TArray<TWsHeaderField>;
+    procedure HandshakeWritten;
+    procedure HandshakeAccepted(const AStatus: Integer;
+      const AFields: TArray<TWsHeaderField>; const ASubprotocol: string);
+    procedure SessionEnded(const AEnd: TWsSessionEnd);
   end;
+
+{ TWsHandshakeSink }
+
+constructor TWsHandshakeSink.Create(const AFields: TArray<TWsHeaderField>);
+begin
+  inherited Create;
+  FFields := Copy(AFields);
+end;
+
+procedure TWsHandshakeSink.SetValue(const AName, AValue: string);
+var
+  I, N: Integer;
+begin
+  if not WsIsHttpToken(AName) then
+    raise EHttpWebSocketError.CreateFmt('"%s" is not a header name', [AName]);
+  if WsIsRestrictedHeader(AName) then
+    raise EHttpWebSocketError.CreateFmt(
+      'header "%s" is set by the handshake and cannot be supplied', [AName]);
+  if (Pos(#13, AValue) > 0) or (Pos(#10, AValue) > 0) then
+    raise EHttpWebSocketError.Create('a header value cannot contain a line break');
+  // replace every value: drop the old ones, then append the new one
+  N := 0;
+  for I := 0 to High(FFields) do
+    if not SameText(FFields[I].Name, AName) then
+    begin
+      FFields[N] := FFields[I];
+      Inc(N);
+    end;
+  SetLength(FFields, N + 1);
+  FFields[N].Name := AName;
+  FFields[N].Value := AValue;
+end;
+
+function TWsHandshakeSink.GetFirst(const AName: string): string;
+var
+  I: Integer;
+begin
+  for I := 0 to High(FFields) do
+    if SameText(FFields[I].Name, AName) then
+      Exit(FFields[I].Value);
+  Result := '';
+end;
+
+function TWsHandshakeSink.Fields: TArray<TWsHeaderField>;
+begin
+  Result := Copy(FFields);
+end;
 
 constructor TAttemptTracker.Create(const AObserver: IHttpClientObserver);
 begin
@@ -1343,7 +1428,6 @@ procedure TAttemptTracker.Start(const ARequest: THttpRequest; const AHop,
 var
   A: THttpAttempt;
   Path: string;
-  Gate: IHttpMessageGate;
 begin
   FCancelToken := ARequest.CancelToken;
   A.Kind := ARequest.AttemptKind;
@@ -1362,6 +1446,41 @@ begin
   A.Reconnect := ARequest.Reconnect;
   A.Context := ARequest.Context;
   A.Headers := THeaderSink.Create(ARequest.Headers);
+  BeginAttempt(A);
+end;
+
+procedure TAttemptTracker.StartSocket(const ARequest: IWebSocketRequest;
+  const AHost: string; const APort: Word; const ASecure: Boolean);
+var
+  A: THttpAttempt;
+begin
+  FSink := TWsHandshakeSink.Create(ARequest.Headers);
+  FSinkRef := FSink;
+  // a WebSocket is on its own HTTP/1.1 connection, never a pooled one
+  if ASecure then
+    FProtocol := npHttp1Tls
+  else
+    FProtocol := npHttp1Cleartext;
+  FReused := False;
+  FCancelToken := nil;
+  A.Kind := akWebSocket;
+  A.Method := 'GET';
+  A.Url := ARequest.Url;
+  A.Host := AHost;
+  A.Port := APort;
+  A.Hop := 0;
+  A.Retry := 0;
+  A.StreamId := 0;
+  A.Reconnect := 0;
+  A.Context := ARequest.Context;
+  A.Headers := FSinkRef;
+  BeginAttempt(A);
+end;
+
+procedure TAttemptTracker.BeginAttempt(const A: THttpAttempt);
+var
+  Gate: IHttpMessageGate;
+begin
   try
     FToken := FObserver.OnAttemptStart(A);
   except
@@ -1420,8 +1539,10 @@ var
   Arrivals: TArrivalStats;
 begin
   FillChar(O, SizeOf(O), 0);
-  O.Subprotocol := '';
-  O.CloseReason := '';
+  O.Subprotocol := FSubprotocol;
+  O.ClosedBy := FWsClosedBy;
+  O.CloseCode := FWsCloseCode;
+  O.CloseReason := FWsCloseReason;
   O.StatusCode := FStatus;
   O.Protocol := FProtocol;
   O.ConnectionReused := FReused;
@@ -1585,6 +1706,10 @@ var
   M: TMessageInfo;
   Deliver: Boolean;
 begin
+  // a message that a reader on another thread reports as the attempt ends is
+  // not delivered: OnMessage never follows OnAttemptEnd
+  if InterlockedCompareExchange(FFired, 0, 0) <> 0 then
+    Exit;
   Deliver := AKind in FWanted;
   if Deliver then
     FillChar(M, SizeOf(M), 0);
@@ -1612,7 +1737,11 @@ begin
           M.SinceLastUs := AArrivedUs - FOutLastUs;
       end;
       Inc(FOutIndex);
-      FOutLastUs := AArrivedUs;
+      // senders on several threads may report slightly out of order
+      if (Deliver) and (M.SinceLastUs < 0) then
+        M.SinceLastUs := 0;
+      if AArrivedUs > FOutLastUs then
+        FOutLastUs := AArrivedUs;
       if AKind in [mkSseEvent, mkWsText, mkWsBinary] then
         Inc(FReaderOut);
     end;
@@ -1653,6 +1782,59 @@ procedure TAttemptTracker.Finish(const ABytesIn: Int64);
 begin
   if InterlockedCompareExchange(FFired, 1, 0) = 0 then
     Dispatch(nil, False, ABytesIn, 0);
+end;
+
+procedure TAttemptTracker.FailHandshake(const AError: Exception);
+begin
+  if InterlockedCompareExchange(FFired, 1, 0) <> 0 then
+    Exit;
+  // a refusal carries the status the server answered; no response headers
+  // are reported for it
+  if AError is EHttpWebSocketHandshakeError then
+    FStatus := EHttpWebSocketHandshakeError(AError).StatusCode;
+  FWsClosedBy := ciError;
+  Dispatch(AError, False, 0, 0);
+end;
+
+function TAttemptTracker.HandshakeHeaders: TArray<TWsHeaderField>;
+begin
+  if FSink <> nil then
+    Result := FSink.Fields
+  else
+    Result := nil;
+end;
+
+procedure TAttemptTracker.HandshakeWritten;
+begin
+  RequestWritten(0);
+end;
+
+procedure TAttemptTracker.HandshakeAccepted(const AStatus: Integer;
+  const AFields: TArray<TWsHeaderField>; const ASubprotocol: string);
+var
+  Headers: IHttpHeaders;
+  I: Integer;
+begin
+  FSubprotocol := ASubprotocol;
+  Headers := NewHttpHeaders;
+  for I := 0 to High(AFields) do
+    try
+      Headers.Add(AFields[I].Name, AFields[I].Value);
+    except
+      // a connection-specific name the header map refuses stays off it
+    end;
+  GotResponse(THttp1Response.Create('HTTP/1.1', AStatus, 'Switching Protocols',
+    Headers, nil));
+end;
+
+procedure TAttemptTracker.SessionEnded(const AEnd: TWsSessionEnd);
+begin
+  if InterlockedCompareExchange(FFired, 1, 0) <> 0 then
+    Exit;
+  FWsClosedBy := AEnd.ClosedBy;
+  FWsCloseCode := AEnd.CloseCode;
+  FWsCloseReason := AEnd.CloseReason;
+  Dispatch(AEnd.Error, AEnd.Abandoned, AEnd.BytesIn, AEnd.BytesOut);
 end;
 
 function HttpMethodIsIdempotent(const AToken: string): Boolean;
@@ -3769,6 +3951,8 @@ var
   Proxy: IProxy;
   Dialer: IHttp1SocketFactory;
   Closed: Boolean;
+  Tracker: TAttemptTracker;
+  TrackerRef: IWebSocketAttempt;
 begin
   FLock.Acquire;
   try
@@ -3779,22 +3963,42 @@ begin
   if Closed then
     raise EHttpConnectionError.Create('the client is closed');
   WsParseUrl(ARequest.Url, Secure, Host, Port, Target, Authority);
-  if not Supports(FFactory, IHttp1SocketFactory, Dialer) then
-    raise EHttpWebSocketError.Create(
-      'the socket factory cannot dial an HTTP/1.1 connection');
-  // the route is chosen on the equivalent http(s) URL, so http_proxy,
-  // https_proxy and no_proxy apply as they do for the same request
-  Proxy := nil;
-  if FProxySelector <> nil then
+  // the session is one attempt: it starts before anything is dialled, and
+  // whatever fails below ends it with that failure
+  Tracker := nil;
+  TrackerRef := nil;
+  if FRequestObserver <> nil then
   begin
-    if Secure then
-      Mapped := 'https://' + Authority + Target
-    else
-      Mapped := 'http://' + Authority + Target;
-    Proxy := FProxySelector.SelectProxy(Mapped);
-    ValidateProxy(Proxy);
+    Tracker := TAttemptTracker.Create(FRequestObserver);
+    TrackerRef := Tracker;
+    Tracker.StartSocket(ARequest, Host, Port, Secure);
   end;
-  Result := OpenWebSocket(Dialer, ARequest, Proxy, FConnectTimeoutMs);
+  try
+    if not Supports(FFactory, IHttp1SocketFactory, Dialer) then
+      raise EHttpWebSocketError.Create(
+        'the socket factory cannot dial an HTTP/1.1 connection');
+    // the route is chosen on the equivalent http(s) URL, so http_proxy,
+    // https_proxy and no_proxy apply as they do for the same request
+    Proxy := nil;
+    if FProxySelector <> nil then
+    begin
+      if Secure then
+        Mapped := 'https://' + Authority + Target
+      else
+        Mapped := 'http://' + Authority + Target;
+      Proxy := FProxySelector.SelectProxy(Mapped);
+      ValidateProxy(Proxy);
+    end;
+    Result := OpenWebSocket(Dialer, ARequest, Proxy, FConnectTimeoutMs, nil,
+      TrackerRef);
+  except
+    on E: Exception do
+    begin
+      if Tracker <> nil then
+        Tracker.FailHandshake(E);
+      raise;
+    end;
+  end;
 end;
 
 procedure THttpClient.Close;

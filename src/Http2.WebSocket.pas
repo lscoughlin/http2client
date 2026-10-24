@@ -224,6 +224,9 @@ type
     function WithPingIntervalMs(const AMs: Integer): IWebSocketRequest;
     /// request one more notification after each delivery
     function WithAutoRequest(const AEnable: Boolean = True): IWebSocketRequest;
+    /// attach an opaque object that the request observer receives as
+    /// THttpAttempt.Context (a parent span, a tenant); nil clears it
+    function WithContext(const AContext: IInterface): IWebSocketRequest;
     function GetUrl: string;
     function GetListener: IWebSocketListener;
     function GetHeaders: TArray<TWsHeaderField>;
@@ -233,6 +236,7 @@ type
     function GetMaxMessageBytes: Int64;
     function GetPingIntervalMs: Integer;
     function GetAutoRequest: Boolean;
+    function GetContext: IInterface;
     property Url: string read GetUrl;
     property Listener: IWebSocketListener read GetListener;
     property Headers: TArray<TWsHeaderField> read GetHeaders;
@@ -242,6 +246,7 @@ type
     property MaxMessageBytes: Int64 read GetMaxMessageBytes;
     property PingIntervalMs: Integer read GetPingIntervalMs;
     property AutoRequest: Boolean read GetAutoRequest;
+    property Context: IInterface read GetContext;
   end;
 
   /// base class with empty callbacks; descend and override what is needed
@@ -271,6 +276,7 @@ type
     FMaxMessageBytes: Int64;
     FPingIntervalMs: Integer;
     FAutoRequest: Boolean;
+    FContext: IInterface;
     function Clone: TWebSocketRequest;
   public
     /// AUrl is ws, wss, http or https; AListener is required
@@ -283,6 +289,7 @@ type
     function WithMaxMessageBytes(const ABytes: Int64): IWebSocketRequest;
     function WithPingIntervalMs(const AMs: Integer): IWebSocketRequest;
     function WithAutoRequest(const AEnable: Boolean = True): IWebSocketRequest;
+    function WithContext(const AContext: IInterface): IWebSocketRequest;
     function GetUrl: string;
     function GetListener: IWebSocketListener;
     function GetHeaders: TArray<TWsHeaderField>;
@@ -292,6 +299,7 @@ type
     function GetMaxMessageBytes: Int64;
     function GetPingIntervalMs: Integer;
     function GetAutoRequest: Boolean;
+    function GetContext: IInterface;
   end;
 
 implementation
@@ -1035,6 +1043,7 @@ begin
   Result.FMaxMessageBytes := FMaxMessageBytes;
   Result.FPingIntervalMs := FPingIntervalMs;
   Result.FAutoRequest := FAutoRequest;
+  Result.FContext := FContext;
 end;
 
 function TWebSocketRequest.WithConnectTimeoutMs(
@@ -1142,6 +1151,16 @@ begin
   Result := R;
 end;
 
+function TWebSocketRequest.WithContext(
+  const AContext: IInterface): IWebSocketRequest;
+var
+  R: TWebSocketRequest;
+begin
+  R := Clone;
+  R.FContext := AContext;
+  Result := R;
+end;
+
 function TWebSocketRequest.GetUrl: string;
 begin
   Result := FUrl;
@@ -1185,6 +1204,11 @@ end;
 function TWebSocketRequest.GetAutoRequest: Boolean;
 begin
   Result := FAutoRequest;
+end;
+
+function TWebSocketRequest.GetContext: IInterface;
+begin
+  Result := FContext;
 end;
 
 end.
