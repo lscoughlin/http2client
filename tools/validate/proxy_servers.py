@@ -64,6 +64,13 @@ def pipe(a, b):
 
 
 def tunnel(client, target):
+    # a relay that lets Nagle batch small writes adds the client's delayed ACK
+    # (about 40 ms on Linux) to every timed case that crosses it
+    for s in (client, target):
+        try:
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
     t = threading.Thread(target=pipe, args=(target, client), daemon=True)
     t.start()
     pipe(client, target)

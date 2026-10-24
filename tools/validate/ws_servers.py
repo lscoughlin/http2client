@@ -105,6 +105,9 @@ def send_frame(sock, op, payload=b"", fin=True):
 class Handler(socketserver.BaseRequestHandler):
     def handle(self):
         conn = self.request
+        # without TCP_NODELAY, Nagle holds a small write behind the client's
+        # delayed ACK (about 40 ms on Linux) and the timed cases read the gaps
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         frames = 0
         unmasked = 0
         path = "?"

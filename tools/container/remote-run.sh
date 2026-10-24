@@ -33,7 +33,7 @@ ssh "$HOST" "mkdir -p $DIR/src/third_party && cd $DIR/src && \
   find . -mindepth 1 -maxdepth 1 ! -name third_party ! -name bin -exec rm -rf {} +"
 tar -c --no-xattrs $(git ls-files -c -m --exclude-standard | sort -u | \
   while read -r f; do [ -e "$f" ] && echo "$f"; done) 2>/dev/null | \
-  ssh "$HOST" "tar -x -C $DIR/src"
+  ssh "$HOST" "tar -x -m -C $DIR/src"   # -m: stamp with the host clock, so a clock skew never hides a change
 if ! ssh "$HOST" "[ -d $DIR/src/third_party/mORMot2/src ]"; then
   tar -c --no-xattrs -C third_party mORMot2 2>/dev/null | \
     ssh "$HOST" "tar -x -C $DIR/src/third_party"

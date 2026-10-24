@@ -420,7 +420,8 @@ begin
     Inc(I);
   AssertTrue('a first inbound message', I < Obs.MessageCount);
   AssertEquals('first has no predecessor', 0, Obs.MessageAt(I).SinceLastUs);
-  AssertTrue('the second follows the first by about 60 ms',
+  AssertTrue(Format('the second follows the first by about 60 ms (gaps %d, %d us)',
+    [Obs.MessageAt(I + 1).SinceLastUs, O.MaxGapUs]),
     Obs.MessageAt(I + 1).SinceLastUs >= 40000);
 end;
 
