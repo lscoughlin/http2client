@@ -3,7 +3,9 @@
 # against a reference RFC 6455 server over ws and wss, directly and through an
 # HTTP CONNECT proxy, an https (TLS) proxy and a SOCKS5 proxy, then read the
 # servers' logs to prove what each connection did on the wire: the mask bit of
-# every client frame, the close codes, the subprotocol, the route.
+# every client frame, the close codes, the subprotocol, the route.  The
+# observed-session cases attach a request observer and assert one start, one
+# end, the close code and the message gaps of a /chatter session.
 #
 #   bash tools/validate/websocket-live.sh              # or: make validate-websocket
 #   bash tools/validate/websocket-live.sh autobahn     # or: make validate-websocket-autobahn
@@ -95,6 +97,9 @@ live() {
   done
   expect "$LOG_A" '^handshake path=/echo host=127\.0\.0\.1:'"$BASE"      "Host header carries the port"
   expect "$LOG_A" '^handshake path=/protocol .* protocols=chat,superchat' "subprotocols offered as a list"
+  expect "$LOG_A" '^handshake path=/chatter host=127\.0\.0\.1:'"$BASE"  "an observed session over ws"
+  expect "$LOG_A" '^handshake path=/chatter host=127\.0\.0\.1:'$((BASE + 1))  "an observed session over wss"
+  expect "$LOG_B" '^handshake path=/chatter host=other\.example'         "an observed session through a proxy"
   expect "$LOG_A" '^pong len=3 data=srv'          "the pong answered the server ping"
   expect "$LOG_A" '^ping-answered len=0'          "the client ping was answered"
   expect "$LOG_A" '^close code=1000 reason=done'  "client close carries its code and reason"

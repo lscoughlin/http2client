@@ -19,6 +19,8 @@ Behaviour is chosen by the request path:
   /serverping   send a ping first and log when the pong arrives, then echo
   /serverclose  send close 1001 'going', log the client's answer, end
   /frag         send "he", a ping, then "llo" as one fragmented text message
+  /chatter      send "t1", "t2", "t3" as three text messages 60 ms apart, then
+                echo like /echo (the observed-session cases read the gaps)
   /badutf8      send a text frame that is not UTF-8, log the close code
   /drop         close the TCP connection right after the handshake
   /protocol     select the first subprotocol the client offered
@@ -177,6 +179,11 @@ class Handler(socketserver.BaseRequestHandler):
                 send_frame(conn, 0, b"llo", fin=True)
             if route == "/serverping":
                 send_frame(conn, 9, b"srv")
+            if route == "/chatter":
+                for i in (1, 2, 3):
+                    if i > 1:
+                        time.sleep(0.06)
+                    send_frame(conn, 1, ("t%d" % i).encode())
 
             while True:
                 fin, op, masked, payload = read_frame(conn)

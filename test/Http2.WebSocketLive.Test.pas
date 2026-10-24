@@ -15,7 +15,8 @@ interface
 
 uses
   SysUtils, Classes, fpcunit, testregistry, Http2.Errors, Http2.Client,
-  Http2.WebSocket, Http2.WebSocketClient.Test;
+  Http2.Tls, Http2.RequestObserver, Http2.WebSocket, Http2.WebSocketClient.Test,
+  Http2.RequestObserver.Test;
 
 type
   TWebSocketLiveTest = class(TTestCase)
@@ -27,6 +28,10 @@ type
     function Connect(const AClient: IHttpClient; const AUrl: string;
       const ARec: TRecorder; const AListener: IWebSocketListener): IWebSocket;
     procedure EchoAndClose(const AClient: IHttpClient; const AUrl: string);
+    /// open AUrl (the /chatter route) through a client that has a recording
+    /// observer, close it, and check what the observer saw
+    procedure ObserveSession(const AFactory: THttpClientFactory;
+      const AUrl, AHost: string; const ATls: Boolean);
   published
     procedure TestEchoPlainTextBinaryAndLarge;
     procedure TestEchoOverTlsSurvivesIdlePolling;
@@ -42,6 +47,10 @@ type
     procedure TestThroughHttpsProxyTlsInsideTls;
     procedure TestThroughSocks5Proxy;
     procedure TestEnvironmentProxyAppliesToWs;
+    procedure TestObservedSessionOverWs;
+    procedure TestObservedSessionOverWss;
+    procedure TestObservedSessionThroughHttpConnectProxy;
+    procedure TestObservedSessionThroughSocks5Proxy;
   end;
 
 implementation
@@ -358,6 +367,95 @@ begin
   // ws maps to http, so http_proxy applies; loopback is still direct
   EchoAndClose(C, 'ws://other.example/echo');
   EchoAndClose(C, 'ws://127.0.0.1:' + IntToStr(FWs) + '/echo');
+end;
+
+procedure TWebSocketLiveTest.ObserveSession(const AFactory: THttpClientFactory;
+  const AUrl, AHost: string; const ATls: Boolean);
+var
+  Obs: TMessageRecordingObserver;
+  ObsRef: IHttpClientObserver;
+  Rec: TRecorder;
+  Ref: IWebSocketListener;
+  Sock: IWebSocket;
+  C: IHttpClient;
+  O: THttpOutcome;
+  I: Integer;
+begin
+  Obs := TMessageRecordingObserver.Create([mkWsText, mkWsClose]);
+  ObsRef := Obs;
+  C := NewClient(AFactory.WithRequestObserver(ObsRef));
+  Rec := TRecorder.Create(10);
+  Ref := Rec;
+  Sock := Connect(C, AUrl, Rec, Ref);
+  // open, then the three messages the server sends 60 ms apart
+  AssertTrue('three messages', Rec.WaitCount(4, 10000));
+  Sock.SendText('mine');
+  AssertTrue('the echo', Rec.WaitCount(5, 10000));
+  Sock.Close(1000, 'done');
+  AssertTrue('close', Rec.WaitCount(6, 10000));
+  AssertTrue('one end', Obs.WaitForEnds(1, 10000));
+  AssertEquals('one start', 1, Obs.StartCount);
+  AssertEquals('one end', 1, Obs.EndCount);
+  AssertEquals('callback order', 'S0 H0 E0',
+    Trim(StringReplace(Obs.Order, sLineBreak, ' ', [rfReplaceAll])));
+  AssertTrue('a WebSocket attempt', Obs.Attempt(0).Kind = akWebSocket);
+  AssertEquals('the origin, not the proxy', AHost, Obs.Attempt(0).Host);
+  O := Obs.Outcome(0).O;
+  AssertEquals('upgraded', 101, O.StatusCode);
+  AssertFalse('unpooled', O.ConnectionReused);
+  if ATls then
+    AssertTrue('HTTP/1.1 over TLS', O.Protocol = npHttp1Tls)
+  else
+    AssertTrue('HTTP/1.1', O.Protocol = npHttp1Cleartext);
+  AssertTrue('closed by this side', O.ClosedBy = ciLocal);
+  AssertEquals('close code', 1000, O.CloseCode);
+  AssertEquals('close reason', 'done', O.CloseReason);
+  AssertEquals('three messages in plus the echo', 4, O.MessagesIn);
+  AssertEquals('one message out', 1, O.MessagesOut);
+  AssertTrue('the server spaced its messages by about 60 ms',
+    O.MaxGapUs >= 40000);
+  // the observer saw the texts in order with growing stamps
+  I := 0;
+  while (I < Obs.MessageCount) and (Obs.MessageAt(I).Direction <> mdIn) do
+    Inc(I);
+  AssertTrue('a first inbound message', I < Obs.MessageCount);
+  AssertEquals('first has no predecessor', 0, Obs.MessageAt(I).SinceLastUs);
+  AssertTrue('the second follows the first by about 60 ms',
+    Obs.MessageAt(I + 1).SinceLastUs >= 40000);
+end;
+
+procedure TWebSocketLiveTest.TestObservedSessionOverWs;
+begin
+  if not Enabled then Exit;
+  ObserveSession(THttpClientFactory.Create,
+    'ws://127.0.0.1:' + IntToStr(FWs) + '/chatter', '127.0.0.1', False);
+end;
+
+procedure TWebSocketLiveTest.TestObservedSessionOverWss;
+begin
+  if not Enabled then Exit;
+  ObserveSession(THttpClientFactory.Create,
+    'wss://127.0.0.1:' + IntToStr(FWs + 1) + '/chatter', '127.0.0.1', True);
+end;
+
+procedure TWebSocketLiveTest.TestObservedSessionThroughHttpConnectProxy;
+begin
+  if not Enabled then Exit;
+  ObserveSession(THttpClientFactory.Create.WithProxy('127.0.0.1', FProxy + 2),
+    'ws://other.example/chatter', 'other.example', False);
+  ObserveSession(THttpClientFactory.Create.WithProxy('127.0.0.1', FProxy + 2),
+    'wss://other.example/chatter', 'other.example', True);
+end;
+
+procedure TWebSocketLiveTest.TestObservedSessionThroughSocks5Proxy;
+begin
+  if not Enabled then Exit;
+  ObserveSession(THttpClientFactory.Create
+    .WithAllProxy('socks5://127.0.0.1:' + IntToStr(FProxy + 4)),
+    'ws://other.example/chatter', 'other.example', False);
+  ObserveSession(THttpClientFactory.Create
+    .WithAllProxy('socks5://127.0.0.1:' + IntToStr(FProxy + 4)),
+    'wss://other.example/chatter', 'other.example', True);
 end;
 
 initialization
