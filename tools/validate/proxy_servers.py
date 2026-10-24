@@ -82,7 +82,11 @@ def open_target(args, host, port):
     mapped = args.target_map.get((host.lower(), port))
     if mapped is None:
         return None
-    return socket.create_connection(("127.0.0.1", mapped), timeout=5)
+    try:
+        return socket.create_connection(("127.0.0.1", mapped), timeout=5)
+    except OSError as e:
+        log(f"origin connect to 127.0.0.1:{mapped} failed: {e}")
+        return None
 
 
 class ConnectHandler(socketserver.BaseRequestHandler):
