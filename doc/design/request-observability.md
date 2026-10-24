@@ -35,12 +35,13 @@ context. This note adds the request-level seam above it.
 Built: the monotonic clock (`Http2.Clock`), the observer vocabulary
 (`Http2.RequestObserver`), `WithContext`, header injection, the factory and
 logger surface, the attempt lifecycle for plain requests over HTTP/2, h2c and
-HTTP/1.1 (start, response headers, redirect, retry, end), and the pool
-statistics snapshot.
+HTTP/1.1 (start, response headers, redirect, retry, end), the pool
+statistics snapshot, wire arrival stamps (`TFrame.ArrivedUs`,
+`IStampedBodyStream`) and the timing and message aggregates of
+`THttpOutcome` for plain responses.
 
-Not built yet: wire arrival stamps (`TFrame.ArrivedUs`, `IStampedBodyStream`),
-the per-message observer (`IHttpMessageObserver`) and the message aggregates
-of `THttpOutcome` (they stay zero), Server-Sent Events and WebSocket
+Not built yet: the per-message observer (`IHttpMessageObserver`), Server-Sent
+Events and WebSocket
 attempts (`akSse` and `akWebSocket` are declared but only `akRequest` is
 produced), and the WebSocket outcome fields.
 
@@ -421,6 +422,9 @@ IStampedBodyStream = interface
 end;
 ```
 
+   The lease's body stream and the pooled response's body implement it; a
+   body behind a decoding stream (a content-encoding) does not report
+   stamps.
 5. `TSseSource` queries `Supports(Body, IStampedBodyStream)` after each `Read`.
    An event takes the stamp of the chunk that completed it (the chunk holding
    its terminating blank line), which is when the endpoint finished sending
@@ -431,7 +435,29 @@ end;
 There are no frames. `TBufferedReader` stamps each transport read and keeps a
 short list of `(buffer offset, stamp)` so bytes are attributed to the read
 that delivered them even when the buffer holds bytes from more than one read.
-Chunked decoding does not change this.
+`ReadBytes` never returns bytes of two transport reads, and the body stream
+returns what has arrived rather than waiting to fill the caller's buffer, so
+one `Read` maps to one stamp here too. Chunked decoding does not change this:
+chunk framing is consumed without a stamp and the payload bytes keep the stamp
+of the read that carried them. A response head and the first body bytes that
+arrive in one read share that read's stamp.
+
+### Aggregates for plain responses
+
+Each `Read` that returns bytes of a frame (HTTP/2) or of a transport read
+(HTTP/1.1) that has not been counted yet is one message. The codec keeps a
+`TArrivalStats` (first and last stamp, count, largest and summed gap between
+consecutive stamps) and reports it in `TExchangeEnd.Arrivals`. The attempt
+tracker turns it into `FirstMessageUs`, `LastMessageUs` (relative to the
+attempt start, like the other times), `MessagesIn`, `MaxGapUs` and
+`SumGapUs`. Several `Read` calls inside one frame are one message. A response
+that is released unread, or one whose body is empty, reports no messages.
+
+### Testing
+
+`SetNowUsHook` makes `NowUs` answer from a function the caller supplies, and
+`ResetNowUsHook` restores the system clock. The hook is process-wide and is
+called from the reader thread, so it must be thread-safe.
 
 ### WebSocket
 

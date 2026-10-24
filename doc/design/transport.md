@@ -36,6 +36,14 @@ Free Pascal 3.2.4 primitives (all choices below are probe-verified; see
   waiters. **It is held as an interface**
   (`IBlockingQueue<T>`) so a thread and a caller can share one queue by
   refcount rather than by raw pointer.
+- **Arrival stamps.** The connection thread reads `Http2.Clock.NowUs` once
+  per received frame, right after the frame is read, and the stamp travels
+  with the frame through the stream's inbound queue. A stream's queue is
+  bounded (`cDefaultQueueCapacity`, 128 frames) and `Push` blocks the thread
+  when it is full, so a consumer that stops reading for 128 frames delays the
+  stamps of every stream on that connection; window credit is returned on
+  arrival, so flow control is unaffected. See
+  [request-observability](request-observability.md), "Arrival stamping".
 - `TCriticalSection` (unit `SyncObjs`) — the pool guard, and per-connection
   stream-id allocation even though the object is free-threaded
   (`TMonitor` is **not** in FPC 3.2.4; `Identifier not found "TMonitor"`).

@@ -50,6 +50,7 @@ type
   TFrame = record
     Header: TFrameHeader;
     Payload: TBytes;
+    ArrivedUs: Int64;                   // reader-thread stamp; 0 unless received
     class function Create(const AFrameType: TFrameType; const AFlags: TFrameFlags;
       const AStreamId: LongWord; const APayload: TBytes): TFrame; static;
     function DataLength: LongWord;      // payload length
@@ -69,6 +70,12 @@ type
     MaxHeaderListSize: LongWord;
   end;
 ```
+
+`ArrivedUs` is the `Http2.Clock` time at which `TConnectionThread` finished
+reading the frame, set before validation and routing. It is meaningful only on
+received frames, is never serialized, and is `0` on every frame built locally.
+The stream layer carries it with a DATA frame to the consumer (see
+[request-observability](request-observability.md), "Arrival stamping").
 
 Which frames the client sends vs. receives, and how they map to the public
 API:
