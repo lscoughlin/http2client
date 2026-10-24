@@ -173,6 +173,11 @@ tasks:
     cmds:
       - bash tools/validate/mtls-live.sh
 
+  validate:mtls-real:
+    desc: 'Live mutual TLS gate against nginx, Apache httpd and Caddy (Docker host; MTLS_REAL_HOST)'
+    cmds:
+      - bash tools/validate/mtls-real.sh
+
   validate:harness:
     desc: 'S12 gate B — 146-id h2-client-test-harness sweep (~30 min, Docker)'
     deps:

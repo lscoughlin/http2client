@@ -1,0 +1,1 @@
+dn=<!--#echo var="SSL_CLIENT_S_DN" --> verify=<!--#echo var="SSL_CLIENT_VERIFY" --> proto=<!--#echo var="SERVER_PROTOCOL" --> tls=<!--#echo var="SSL_PROTOCOL" -->

@@ -13,6 +13,7 @@
 #   make validate-websocket-autobahn  Autobahn|Testsuite client run (needs Docker)
 #   make validate-cleartext  opt-in live gate: cleartext requests are sent once
 #   make validate-mtls  opt-in live mutual TLS gate against tools/validate/mtls_server.py and nghttpd
+#   make validate-mtls-real  opt-in mutual TLS gate against nginx, Apache httpd and Caddy (needs a Docker host)
 #   make measure-observer  opt-in observer overhead measurement on loopback
 #   make clean    remove build outputs
 
@@ -33,7 +34,7 @@ EXAMPLEUNITS = examples/observer_tracing.pas examples/observer_metrics.pas examp
 EXAMPLESRC = $(filter-out $(EXAMPLEUNITS),$(wildcard examples/*.pas))
 BIN        = bin
 
-.PHONY: all test examples measure-observer clean validate-interop validate-harness validate-sse validate-proxy validate-websocket validate-websocket-autobahn validate-cleartext validate-mtls validate
+.PHONY: all test examples measure-observer clean validate-interop validate-harness validate-sse validate-proxy validate-websocket validate-websocket-autobahn validate-cleartext validate-mtls validate-mtls-real validate
 
 all: $(BIN)/libhttp2.a
 
@@ -108,5 +109,12 @@ validate-cleartext: all | $(BIN)
 # driven by examples/mtls_get.pas.
 validate-mtls: all | $(BIN)
 	bash tools/validate/mtls-live.sh
+
+# Opt-in mutual TLS gate against real server stacks (nginx, Apache httpd and
+# Caddy as containers, driven by examples/mtls_get.pas in the dev image); runs
+# on the Docker host named by MTLS_REAL_HOST (default lscoughlin@liam-rzbox.local;
+# `local` runs here).
+validate-mtls-real:
+	bash tools/validate/mtls-real.sh
 
 validate: validate-interop validate-harness
