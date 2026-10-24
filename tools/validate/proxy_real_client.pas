@@ -141,6 +141,7 @@ begin
   Url := ParamStr(2);
   Timeout := StrToIntDef(Opt('timeout', '8000'), 8000);
   Env := TStringList.Create;
+  Env.CaseSensitive := True;   // HTTP_PROXY and http_proxy are different variables
   for I := 3 to ParamCount do
     if Pos('env=', ParamStr(I)) = 1 then
       Env.Add(Copy(ParamStr(I), 5, MaxInt));
@@ -165,13 +166,12 @@ begin
   V := Opt('cert', '');
   if V <> '' then
     Factory := Factory.WithClientCertificateFiles(V, Opt('key', ''));
-  V := Opt('pcert', '');
-  if V <> '' then
-    Factory := Factory.WithProxyClientIdentity(
-      TClientIdentity.FromPemFiles(V, Opt('pkey', '')));
-
   Client := nil;
   try
+    V := Opt('pcert', '');
+    if V <> '' then
+      Factory := Factory.WithProxyClientIdentity(
+        TClientIdentity.FromPemFiles(V, Opt('pkey', '')));
     Client := Factory.Build;
     if Mode = 'get' then
     begin
