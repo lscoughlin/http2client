@@ -1279,6 +1279,7 @@ type
     FReused: Boolean;
     FBytesOut: Int64;
     FRequestSentUs: Int64;
+    FRequestWritten: Boolean;
     FHeadersUs: Int64;
     // an end reported before Send armed the tracker
     FEndAbandoned: Boolean;
@@ -1648,7 +1649,14 @@ end;
 
 procedure TAttemptTracker.RequestWritten(const ABytesOut: Int64);
 begin
-  FBytesOut := ABytesOut;
+  // the h2c paths report again after the response head was read (the probe
+  // carried the request); the first report is the real write, so a later one
+  // may only raise the byte count, never move the stamp
+  if ABytesOut > FBytesOut then
+    FBytesOut := ABytesOut;
+  if FRequestWritten then
+    Exit;
+  FRequestWritten := True;
   FRequestSentUs := NowUs - FStartUs;
 end;
 
@@ -3270,6 +3278,10 @@ begin
       raise EHttpConnectionClosed.Create('h2c upgrade request write failed');
     Inc(Ofs, N);
   end;
+  // the probe carries the request, so this is the moment it was written; the
+  // declined and accepted paths report again after the response head was read
+  if ARequest.Exchange <> nil then
+    ARequest.Exchange.RequestWritten(Length(ARequest.Body.Data));
   if not ReadHeadLineBytewise(Sock, Line) then
     raise EHttpProtocolError.Create('peer closed during the h2c upgrade',
       ecProtocolError);

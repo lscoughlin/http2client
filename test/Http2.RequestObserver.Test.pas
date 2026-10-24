@@ -221,6 +221,7 @@ type
     procedure TestHttp1TlsFallbackProducesStartAndEnd;
     procedure TestPriorKnowledgeH2cProducesStartAndEnd;
     procedure TestDeclinedUpgradeProducesStartAndEnd;
+    procedure TestDeclinedUpgradeKeepsTheRealWriteStamp;
     procedure TestCleartextHttp1ProducesStartAndEnd;
     procedure TestHttp1RequestBodySizeIsReported;
   end;
@@ -1587,6 +1588,47 @@ begin
     Obs.Outcome(0).O.Protocol = npHttp1Cleartext);
   AssertEquals('bytes in', 5, Obs.Outcome(0).O.BytesIn);
   AssertFalse('not abandoned', Obs.Outcome(0).O.Abandoned);
+  Client.Close;
+end;
+
+var
+  GTickUs: Int64;
+
+function TickingClock: Int64;
+begin
+  Result := InterlockedExchangeAdd64(GTickUs, 100) + 100;
+end;
+
+procedure THttp1ObserverTest.TestDeclinedUpgradeKeepsTheRealWriteStamp;
+var
+  Obs: TRecordingRequestObserver;
+  ObsRef: IHttpClientObserver;
+  Client: IHttpClient;
+  R: IHttpResponse;
+  O: THttpOutcome;
+begin
+  // the probe carries the request, and the pool reports "request written"
+  // again once the declined response head was read; the stamp must stay at
+  // the real write, which precedes the read that delivered the response
+  GTickUs := 0;
+  SetNowUsHook(TickingClock);
+  try
+    Obs := TRecordingRequestObserver.Create;
+    ObsRef := Obs;
+    R := Send(TScriptProtocolFactory.Create(npHttp1Cleartext,
+      'HTTP/1.1 200 OK'#13#10'Content-Length: 5'#13#10#13#10'hello'), ObsRef,
+      'http://plain.example/x', ctUpgrade, Client);
+    AssertEquals('five bytes', 5, ReadAll(R));
+    O := Obs.Outcome(0).O;
+    AssertTrue('the first message arrived', O.FirstMessageUs > 0);
+    AssertTrue('request written before the first byte arrived: ' +
+      IntToStr(O.RequestSentUs) + ' vs ' + IntToStr(O.FirstMessageUs),
+      O.RequestSentUs < O.FirstMessageUs);
+    AssertTrue('request written before headers',
+      O.RequestSentUs <= O.HeadersUs);
+  finally
+    ResetNowUsHook;
+  end;
   Client.Close;
 end;
 
