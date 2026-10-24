@@ -15,6 +15,12 @@
 # any connection).  The Python servers also serve /events and wss, and their
 # logs prove what each connection did on the server side.
 #
+# Then the selector and proxy-identity cases (doc/design/mtls.md "Selector and
+# proxy identity"): two origins that each serve one identity only, reached by
+# one client whose selector picks the identity per origin; and an https proxy
+# (mtls_server.py --proxy) that requires its own client certificate while the
+# origin behind it sees the origin identity only.
+#
 #   bash tools/validate/mtls-live.sh          # or: make validate-mtls
 #
 # Fixtures come from tools/validate/make-mtls-certs.sh (test/certs/mtls).
@@ -112,8 +118,8 @@ python_cases() {
   check "$label refused handshakes" 2 "$(grep -c '^reject ' "$log")"
 }
 
-start_python() { # port tls log
-  python3 "$HERE/mtls_server.py" --port "$1" --tls "$2" --log "$3" \
+start_python() { # port tls log [extra mtls_server.py args...]
+  python3 "$HERE/mtls_server.py" --port "$1" --tls "$2" --log "$3" "${@:4}" \
     --cert "$CERTS/server.crt" --key "$CERTS/server.key" --ca "$CERTS/ca.crt" \
     >"$WORK/ready-$1" 2>"$WORK/err-$1" &
   PIDS+=($!)
@@ -140,6 +146,54 @@ else
   sleep 1
   common_cases "nghttpd http/2" $((BASE + 2))
 fi
+
+# the selector: each origin serves one identity only, so a client that offered
+# the wrong one would be answered 403; one client, one selector, two origins
+ORIGIN_A=$((BASE + 3)); ORIGIN_B=$((BASE + 4))
+start_python "$ORIGIN_A" 1.3 "$WORK/origin-a.log" --only-subject "mtls client"
+start_python "$ORIGIN_B" 1.3 "$WORK/origin-b.log" --only-subject "mtls client two"
+SELECT="$ORIGIN_A:$GOOD_CERT:$GOOD_KEY;$ORIGIN_B:$CERTS/client2-chain.pem:$CERTS/client2.key"
+OUT="$(MTLS_SELECT="$SELECT" "$GET" \
+  "https://localhost:$ORIGIN_A/,https://localhost:$ORIGIN_B/,https://localhost:$ORIGIN_A/" \
+  - - "$CERTS/ca.crt" 2>&1)"
+RC=$?
+check "selector two origins: exit" 0 "$RC"
+check "selector two origins: three 200s" 3 "$(printf '%s\n' "$OUT" | grep -c 'status: 200')"
+# the server closes after each response, so each of A's two requests dials
+check "selector origin A: two connections" 2 "$(grep -c '^accept ' "$WORK/origin-a.log")"
+check "selector origin A: its identity each time" 2 "$(grep -c 'commonName=mtls client$' "$WORK/origin-a.log")"
+check "selector origin B: one connection" 1 "$(grep -c '^accept ' "$WORK/origin-b.log")"
+check "selector origin B: its identity" 1 "$(grep -c 'commonName=mtls client two$' "$WORK/origin-b.log")"
+check "selector: neither origin refused an identity" 0 \
+  "$(cat "$WORK/origin-a.log" "$WORK/origin-b.log" | grep -c '^forbid ')"
+# the origins do enforce it: the one fixed identity is forbidden at B
+run_get "https://localhost:$ORIGIN_B/" "$GOOD_CERT" "$GOOD_KEY"
+contains "fixed identity at the other origin: forbidden" "status: 403" "$OUT"
+contains "fixed identity at the other origin: logged" "forbid " "$(cat "$WORK/origin-b.log")"
+
+# the proxy identity: an https proxy that requires a client certificate in front
+# of an origin that requires another; each must see its own identity only
+PROXY_ORIGIN=$((BASE + 5)); PROXY_PORT=$((BASE + 6))
+start_python "$PROXY_ORIGIN" 1.3 "$WORK/proxy-origin.log"
+start_python "$PROXY_PORT" 1.3 "$WORK/proxy.log" --proxy
+OUT="$(MTLS_PROXY="$PROXY_PORT" MTLS_PROXY_CERT="$CERTS/client2-chain.pem" \
+  MTLS_PROXY_KEY="$CERTS/client2.key" "$GET" "https://localhost:$PROXY_ORIGIN/" \
+  "$GOOD_CERT" "$GOOD_KEY" "$CERTS/ca.crt" 2>&1)"
+RC=$?
+check "proxy identity: exit" 0 "$RC"
+contains "proxy identity: status" "status: 200" "$OUT"
+check "proxy accepted the proxy identity" 1 "$(grep -c 'commonName=mtls client two$' "$WORK/proxy.log")"
+contains "proxy tunnelled to the origin" "tunnel localhost:$PROXY_ORIGIN" "$(cat "$WORK/proxy.log")"
+check "origin accepted the origin identity" 1 "$(grep -c 'commonName=mtls client$' "$WORK/proxy-origin.log")"
+check "origin never saw the proxy identity" 0 "$(grep -c 'client two' "$WORK/proxy-origin.log")"
+check "proxy never saw the origin identity" 0 "$(grep -c 'commonName=mtls client$' "$WORK/proxy.log")"
+# the origin identity does not satisfy the proxy
+OUT="$(MTLS_PROXY="$PROXY_PORT" "$GET" "https://localhost:$PROXY_ORIGIN/" \
+  "$GOOD_CERT" "$GOOD_KEY" "$CERTS/ca.crt" 2>&1)"
+RC=$?
+check "proxy without its identity: refused" 1 "$([ "$RC" -ne 0 ] && echo 1 || echo 0)"
+check "proxy without its identity: no second tunnel" 1 \
+  "$(grep -c '^tunnel ' "$WORK/proxy.log")"
 
 if [ "$FAIL" -ne 0 ]; then
   echo "mtls-live: FAILED"; exit 1

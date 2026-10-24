@@ -15,11 +15,21 @@ It logs one line per TLS connection to the file given with --log:
     reject <reason>                     the handshake was refused
 
 and `request <path>` for each request, so the gate can prove what the server
-saw.  Usage:
+saw.  Two options serve the selector and proxy-identity cases:
+
+    --only-subject CN   serve only a client whose common name is CN; any other
+                        accepted client gets 403 and a `forbid` log line, so
+                        two origins can each demand a different identity
+    --proxy             act as an https proxy that requires a client
+                        certificate: answer CONNECT host:port with 200, log
+                        `tunnel host:port` and pipe the bytes
+
+Usage:
 
     python3 tools/validate/mtls_server.py --port 8661 \
         --cert test/certs/mtls/server.crt --key test/certs/mtls/server.key \
-        --ca test/certs/mtls/ca.crt --log /tmp/mtls.log [--tls 1.2|1.3]
+        --ca test/certs/mtls/ca.crt --log /tmp/mtls.log [--tls 1.2|1.3] \
+        [--only-subject CN] [--proxy]
 
 It prints "ready" on stdout once it listens.  See doc/design/mtls.md.
 """
@@ -53,6 +63,49 @@ def subject_of(cert):
     return ",".join(parts)
 
 
+def common_name_of(cert):
+    for rdn in cert.get("subject", ()):
+        for key, value in rdn:
+            if key == "commonName":
+                return value
+    return ""
+
+
+def pipe(src, dst):
+    try:
+        while True:
+            data = src.recv(16384)
+            if not data:
+                break
+            dst.sendall(data)
+    except (ssl.SSLError, OSError):
+        pass
+    try:
+        dst.shutdown(socket.SHUT_WR)
+    except (ssl.SSLError, OSError):
+        pass
+
+
+def serve_proxy(conn, head, note):
+    parts = head.split(" ", 2)
+    if len(parts) < 2 or parts[0] != "CONNECT":
+        conn.sendall(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+        return
+    host, _, port = parts[1].rpartition(":")
+    try:
+        upstream = socket.create_connection((host, int(port)), timeout=5)
+    except OSError:
+        conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+        return
+    note("tunnel %s:%s" % (host, port))
+    conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+    back = threading.Thread(target=pipe, args=(upstream, conn), daemon=True)
+    back.start()
+    pipe(conn, upstream)
+    back.join(timeout=5)
+    upstream.close()
+
+
 def serve_ws(conn, head):
     key = ""
     for line in head.split("\r\n"):
@@ -77,7 +130,7 @@ def serve_ws(conn, head):
             return
 
 
-def handle(raw, ctx, log, lock):
+def handle(raw, ctx, log, lock, opts):
     def note(text):
         with lock:
             with open(log, "a") as f:
@@ -90,9 +143,18 @@ def handle(raw, ctx, log, lock):
         raw.close()
         return
     try:
-        note("accept subject=%s" % subject_of(conn.getpeercert()))
+        cert = conn.getpeercert()
+        note("accept subject=%s" % subject_of(cert))
         head = read_head(conn)
         if not head:
+            return
+        if opts.proxy:
+            serve_proxy(conn, head, note)
+            return
+        if opts.only_subject and common_name_of(cert) != opts.only_subject:
+            note("forbid subject=%s" % subject_of(cert))
+            conn.sendall(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n"
+                         b"Connection: close\r\n\r\nforbidden")
             return
         path = head.split(" ", 2)[1] if " " in head else "/"
         note("request %s" % path)
@@ -125,6 +187,8 @@ def main():
     ap.add_argument("--ca", required=True)
     ap.add_argument("--log", required=True)
     ap.add_argument("--tls", choices=("1.2", "1.3"), default=None)
+    ap.add_argument("--only-subject", default=None)
+    ap.add_argument("--proxy", action="store_true")
     args = ap.parse_args()
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -148,7 +212,7 @@ def main():
     while True:
         raw, _ = srv.accept()
         raw.settimeout(5)
-        threading.Thread(target=handle, args=(raw, ctx, args.log, lock),
+        threading.Thread(target=handle, args=(raw, ctx, args.log, lock, args),
                          daemon=True).start()
 
 

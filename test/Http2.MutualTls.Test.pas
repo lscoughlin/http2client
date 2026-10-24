@@ -66,17 +66,42 @@ type
     FCtx: PSSL_CTX;
     FMode: TTunnelMode;
     FOriginPort: Word;
+    FRequireCert: Boolean;
     FPort: Word;
     procedure Handle(const AFd: Integer);
   protected
     procedure Execute; override;
   public
-    Tunnels: Integer;
+    Tunnels, Refused: Integer;
     SawClientCert: Boolean;
-    constructor Create(const AMode: TTunnelMode; const AOriginPort: Word);
+    /// subject of the last client certificate the proxy accepted
+    LastSubject: string;
+    /// ARequireCert makes an https proxy refuse a client that offers none
+    constructor Create(const AMode: TTunnelMode; const AOriginPort: Word;
+      const ARequireCert: Boolean = False);
     destructor Destroy; override;
     procedure Stop;
     property Port: Word read FPort;
+  end;
+
+  /// answers a fixed identity per port and counts the calls; the optional
+  /// probe checks, from another thread, that the pool lock is free during it
+  TCountingSelector = class(TInterfacedObject, IClientIdentitySelector)
+  private
+    FProbe: THttpClient;
+  public
+    Calls: Integer;
+    LastHost: string;
+    LastPort: Word;
+    LastThread: TThreadID;
+    Answer: IClientIdentity;
+    /// when ForPort is set, that port gets PortAnswer instead of Answer
+    ForPort: Word;
+    PortAnswer: IClientIdentity;
+    Fail: Boolean;
+    LockWasFree: Boolean;
+    function Select(const AHost: string; const APort: Word): IClientIdentity;
+    procedure ProbeLockWith(const AClient: IHttpClient);
   end;
 
   /// routes every request, loopback included, through one proxy
@@ -122,6 +147,13 @@ type
     procedure RunExpiredOnTheWire(const AVersion: Integer;
       const AExpected: string);
     procedure RunTunnel(const AMode: TTunnelMode; const AVersion: Integer);
+    function ServerUrl(const AServer: TMtlsServer): string;
+    function SendTo(const AClient: IHttpClient; const AUrl: string): IHttpResponse;
+    function ReadBody(const AResponse: IHttpResponse): string;
+    function Client2Identity: IClientIdentity;
+    function SubjectIs(const ASubject, AName: string): Boolean;
+    procedure RunProxyIdentity(const AVersion: Integer);
+    function SelectorClient(const ASelector: IClientIdentitySelector): IHttpClient;
     function ProbeAlert(const AVersion: Integer;
       const AIdentity: IClientIdentity; const AKind: TMtlsKind): string;
   protected
@@ -155,6 +187,23 @@ type
     // every dial helper
     procedure TestEveryDialHelperPresentsTheIdentity;
     procedure TestEveryTlsSocketConstructionCarriesTheIdentity;
+    // selector and proxy identity
+    procedure TestFixedIdentitySelectorAnswersTheIdentity;
+    procedure TestSelectorIsCalledOncePerDialNotPerRequest;
+    procedure TestSelectorRunsOnTheDiallingThreadOutsideThePoolLock;
+    procedure TestSelectorChoosesTheIdentityPerOrigin;
+    procedure TestNilAnswerPresentsNoCertificate;
+    procedure TestThrowingSelectorFailsTheDial;
+    procedure TestRotationOpensANewConnectionAndTheOldOneStillAnswers;
+    procedure TestNilAnswerNeverSharesAConnectionWithAnIdentity;
+    procedure TestSelectorAppliesToWss;
+    procedure TestSelectorIsNotCalledForCleartext;
+    procedure TestSelectorAndFixedIdentityReplaceEachOther;
+    procedure TestProxyIdentityGoesToTheProxyOnlyTls13;
+    procedure TestProxyIdentityGoesToTheProxyOnlyTls12;
+    procedure TestOriginIdentityAloneDoesNotSatisfyAProxyThatAsksForOne;
+    procedure TestProxyIdentityDoesNotReachACleartextOrigin;
+    procedure TestSelectorAndProxyIdentityTogether;
     // other
     procedure TestCleartextIgnoresTheIdentity;
     procedure TestLogLineHasSubjectAndFingerprintButNoSecrets;
@@ -576,10 +625,11 @@ end;
 { TTunnelProxy }
 
 constructor TTunnelProxy.Create(const AMode: TTunnelMode;
-  const AOriginPort: Word);
+  const AOriginPort: Word; const ARequireCert: Boolean);
 begin
   FMode := AMode;
   FOriginPort := AOriginPort;
+  FRequireCert := ARequireCert;
   FListenFd := ListenOnLoopback(FPort);
   if AMode = tmHttps then
   begin
@@ -592,7 +642,11 @@ begin
     // proxy would be seen (and verified) rather than abort the handshake
     SSL_CTX_load_verify_locations(FCtx,
       PUtf8Char(UTF8String(Fixture('ca.crt'))), nil);
-    SSL_CTX_set_verify(FCtx, SSL_VERIFY_PEER, nil);
+    if ARequireCert then
+      SSL_CTX_set_verify(FCtx,
+        SSL_VERIFY_PEER or SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nil)
+    else
+      SSL_CTX_set_verify(FCtx, SSL_VERIFY_PEER, nil);
   end;
   inherited Create(False);
 end;
@@ -654,11 +708,19 @@ begin
       C.Ssl := SSL_new(FCtx);
       SSL_set_fd(C.Ssl, AFd);
       if SSL_accept(C.Ssl) <> 1 then
+      begin
+        InterlockedIncrement(Refused);
+        // let the client read the alert before the close
+        fpShutdown(AFd, SHUT_WR);
+        SetTimeouts(AFd, 300);
+        while fpRecv(AFd, @B[0], SizeOf(B), 0) > 0 do;
         Exit;
+      end;
       Peer := SSL_get_peer_certificate(C.Ssl);
       if Peer <> nil then
       begin
         SawClientCert := True;
+        LastSubject := string(Peer^.SubjectName);
         X509_free(Peer);
       end;
     end;
@@ -759,6 +821,67 @@ begin
       SSL_free(C.Ssl);
     end;
   end;
+end;
+
+{ TCountingSelector }
+
+type
+  /// reads the pool statistics from a second thread: the read waits for the
+  /// pool lock, so it finishes only if the lock is free
+  TStatsProbe = class(TThread)
+  private
+    FClient: THttpClient;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const AClient: THttpClient);
+  end;
+
+constructor TStatsProbe.Create(const AClient: THttpClient);
+begin
+  FClient := AClient;
+  inherited Create(False);
+end;
+
+procedure TStatsProbe.Execute;
+begin
+  FClient.PoolStats;
+end;
+
+function TCountingSelector.Select(const AHost: string;
+  const APort: Word): IClientIdentity;
+var
+  Probe: TStatsProbe;
+  Waited: Integer;
+begin
+  InterlockedIncrement(Calls);
+  LastHost := AHost;
+  LastPort := APort;
+  LastThread := GetCurrentThreadId;
+  if FProbe <> nil then
+  begin
+    Probe := TStatsProbe.Create(FProbe);
+    Waited := 0;
+    while (not Probe.Finished) and (Waited < 2000) do
+    begin
+      Sleep(5);
+      Inc(Waited, 5);
+    end;
+    LockWasFree := Probe.Finished;
+    Probe.WaitFor;
+    Probe.Free;
+  end;
+  if Fail then
+    raise Exception.Create('selector refused');
+  if (ForPort <> 0) and (APort = ForPort) then
+    Result := PortAnswer
+  else
+    Result := Answer;
+end;
+
+procedure TCountingSelector.ProbeLockWith(const AClient: IHttpClient);
+begin
+  FProbe := AClient as THttpClient;
 end;
 
 { TFixedSelector }
@@ -1037,6 +1160,87 @@ begin
   AssertFalse('the proxy was not handed the identity', FProxy.SawClientCert);
 end;
 
+function TMutualTlsTest.ServerUrl(const AServer: TMtlsServer): string;
+begin
+  Result := Format('https://localhost:%d/', [AServer.Port]);
+end;
+
+function TMutualTlsTest.SendTo(const AClient: IHttpClient;
+  const AUrl: string): IHttpResponse;
+begin
+  Result := AClient.Send(THttpRequest.Create(hmGet, AUrl));
+end;
+
+function TMutualTlsTest.ReadBody(const AResponse: IHttpResponse): string;
+var
+  Raw: TBytes;
+begin
+  Raw := ReadAllBodyBytes(AResponse.Body);
+  Result := '';
+  if Length(Raw) > 0 then
+    SetString(Result, PAnsiChar(@Raw[0]), Length(Raw));
+end;
+
+function TMutualTlsTest.Client2Identity: IClientIdentity;
+begin
+  Result := TClientIdentity.FromPemFiles(Fixture('client2-chain.pem'),
+    Fixture('client2.key'));
+end;
+
+/// the subject's common name is exactly AName ('mtls client' is not a match
+/// for 'mtls client two')
+function TMutualTlsTest.SubjectIs(const ASubject, AName: string): Boolean;
+var
+  P, After: Integer;
+begin
+  P := Pos('CN=' + AName, ASubject);
+  After := P + Length('CN=' + AName);
+  Result := (P > 0) and ((After > Length(ASubject)) or
+    (ASubject[After] in [',', '/']));
+end;
+
+/// a client whose identity comes only from ASelector; HTTP/1.1 is allowed so
+/// one connection serves one request and the next request dials again
+function TMutualTlsTest.SelectorClient(
+  const ASelector: IClientIdentitySelector): IHttpClient;
+begin
+  Result := THttpClientFactory.Create
+    .WithCACertFile(Fixture('ca.crt'))
+    .WithConnectTimeout(3000)
+    .WithHeaderTimeout(5000)
+    .WithHttp1Fallback(True)
+    .WithClientIdentitySelector(ASelector)
+    .Build;
+end;
+
+procedure TMutualTlsTest.RunProxyIdentity(const AVersion: Integer);
+var
+  Client: IHttpClient;
+  Body: string;
+begin
+  StartServer(mkH2, AVersion);
+  FProxy := TTunnelProxy.Create(tmHttps, FServer.Port, True);
+  Client := THttpClientFactory.Create
+    .WithCACertFile(Fixture('ca.crt'))
+    .WithClientIdentity(GoodIdentity)
+    .WithProxyClientIdentity(Client2Identity)
+    .WithProxySelector(TFixedSelector.Create(pkHttps, FProxy.Port))
+    .WithConnectTimeout(3000)
+    .WithHeaderTimeout(5000)
+    .Build;
+  AssertEquals('status', 200, Fetch(Client, Body));
+  AssertEquals('body', 'ok', Body);
+  Client.Close;
+  FProxy.Stop;
+  FServer.Stop;
+  AssertEquals('one tunnel', 1, FProxy.Tunnels);
+  AssertTrue('the proxy accepted the proxy identity',
+    SubjectIs(FProxy.LastSubject, 'mtls client two'));
+  AssertEquals('the origin accepted the origin identity', 1, FServer.Handshakes);
+  AssertTrue('the origin saw the origin identity, not the proxy one',
+    SubjectIs(FServer.LastSubject, 'mtls client'));
+end;
+
 { accepted identity }
 
 procedure TMutualTlsTest.TestHttp2WithTheIdentityTls12;
@@ -1296,6 +1500,401 @@ begin
     end;
   end;
   AssertTrue('the scan found the dial sites (' + IntToStr(Seen) + ')', Seen >= 9);
+end;
+
+{ selector and proxy identity }
+
+procedure TMutualTlsTest.TestFixedIdentitySelectorAnswersTheIdentity;
+var
+  Id: IClientIdentity;
+  Sel: IClientIdentitySelector;
+  Client: IHttpClient;
+  Body: string;
+begin
+  Id := GoodIdentity;
+  Sel := FixedIdentitySelector(Id);
+  AssertTrue('the helper answers the identity it wraps',
+    Sel.Select('a.example', 443) = Id);
+  AssertTrue('and the same one for any origin', Sel.Select('b.example', 8443) = Id);
+  AssertTrue('a nil identity gives a nil answer',
+    FixedIdentitySelector(nil).Select('a.example', 443) = nil);
+  // and it behaves as the fixed identity on the wire
+  StartServer(mkH2, cTls13);
+  Client := SelectorClient(Sel);
+  AssertEquals('status', 200, Fetch(Client, Body));
+  Client.Close;
+  FServer.Stop;
+  AssertTrue('the server saw the client certificate',
+    SubjectIs(FServer.LastSubject, 'mtls client'));
+end;
+
+procedure TMutualTlsTest.TestSelectorIsCalledOncePerDialNotPerRequest;
+var
+  Sel: TCountingSelector;
+  SelRef: IClientIdentitySelector;
+  Client: IHttpClient;
+  Body: string;
+  I: Integer;
+begin
+  StartServer(mkH2, cTls13);
+  Sel := TCountingSelector.Create;
+  SelRef := Sel;
+  Sel.Answer := GoodIdentity;
+  Client := SelectorClient(SelRef);
+  for I := 1 to 3 do
+    AssertEquals('status', 200, Fetch(Client, Body));
+  Client.Close;
+  FServer.Stop;
+  AssertEquals('three requests', 3, FServer.Requests);
+  AssertEquals('one connection', 1, FServer.Connections);
+  AssertEquals('one selector call for the one dial', 1, Sel.Calls);
+  AssertEquals('asked for the origin host', 'localhost', Sel.LastHost);
+  AssertEquals('asked for the origin port', FServer.Port, Sel.LastPort);
+end;
+
+procedure TMutualTlsTest.TestSelectorRunsOnTheDiallingThreadOutsideThePoolLock;
+var
+  Sel: TCountingSelector;
+  SelRef: IClientIdentitySelector;
+  Client: IHttpClient;
+  Body: string;
+begin
+  StartServer(mkH2, cTls13);
+  Sel := TCountingSelector.Create;
+  SelRef := Sel;
+  Sel.Answer := GoodIdentity;
+  Client := SelectorClient(SelRef);
+  Sel.ProbeLockWith(Client);
+  AssertEquals('status', 200, Fetch(Client, Body));
+  Client.Close;
+  FServer.Stop;
+  AssertEquals('one call', 1, Sel.Calls);
+  AssertTrue('on the thread that sent the request',
+    Sel.LastThread = GetCurrentThreadId);
+  AssertTrue('another thread could take the pool lock meanwhile',
+    Sel.LockWasFree);
+end;
+
+procedure TMutualTlsTest.TestSelectorChoosesTheIdentityPerOrigin;
+var
+  Other: TMtlsServer;
+  Sel: TCountingSelector;
+  SelRef: IClientIdentitySelector;
+  Client: IHttpClient;
+begin
+  StartServer(mkH2, cTls13);
+  Other := TMtlsServer.Create(mkH2, cTls13);
+  try
+    Sel := TCountingSelector.Create;
+    SelRef := Sel;
+    Sel.Answer := GoodIdentity;
+    Sel.ForPort := Other.Port;
+    Sel.PortAnswer := Client2Identity;
+    Client := SelectorClient(SelRef);
+    AssertEquals('first origin', 200, SendTo(Client, ServerUrl(FServer)).StatusCode);
+    AssertEquals('second origin', 200, SendTo(Client, ServerUrl(Other)).StatusCode);
+    AssertEquals('first again, pooled', 200,
+      SendTo(Client, ServerUrl(FServer)).StatusCode);
+    Client.Close;
+    FServer.Stop;
+    Other.Stop;
+    AssertEquals('two dials, two selector calls', 2, Sel.Calls);
+    AssertTrue('first origin saw the first identity',
+      SubjectIs(FServer.LastSubject, 'mtls client'));
+    AssertTrue('second origin saw the second identity',
+      SubjectIs(Other.LastSubject, 'mtls client two'));
+    AssertEquals('first origin: one handshake', 1, FServer.Handshakes);
+    AssertEquals('second origin: one handshake', 1, Other.Handshakes);
+  finally
+    Other.Stop;
+    Other.Free;
+  end;
+end;
+
+procedure TMutualTlsTest.TestNilAnswerPresentsNoCertificate;
+var
+  Sel: TCountingSelector;
+  SelRef: IClientIdentitySelector;
+  Client: IHttpClient;
+begin
+  StartServer(mkH2, cTls13);
+  Sel := TCountingSelector.Create;
+  SelRef := Sel;
+  Client := SelectorClient(SelRef);
+  AssertEquals('the server asks for a certificate and gets none',
+    'certificate required', AlertOfFetch(Client));
+  Client.Close;
+  FServer.Stop;
+  AssertEquals('one selector call', 1, Sel.Calls);
+  AssertEquals('no handshake completed', 0, FServer.Handshakes);
+end;
+
+procedure TMutualTlsTest.TestThrowingSelectorFailsTheDial;
+var
+  Sel: TCountingSelector;
+  SelRef: IClientIdentitySelector;
+  Client: IHttpClient;
+  Body, Msg: string;
+begin
+  StartServer(mkH2, cTls13);
+  Sel := TCountingSelector.Create;
+  SelRef := Sel;
+  Sel.Fail := True;
+  Client := SelectorClient(SelRef);
+  Msg := '';
+  try
+    Fetch(Client, Body);
+    Fail('the dial must fail');
+  except
+    on E: EHttpTlsConfigError do
+      Msg := E.Message;
+  end;
+  AssertTrue('the selector message is carried: ' + Msg,
+    Pos('selector refused', Msg) > 0);
+  AssertEquals('the failed dial opened no connection', 0, FServer.Connections);
+  // the next request asks again and, once the selector recovers, succeeds
+  Sel.Fail := False;
+  Sel.Answer := GoodIdentity;
+  AssertEquals('status', 200, Fetch(Client, Body));
+  Client.Close;
+  FServer.Stop;
+  AssertEquals('two calls', 2, Sel.Calls);
+  AssertEquals('one connection in all', 1, FServer.Connections);
+end;
+
+procedure TMutualTlsTest.TestRotationOpensANewConnectionAndTheOldOneStillAnswers;
+var
+  Sel: TCountingSelector;
+  SelRef: IClientIdentitySelector;
+  Client: IHttpClient;
+  Old, Fresh: IHttpResponse;
+  Stats: TPoolStats;
+  FpOld, FpNew: string;
+begin
+  StartServer(mkHttp1, cTls13);
+  Sel := TCountingSelector.Create;
+  SelRef := Sel;
+  Sel.Answer := GoodIdentity;
+  FpOld := Sel.Answer.Fingerprint;
+  Client := SelectorClient(SelRef);
+  // the first response is held open, so its connection stays in use
+  Old := SendTo(Client, Url);
+  AssertEquals('first status', 200, Old.StatusCode);
+  AssertTrue('the first connection presented the first identity',
+    SubjectIs(FServer.LastSubject, 'mtls client'));
+  // rotate: the next dial presents the new identity
+  Sel.Answer := Client2Identity;
+  FpNew := Sel.Answer.Fingerprint;
+  Fresh := SendTo(Client, Url);
+  AssertEquals('second status', 200, Fresh.StatusCode);
+  AssertEquals('two selector calls: one per dial', 2, Sel.Calls);
+  AssertTrue('the new connection presented the new identity',
+    SubjectIs(FServer.LastSubject, 'mtls client two'));
+  // the pool keeps the identities apart
+  Stats := (Client as THttpClient).PoolStats;
+  AssertEquals('two pool keys', 2, Length(Stats.PerOrigin));
+  AssertTrue('keys carry the fingerprints',
+    ((Pos(FpOld, Stats.PerOrigin[0].Origin) > 0) and
+     (Pos(FpNew, Stats.PerOrigin[1].Origin) > 0)) or
+    ((Pos(FpNew, Stats.PerOrigin[0].Origin) > 0) and
+     (Pos(FpOld, Stats.PerOrigin[1].Origin) > 0)));
+  // the connection of the replaced certificate still delivers its response
+  AssertEquals('old connection still answers', 'ok', ReadBody(Old));
+  AssertEquals('new connection answers', 'ok', ReadBody(Fresh));
+  Client.Close;
+  FServer.Stop;
+  AssertEquals('two handshakes', 2, FServer.Handshakes);
+end;
+
+procedure TMutualTlsTest.TestNilAnswerNeverSharesAConnectionWithAnIdentity;
+var
+  Sel: TCountingSelector;
+  SelRef: IClientIdentitySelector;
+  Client: IHttpClient;
+  Old: IHttpResponse;
+begin
+  StartServer(mkHttp1, cTls13);
+  Sel := TCountingSelector.Create;
+  SelRef := Sel;
+  Sel.Answer := GoodIdentity;
+  Client := SelectorClient(SelRef);
+  Old := SendTo(Client, Url);
+  AssertEquals('first status', 200, Old.StatusCode);
+  // the selector now answers nil; the open connection holds an identity, so
+  // it must not be used for a request that is to present none
+  Sel.Answer := nil;
+  AssertEquals('the new dial presented no certificate',
+    'certificate required', AlertOfFetch(Client));
+  AssertEquals('two selector calls', 2, Sel.Calls);
+  AssertEquals('old connection still answers', 'ok', ReadBody(Old));
+  Client.Close;
+  FServer.Stop;
+  AssertEquals('one handshake completed', 1, FServer.Handshakes);
+end;
+
+procedure TMutualTlsTest.TestSelectorAppliesToWss;
+var
+  Sel: TCountingSelector;
+  SelRef: IClientIdentitySelector;
+  Client: IHttpClient;
+  Rec: TWsRecorder;
+  RecRef: IWebSocketListener;
+  Sock: IWebSocket;
+begin
+  StartServer(mkWebSocket, cTls13);
+  Sel := TCountingSelector.Create;
+  SelRef := Sel;
+  Sel.Answer := Client2Identity;
+  Client := SelectorClient(SelRef);
+  Rec := TWsRecorder.Create;
+  RecRef := Rec;
+  Sock := Client.Send(TWebSocketRequest.Create(
+    Format('wss://localhost:%d/chat', [FServer.Port]), RecRef).WithAutoRequest);
+  AssertTrue('the server sent a message', Rec.WaitText(4000));
+  Sock.Close;
+  Sleep(50);
+  Client.Close;
+  FServer.Stop;
+  AssertEquals('one selector call', 1, Sel.Calls);
+  AssertEquals('asked for the wss origin', FServer.Port, Sel.LastPort);
+  AssertTrue('the server saw the selector identity',
+    SubjectIs(FServer.LastSubject, 'mtls client two'));
+end;
+
+procedure TMutualTlsTest.TestSelectorIsNotCalledForCleartext;
+var
+  Sel: TCountingSelector;
+  SelRef: IClientIdentitySelector;
+  Client: IHttpClient;
+begin
+  StartServer(mkPlain, 0);
+  Sel := TCountingSelector.Create;
+  SelRef := Sel;
+  Sel.Answer := GoodIdentity;
+  Client := THttpClientFactory.Create
+    .WithClientIdentitySelector(SelRef)
+    .WithClearText(ctHttp1)
+    .WithConnectTimeout(3000)
+    .WithHeaderTimeout(5000)
+    .Build;
+  AssertEquals('status', 200,
+    SendTo(Client, Format('http://localhost:%d/', [FServer.Port])).StatusCode);
+  Client.Close;
+  FServer.Stop;
+  AssertEquals('no handshake, so no question', 0, Sel.Calls);
+end;
+
+procedure TMutualTlsTest.TestSelectorAndFixedIdentityReplaceEachOther;
+var
+  Id: IClientIdentity;
+  Sel: IClientIdentitySelector;
+  F: THttpClientFactory;
+begin
+  Id := GoodIdentity;
+  Sel := FixedIdentitySelector(Id);
+  F := THttpClientFactory.Create.WithClientIdentity(Id)
+    .WithClientIdentitySelector(Sel);
+  AssertTrue('the selector is installed', F.ClientIdentitySelector = Sel);
+  AssertTrue('the fixed identity is gone', F.ClientIdentity = nil);
+  F := F.WithClientIdentity(Id);
+  AssertTrue('the fixed identity is back', F.ClientIdentity = Id);
+  AssertTrue('the selector is gone', F.ClientIdentitySelector = nil);
+  F := F.WithClientIdentitySelector(Sel).WithClientIdentitySelector(nil);
+  AssertTrue('nil removes the selector', F.ClientIdentitySelector = nil);
+end;
+
+/// the https proxy demands a certificate; the origin is told nothing of it
+procedure TMutualTlsTest.TestProxyIdentityGoesToTheProxyOnlyTls13;
+begin
+  RunProxyIdentity(cTls13);
+end;
+
+procedure TMutualTlsTest.TestProxyIdentityGoesToTheProxyOnlyTls12;
+begin
+  RunProxyIdentity(cTls12);
+end;
+
+procedure TMutualTlsTest.TestOriginIdentityAloneDoesNotSatisfyAProxyThatAsksForOne;
+var
+  Client: IHttpClient;
+  Body: string;
+  Failed: Boolean;
+begin
+  StartServer(mkH2, cTls13);
+  FProxy := TTunnelProxy.Create(tmHttps, FServer.Port, True);
+  Client := NewClient(GoodIdentity);
+  Failed := False;
+  try
+    Fetch(Client, Body);
+  except
+    on E: EHttpConnectionError do
+      Failed := True;
+  end;
+  AssertTrue('the proxy must refuse a client without its own identity', Failed);
+  Client.Close;
+  FProxy.Stop;
+  FServer.Stop;
+  AssertEquals('the proxy accepted no certificate', '', FProxy.LastSubject);
+  AssertEquals('no tunnel', 0, FProxy.Tunnels);
+  AssertEquals('the origin was never reached', 0, FServer.Connections);
+end;
+
+procedure TMutualTlsTest.TestProxyIdentityDoesNotReachACleartextOrigin;
+var
+  Client: IHttpClient;
+begin
+  // http origin through an https proxy: the TLS leg is the proxy's, and it
+  // gets the proxy identity; there is no origin handshake to hand anything to
+  StartServer(mkPlain, 0);
+  FProxy := TTunnelProxy.Create(tmHttps, FServer.Port, True);
+  Client := THttpClientFactory.Create
+    .WithCACertFile(Fixture('ca.crt'))
+    .WithClientIdentity(GoodIdentity)
+    .WithProxyClientIdentity(Client2Identity)
+    .WithProxySelector(TFixedSelector.Create(pkHttps, FProxy.Port))
+    .WithClearText(ctHttp1)
+    .WithConnectTimeout(3000)
+    .WithHeaderTimeout(5000)
+    .Build;
+  AssertEquals('status', 200,
+    SendTo(Client, Format('http://localhost:%d/', [FServer.Port])).StatusCode);
+  Client.Close;
+  FProxy.Stop;
+  FServer.Stop;
+  AssertTrue('the proxy saw the proxy identity',
+    SubjectIs(FProxy.LastSubject, 'mtls client two'));
+  AssertEquals('one origin request', 1, FServer.Requests);
+end;
+
+procedure TMutualTlsTest.TestSelectorAndProxyIdentityTogether;
+var
+  Sel: TCountingSelector;
+  SelRef: IClientIdentitySelector;
+  Client: IHttpClient;
+begin
+  StartServer(mkH2, cTls13);
+  FProxy := TTunnelProxy.Create(tmHttps, FServer.Port, True);
+  Sel := TCountingSelector.Create;
+  SelRef := Sel;
+  Sel.Answer := GoodIdentity;
+  Client := THttpClientFactory.Create
+    .WithCACertFile(Fixture('ca.crt'))
+    .WithClientIdentitySelector(SelRef)
+    .WithProxyClientIdentity(Client2Identity)
+    .WithProxySelector(TFixedSelector.Create(pkHttps, FProxy.Port))
+    .WithConnectTimeout(3000)
+    .WithHeaderTimeout(5000)
+    .Build;
+  AssertEquals('status', 200, SendTo(Client, Url).StatusCode);
+  AssertEquals('pooled', 200, SendTo(Client, Url).StatusCode);
+  Client.Close;
+  FProxy.Stop;
+  FServer.Stop;
+  AssertEquals('one dial, one call', 1, Sel.Calls);
+  AssertTrue('the proxy saw the proxy identity',
+    SubjectIs(FProxy.LastSubject, 'mtls client two'));
+  AssertTrue('the origin saw the selector identity',
+    SubjectIs(FServer.LastSubject, 'mtls client'));
 end;
 
 { other }

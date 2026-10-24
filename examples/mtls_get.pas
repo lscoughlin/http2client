@@ -1,9 +1,18 @@
-/// http2client example: one GET, or a wss session, with a client certificate.
+/// http2client example: GETs, or a wss session, with a client certificate.
 // - build: `make examples`
 // - run:   bin/mtls_get https://localhost:8443/ client.crt client.key [ca.crt [passphrase]]
 //          bin/mtls_get wss://localhost:8443/ws client.crt client.key ca.crt
-//          a certificate of `-` presents no identity
-// - shows: WithClientCertificateFiles, a bad identity failing at Build, and the
+//          a certificate of `-` presents no identity; the URL may be a comma
+//          separated list, fetched in turn by the one client
+// - env:   MTLS_SELECT=port:cert:key[;port:cert:key...] picks the identity per
+//          origin port with a selector that reads the files at each dial (so a
+//          replaced file is presented by the next new connection), in place of
+//          the certificate arguments
+//          MTLS_PROXY=port routes every request through an https proxy on
+//          localhost:port; MTLS_PROXY_CERT and MTLS_PROXY_KEY are the identity
+//          that proxy requires (never sent to the origin)
+// - shows: WithClientCertificateFiles, WithClientIdentitySelector,
+//   WithProxyClientIdentity, a bad identity failing at Build, and the
 //   distinct EHttpTlsClientAuthError when the server rejects the certificate.
 program example_mtls_get;
 
@@ -11,10 +20,29 @@ program example_mtls_get;
 
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
-  SysUtils, SyncObjs, Http2.Errors, Http2.Stream, Http2.Messages,
-  Http2.Client, Http2.WebSocket;
+  SysUtils, Classes, SyncObjs, Http2.Errors, Http2.Stream, Http2.Messages,
+  Http2.ClientCert, Http2.Proxy, Http2.Client, Http2.WebSocket;
 
 type
+  /// MTLS_SELECT: the identity files for each origin port, read at every dial
+  TFileSelector = class(TInterfacedObject, IClientIdentitySelector)
+  private
+    FEntries: TStringList;   // port=cert|key
+  public
+    constructor Create(const ASpec: string);
+    destructor Destroy; override;
+    function Select(const AHost: string; const APort: Word): IClientIdentity;
+  end;
+
+  /// every request goes through one https proxy
+  TFixedHttpsProxy = class(TInterfacedObject, IProxySelector)
+  private
+    FProxy: IProxy;
+  public
+    constructor Create(const APort: Word);
+    function SelectProxy(const AUri: string): IProxy;
+  end;
+
   /// remembers the first text message and wakes the main thread
   TFirstText = class(TWebSocketListener)
   public
@@ -45,8 +73,73 @@ begin
   Done.SetEvent;
 end;
 
+constructor TFileSelector.Create(const ASpec: string);
+var
+  Parts: TStringList;
+  I: Integer;
+  Entry: TStringList;
+begin
+  inherited Create;
+  FEntries := TStringList.Create;
+  Parts := TStringList.Create;
+  Entry := TStringList.Create;
+  try
+    Parts.Delimiter := ';';
+    Parts.StrictDelimiter := True;
+    Parts.DelimitedText := ASpec;
+    for I := 0 to Parts.Count - 1 do
+    begin
+      Entry.Delimiter := ':';
+      Entry.StrictDelimiter := True;
+      Entry.DelimitedText := Parts[I];
+      if Entry.Count = 3 then
+        FEntries.Add(Entry[0] + '=' + Entry[1] + '|' + Entry[2]);
+    end;
+  finally
+    Entry.Free;
+    Parts.Free;
+  end;
+end;
+
+destructor TFileSelector.Destroy;
+begin
+  FEntries.Free;
+  inherited Destroy;
+end;
+
+function TFileSelector.Select(const AHost: string;
+  const APort: Word): IClientIdentity;
+var
+  Value: string;
+  P: Integer;
+begin
+  // no entry for the port: present nothing
+  Result := nil;
+  Value := FEntries.Values[IntToStr(APort)];
+  P := Pos('|', Value);
+  if P = 0 then
+    Exit;
+  // read from disk now, so a file replaced since the last dial is picked up
+  Result := TClientIdentity.FromPemFiles(Copy(Value, 1, P - 1),
+    Copy(Value, P + 1, MaxInt));
+end;
+
+constructor TFixedHttpsProxy.Create(const APort: Word);
+begin
+  inherited Create;
+  FProxy := TProxy.Create(pkHttps, 'localhost', APort);
+end;
+
+function TFixedHttpsProxy.SelectProxy(const AUri: string): IProxy;
+begin
+  Result := FProxy;
+end;
+
 var
   Factory: THttpClientFactory;
+  Urls: TStringList;
+  UrlIndex: Integer;
+  SelectSpec, ProxyPort, ProxyCert, ProxyKey: string;
   Client: IHttpClient;
   Response: IHttpResponse;
   Listener: TFirstText;
@@ -69,12 +162,24 @@ begin
 
   // HTTP/1.1 is accepted as well as HTTP/2, so any server will do
   Factory := THttpClientFactory.Create.WithHttp1Fallback(True);
-  if ParamStr(2) <> '-' then
+  SelectSpec := GetEnvironmentVariable('MTLS_SELECT');
+  ProxyPort := GetEnvironmentVariable('MTLS_PROXY');
+  ProxyCert := GetEnvironmentVariable('MTLS_PROXY_CERT');
+  ProxyKey := GetEnvironmentVariable('MTLS_PROXY_KEY');
+  if SelectSpec <> '' then
+    Factory := Factory.WithClientIdentitySelector(TFileSelector.Create(SelectSpec))
+  else if ParamStr(2) <> '-' then
     Factory := Factory.WithClientCertificateFiles(ParamStr(2), ParamStr(3),
       Passphrase);
+  if ProxyPort <> '' then
+    Factory := Factory.WithProxySelector(
+      TFixedHttpsProxy.Create(Word(StrToInt(ProxyPort))));
   if CaFile <> '' then
     Factory := Factory.WithCACertFile(CaFile);
   try
+    if ProxyCert <> '' then
+      Factory := Factory.WithProxyClientIdentity(
+        TClientIdentity.FromPemFiles(ProxyCert, ProxyKey));
     // an unreadable file, a wrong passphrase, a key that does not match the
     // certificate and an expired certificate all fail here, not on the request
     Client := Factory.Build;
@@ -85,26 +190,31 @@ begin
       Halt(1);
     end;
   end;
+  Urls := TStringList.Create;
+  Urls.Delimiter := ',';
+  Urls.StrictDelimiter := True;
+  Urls.DelimitedText := ParamStr(1);
   try
     try
-      if Pos('wss://', ParamStr(1)) = 1 then
-      begin
-        Listener := TFirstText.Create;
-        ListenerRef := Listener;
-        Socket := Client.Send(TWebSocketRequest.Create(ParamStr(1), ListenerRef)
-          .WithAutoRequest);
-        if Listener.Done.WaitFor(5000) = wrSignaled then
-          WriteLn('message: ', Listener.Text)
+      for UrlIndex := 0 to Urls.Count - 1 do
+        if Pos('wss://', Urls[UrlIndex]) = 1 then
+        begin
+          Listener := TFirstText.Create;
+          ListenerRef := Listener;
+          Socket := Client.Send(TWebSocketRequest.Create(Urls[UrlIndex],
+            ListenerRef).WithAutoRequest);
+          if Listener.Done.WaitFor(5000) = wrSignaled then
+            WriteLn('message: ', Listener.Text)
+          else
+            WriteLn(StdErr, 'no message arrived');
+          Socket.Close;
+        end
         else
-          WriteLn(StdErr, 'no message arrived');
-        Socket.Close;
-      end
-      else
-      begin
-        Response := Client.Send(THttpRequest.Create(hmGet, ParamStr(1)));
-        WriteLn('status: ', Response.StatusCode);
-        WriteLn('body bytes: ', Length(ReadText(Response)));
-      end;
+        begin
+          Response := Client.Send(THttpRequest.Create(hmGet, Urls[UrlIndex]));
+          WriteLn('status: ', Response.StatusCode);
+          WriteLn('body bytes: ', Length(ReadText(Response)));
+        end;
     except
       on E: EHttpTlsClientAuthError do
       begin
@@ -120,5 +230,6 @@ begin
     end;
   finally
     Client.Close;
+    Urls.Free;
   end;
 end.

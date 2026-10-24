@@ -66,6 +66,9 @@ type
     function WithClientIdentity(const AIdentity: IClientIdentity): THttpClientFactory;
     function WithClientCertificateFiles(const ACertFile, AKeyFile: string;
       const APassphrase: string = ''): THttpClientFactory;
+    function WithClientIdentitySelector(
+      const ASelector: IClientIdentitySelector): THttpClientFactory;
+    function WithProxyClientIdentity(const AIdentity: IClientIdentity): THttpClientFactory;
     function WithHttp1Fallback(const AEnable: Boolean = True): THttpClientFactory;
     function WithClearText(const APolicy: TClearTextPolicy): THttpClientFactory;
     function WithObserver(const AObserver: IHttp2Observer): THttpClientFactory;
@@ -149,7 +152,13 @@ default). `WithClientIdentity` presents a client certificate on every TLS
 connection to an origin (mutual TLS), and `WithClientCertificateFiles` loads
 one from PEM files; `Build` raises `EHttpTlsConfigError` for an identity that
 cannot be used, and a server that refuses the certificate raises
-`EHttpTlsClientAuthError`. See [mtls](mtls.md). `WithObserver` installs an `IHttp2Observer` for connection,
+`EHttpTlsClientAuthError`. `WithClientIdentitySelector` asks an
+`IClientIdentitySelector` for the identity of each new TLS connection (once per
+dial, outside the pool lock), which gives a different identity per origin and
+certificate rotation; with it installed the pool key carries the identity
+fingerprint. `WithProxyClientIdentity` answers an `https://` proxy that
+requires a client certificate, and the identity goes to that proxy only. See
+[mtls](mtls.md). `WithObserver` installs an `IHttp2Observer` for connection,
 stream, and frame-level events — see [testing-observability](testing-observability.md).
 
 `WithRequestObserver` installs an `IHttpClientObserver`, the request-level

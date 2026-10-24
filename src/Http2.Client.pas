@@ -102,27 +102,34 @@ type
   /// behaviour byte-for-byte: an injected test factory that only knows
   /// IHttp2SocketFactory still works unchanged on the https path.
   TDefaultSocketFactory = class(TInterfacedObject, IHttp2SocketFactory,
-    ICleartextSocketFactory, IProxySocketFactory, IHttp1SocketFactory)
+    ICleartextSocketFactory, IProxySocketFactory, IHttp1SocketFactory,
+    IIdentitySocketFactory)
   private
     FCACertFile: string;
     FInsecure: Boolean;
     FProxyHost: string;
     FProxyPort: Word;
     FIdentity: IClientIdentity;
+    FProxyIdentity: IClientIdentity;
     FLogger: IHttpLogger;
     FProtocols: TProtocolSocketFactory;
     /// debug line naming the identity a TLS dial to AHost:APort installs
-    procedure LogIdentity(const AHost: string; const APort: Word);
+    procedure LogIdentity(const AHost: string; const APort: Word;
+      const AIdentity: IClientIdentity);
   public
-    /// AIdentity is presented on every TLS connection to an origin; ALogger
-    /// (may be nil) receives the debug line that names it
+    /// AIdentity is presented on every TLS connection to an origin and
+    /// AProxyIdentity on the TLS leg to an https proxy, never the other way
+    /// round; ALogger (may be nil) receives the debug line that names the
+    /// origin identity
     constructor Create(const ACACertFile: string = '';
       const AInsecure: Boolean = False; const AProxyHost: string = '';
       const AProxyPort: Word = 0; const AIdentity: IClientIdentity = nil;
-      const ALogger: IHttpLogger = nil);
-    /// a copy of this factory that presents AIdentity and logs to ALogger
+      const ALogger: IHttpLogger = nil;
+      const AProxyIdentity: IClientIdentity = nil);
+    /// a copy of this factory that presents the identities and logs to ALogger
     function WithIdentity(const AIdentity: IClientIdentity;
-      const ALogger: IHttpLogger): TDefaultSocketFactory;
+      const ALogger: IHttpLogger;
+      const AProxyIdentity: IClientIdentity = nil): TDefaultSocketFactory;
     function Dial(const AHost: string; const APort: Word;
       const ATimeoutMs: Integer): IHttp2Socket;
     function DialProtocol(const AHost: string; const APort: Word;
@@ -140,6 +147,16 @@ type
     function DialHttp1(const AHost: string; const APort: Word;
       const AScheme: string; const ATimeoutMs: Integer;
       const AProxy: IProxy): IHttp2Socket;
+    /// DialProtocolVia and DialHttp1 with the origin identity chosen by the
+    /// caller (the selector's answer) instead of the fixed one
+    function DialProtocolViaAs(const AHost: string; const APort: Word;
+      const AScheme: string; const AHttp1Fallback: Boolean;
+      const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
+      const AProxy: IProxy; const AIdentity: IClientIdentity;
+      out AProtocol: TNegotiatedProtocol): IHttp2Socket;
+    function DialHttp1As(const AHost: string; const APort: Word;
+      const AScheme: string; const ATimeoutMs: Integer;
+      const AProxy: IProxy; const AIdentity: IClientIdentity): IHttp2Socket;
   end;
 
   /// an HTTP/2 response. Pseudo-headers
@@ -289,6 +306,8 @@ type
     FLogger: IHttpLogger;
     FIdentity: IClientIdentity;
     FIdentityError: string;   // a deferred WithClientCertificateFiles failure
+    FIdentitySelector: IClientIdentitySelector;
+    FProxyIdentity: IClientIdentity;
   public
     class function Create: THttpClientFactory; static;
     /// compatibility shim: sets BOTH the per-host and the total cap to AMax,
@@ -338,6 +357,21 @@ type
     /// Cleartext connections ignore it.  Build raises EHttpTlsConfigError when
     /// the leaf certificate has expired.  nil removes it.
     function WithClientIdentity(const AIdentity: IClientIdentity): THttpClientFactory;
+    /// ask ASelector for the identity of each new TLS connection to an origin
+    /// (doc/design/mtls.md "Selector and proxy identity"), in place of a fixed
+    /// identity.  It is called once per dial, on the dialling thread and
+    /// outside the pool lock, with the origin's host and port; nil presents no
+    /// certificate and an exception fails that dial with EHttpTlsConfigError.
+    /// A selector that returns a fresh identity rotates the certificate: the
+    /// next new connection presents it and older connections serve until they
+    /// close.  The pool key then carries the identity fingerprint, so two
+    /// identities never share a connection.  nil removes it.
+    function WithClientIdentitySelector(
+      const ASelector: IClientIdentitySelector): THttpClientFactory;
+    /// present AIdentity to an https proxy on the TLS leg to the proxy, and
+    /// nowhere else; the origin identity is never sent to the proxy.  nil
+    /// removes it.  Build raises EHttpTlsConfigError when the leaf has expired.
+    function WithProxyClientIdentity(const AIdentity: IClientIdentity): THttpClientFactory;
     /// load a PEM certificate chain (leaf first) and key, then WithClientIdentity.
     /// A file that cannot be loaded raises EHttpTlsConfigError from Build, so
     /// the passphrase is not kept past this call.
@@ -386,6 +420,9 @@ type
     property CACertFile: string read FCACertFile;
     property InsecureTls: Boolean read FInsecure;
     property ClientIdentity: IClientIdentity read FIdentity;
+    property ClientIdentitySelector: IClientIdentitySelector
+      read FIdentitySelector;
+    property ProxyClientIdentity: IClientIdentity read FProxyIdentity;
     property Observer: IHttp2Observer read FObserver;
     property RequestObservers: TArray<IHttpClientObserver>
       read FRequestObservers;
@@ -646,13 +683,22 @@ type
     FCreatedAt: TDictionary<Pointer, QWord>;
     /// callers parked in Acquire waiting for a slot, per origin key
     FPending: TDictionary<string, Integer>;
+    /// the selector that chooses the origin identity of each new TLS
+    /// connection (nil = the factory's fixed identity); set once by Build
+    FIdentitySelector: IClientIdentitySelector;
+    /// the fingerprint the last dial to a pool key presented, so a request
+    /// finds its connections without calling the selector; guarded by FLock
+    FIdentityKeys: TDictionary<string, string>;
     /// the TCP+TLS-or-cleartext dial for ARequest's scheme (fallback on https,
     /// the policy on http); out AProtocol names the negotiated wire protocol.
     /// Uses the extended ICleartextSocketFactory contract when the factory
     /// supports it, else the legacy Dial (npHttp2Tls) so an injected test
     /// factory keeps working
+    // - AUseIdentity True hands AIdentity (the selector's answer, possibly
+    //   nil) to a factory that takes the identity per dial
     function DialFor(const AHost: string; const APort: Word;
       const AScheme: string; const ATimeoutMs: Integer; const AProxy: IProxy;
+      const AUseIdentity: Boolean; const AIdentity: IClientIdentity;
       out AProtocol: TNegotiatedProtocol): IHttp2Socket;
     /// wrap Sock as an HTTP/2 pooled connection.  AStart True runs the thread
     /// and waits for csOpen (preface + SETTINGS written by DoPreface); False
@@ -673,6 +719,7 @@ type
     function OpenForTxn(const AOrigin, AHost: string; const APort: Word;
       const ARequest: TStreamRequest; const AHeaderTimeoutMs: Integer;
       const AScheme: string; const AProxy: IProxy;
+      const AUseIdentity: Boolean; const AIdentity: IClientIdentity;
       out AConn: IPooledConnection; out AUpgraded: Boolean;
       out AFirst: IHttpResponse): Boolean;
     /// write the h2c Upgrade request on Sock and read the whole response head
@@ -709,7 +756,10 @@ type
     /// non-nil the wait is cancellable (plan S10 task 10.8).  The request's
     /// scheme selects TLS vs cleartext and the HTTP/2 vs HTTP/1.1 codec.
     /// AOrigin is the pool key (the plain origin when direct, origin plus the
-    /// proxy route otherwise); AProxy is the route to dial on a new connection
+    /// proxy route otherwise); AProxy is the route to dial on a new connection.
+    /// With an identity selector installed an https request is keyed by the
+    /// identity fingerprint as well, and the selector is asked (outside FLock)
+    /// only when a new connection has to be dialled
     function Acquire(const AOrigin, AHost: string; const APort: Word;
       const ARequest: TStreamRequest; const AHeaderTimeoutMs: Integer;
       const AToken: ICancellationToken = nil;
@@ -718,6 +768,9 @@ type
     /// the pool stays within MaxTotalConnections (plan S10 task 10.7).
     procedure ReapIdle;
     procedure Close;
+    /// install the identity selector (called by Build, before any request)
+    property IdentitySelector: IClientIdentitySelector
+      read FIdentitySelector write FIdentitySelector;
     /// a snapshot of the counts, copied under FLock and returned by value
     function Stats: TPoolStats;
     // test seams
@@ -749,6 +802,8 @@ type
     /// the request observers folded into one (nil when none is installed)
     FRequestObserver: IHttpClientObserver;
     FClonedAttempts: Integer;
+    /// nil = the factory's fixed identity (or none)
+    FIdentitySelector: IClientIdentitySelector;
     function SendOnce(const ARequest: THttpRequest;
       const AExchange: IExchangeObserver): IHttpResponse;
   public
@@ -772,6 +827,8 @@ type
     procedure InstallRequestObservers(
       const AObservers: TArray<IHttpClientObserver>;
       const ALogger: IHttpLogger);
+    /// install the origin identity selector (called by Build)
+    procedure InstallIdentitySelector(const ASelector: IClientIdentitySelector);
     /// the pool (test seam)
     property Pool: TConnectionPool read FPool;
     /// attempts that were cloned for an observer (test seam): stays 0 for a
@@ -1880,11 +1937,58 @@ begin
     (AStatus = 307) or (AStatus = 308);
 end;
 
+/// ask ASelector for the identity of a dial to AHost:APort; any exception it
+// raises fails the dial with EHttpTlsConfigError carrying its message
+function ChooseClientIdentity(const ASelector: IClientIdentitySelector;
+  const AHost: string; const APort: Word): IClientIdentity;
+begin
+  try
+    Result := ASelector.Select(AHost, APort);
+  except
+    on E: Exception do
+      raise EHttpTlsConfigError.CreateFmt(
+        'the client identity selector failed for %s:%d: %s',
+        [AHost, APort, E.Message]);
+  end;
+end;
+
+type
+  /// an HTTP/1.1 dialer that hands one selector answer to the factory, for a
+  /// WebSocket dial (it never goes through the pool)
+  TIdentityHttp1Dialer = class(TInterfacedObject, IHttp1SocketFactory)
+  private
+    FFactory: IIdentitySocketFactory;
+    FIdentity: IClientIdentity;
+  public
+    constructor Create(const AFactory: IIdentitySocketFactory;
+      const AIdentity: IClientIdentity);
+    function DialHttp1(const AHost: string; const APort: Word;
+      const AScheme: string; const ATimeoutMs: Integer;
+      const AProxy: IProxy): IHttp2Socket;
+  end;
+
+constructor TIdentityHttp1Dialer.Create(const AFactory: IIdentitySocketFactory;
+  const AIdentity: IClientIdentity);
+begin
+  inherited Create;
+  FFactory := AFactory;
+  FIdentity := AIdentity;
+end;
+
+function TIdentityHttp1Dialer.DialHttp1(const AHost: string; const APort: Word;
+  const AScheme: string; const ATimeoutMs: Integer;
+  const AProxy: IProxy): IHttp2Socket;
+begin
+  Result := FFactory.DialHttp1As(AHost, APort, AScheme, ATimeoutMs, AProxy,
+    FIdentity);
+end;
+
 { IHttp2SocketFactory }
 
 constructor TDefaultSocketFactory.Create(const ACACertFile: string;
   const AInsecure: Boolean; const AProxyHost: string; const AProxyPort: Word;
-  const AIdentity: IClientIdentity; const ALogger: IHttpLogger);
+  const AIdentity: IClientIdentity; const ALogger: IHttpLogger;
+  const AProxyIdentity: IClientIdentity);
 begin
   inherited Create;
   FCACertFile := ACACertFile;
@@ -1892,28 +1996,30 @@ begin
   FProxyHost := AProxyHost;
   FProxyPort := AProxyPort;
   FIdentity := AIdentity;
+  FProxyIdentity := AProxyIdentity;
   FLogger := ALogger;
   FProtocols := TProtocolSocketFactory.Create(ACACertFile, AInsecure, AProxyHost,
-    AProxyPort, AIdentity);
+    AProxyPort, AIdentity, AProxyIdentity);
 end;
 
 function TDefaultSocketFactory.WithIdentity(const AIdentity: IClientIdentity;
-  const ALogger: IHttpLogger): TDefaultSocketFactory;
+  const ALogger: IHttpLogger;
+  const AProxyIdentity: IClientIdentity): TDefaultSocketFactory;
 begin
   Result := TDefaultSocketFactory.Create(FCACertFile, FInsecure, FProxyHost,
-    FProxyPort, AIdentity, ALogger);
+    FProxyPort, AIdentity, ALogger, AProxyIdentity);
 end;
 
 procedure TDefaultSocketFactory.LogIdentity(const AHost: string;
-  const APort: Word);
+  const APort: Word; const AIdentity: IClientIdentity);
 begin
-  if (FIdentity = nil) or (FLogger = nil) then
+  if (AIdentity = nil) or (FLogger = nil) then
     Exit;
   // only the subject and the fingerprint: never the PEM, a path or a passphrase
   try
     FLogger.Log(llDebug, Format(
       'TLS to %s:%d presents client identity subject="%s" fingerprint=%s',
-      [AHost, APort, FIdentity.Subject, FIdentity.Fingerprint]));
+      [AHost, APort, AIdentity.Subject, AIdentity.Fingerprint]));
   except
     // a logger that raises must not break a dial
   end;
@@ -1922,7 +2028,7 @@ end;
 function TDefaultSocketFactory.Dial(const AHost: string; const APort: Word;
   const ATimeoutMs: Integer): IHttp2Socket;
 begin
-  LogIdentity(AHost, APort);
+  LogIdentity(AHost, APort, FIdentity);
   Result := TTlsSocket.Dial(AHost, APort, FInsecure, ATimeoutMs, FCACertFile,
     FProxyHost, FProxyPort, FIdentity);
 end;
@@ -1940,15 +2046,33 @@ function TDefaultSocketFactory.DialHttp1(const AHost: string;
   const APort: Word; const AScheme: string; const ATimeoutMs: Integer;
   const AProxy: IProxy): IHttp2Socket;
 begin
+  Result := DialHttp1As(AHost, APort, AScheme, ATimeoutMs, AProxy, FIdentity);
+end;
+
+function TDefaultSocketFactory.DialHttp1As(const AHost: string;
+  const APort: Word; const AScheme: string; const ATimeoutMs: Integer;
+  const AProxy: IProxy; const AIdentity: IClientIdentity): IHttp2Socket;
+begin
   if AScheme <> 'http' then
-    LogIdentity(AHost, APort);
-  Result := FProtocols.DialHttp1(AHost, APort, AScheme, ATimeoutMs, AProxy);
+    LogIdentity(AHost, APort, AIdentity);
+  Result := FProtocols.DialHttp1As(AHost, APort, AScheme, ATimeoutMs, AProxy,
+    AIdentity);
 end;
 
 function TDefaultSocketFactory.DialProtocolVia(const AHost: string;
   const APort: Word; const AScheme: string; const AHttp1Fallback: Boolean;
   const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
   const AProxy: IProxy;
+  out AProtocol: TNegotiatedProtocol): IHttp2Socket;
+begin
+  Result := DialProtocolViaAs(AHost, APort, AScheme, AHttp1Fallback, APolicy,
+    ATimeoutMs, AProxy, FIdentity, AProtocol);
+end;
+
+function TDefaultSocketFactory.DialProtocolViaAs(const AHost: string;
+  const APort: Word; const AScheme: string; const AHttp1Fallback: Boolean;
+  const APolicy: TClearTextPolicy; const ATimeoutMs: Integer;
+  const AProxy: IProxy; const AIdentity: IClientIdentity;
   out AProtocol: TNegotiatedProtocol): IHttp2Socket;
 var
   Sock: IHttp2Socket;
@@ -1973,9 +2097,9 @@ begin
   // selected name to a codec.  DialWithAlpn reports the name instead of
   // enforcing "h2", so the mapping happens here
   // (doc/design/fallback.md "Negotiation").
-  LogIdentity(AHost, APort);
+  LogIdentity(AHost, APort, AIdentity);
   Sock := TTlsSocket.DialWithAlpnVia(AHost, APort, AlpnOfferFor(AHttp1Fallback),
-    FInsecure, ATimeoutMs, FCACertFile, Proxy, FIdentity);
+    FInsecure, ATimeoutMs, FCACertFile, Proxy, AIdentity, FProxyIdentity);
   // downcast with Supports, NOT a hard class cast: a hard cast reinterprets
   // the interface pointer (which is not the object base) and reads garbage
   Name := '';
@@ -2248,6 +2372,8 @@ begin
   Result.FInsecure := False;
   Result.FIdentity := nil;
   Result.FIdentityError := '';
+  Result.FIdentitySelector := nil;
+  Result.FProxyIdentity := nil;
   Result.FObserver := nil;
   Result.FRequestObservers := nil;
   Result.FLogger := nil;
@@ -2383,6 +2509,23 @@ begin
   Result := Self;
   Result.FIdentity := AIdentity;
   Result.FIdentityError := '';
+  Result.FIdentitySelector := nil;
+end;
+
+function THttpClientFactory.WithClientIdentitySelector(
+  const ASelector: IClientIdentitySelector): THttpClientFactory;
+begin
+  Result := Self;
+  Result.FIdentitySelector := ASelector;
+  Result.FIdentity := nil;
+  Result.FIdentityError := '';
+end;
+
+function THttpClientFactory.WithProxyClientIdentity(
+  const AIdentity: IClientIdentity): THttpClientFactory;
+begin
+  Result := Self;
+  Result.FProxyIdentity := AIdentity;
 end;
 
 function THttpClientFactory.WithClientCertificateFiles(const ACertFile,
@@ -2393,6 +2536,7 @@ begin
     Result.FIdentity := TClientIdentity.FromPemFiles(ACertFile, AKeyFile,
       APassphrase);
     Result.FIdentityError := '';
+    Result.FIdentitySelector := nil;
   except
     on E: EHttpTlsConfigError do
     begin
@@ -2480,16 +2624,22 @@ begin
     raise EHttpTlsConfigError.Create(FIdentityError);
   Factory := FSocketFactory;
   if FIdentity <> nil then
-  begin
     if FIdentity.NotAfter < LocalTimeToUniversal(Now) then
       raise EHttpTlsConfigError.CreateFmt(
         'the client certificate expired on %s UTC',
         [FormatDateTime('yyyy-mm-dd hh:nn:ss', FIdentity.NotAfter)]);
-    // an injected transport factory is the test seam and is left alone
-    if Factory is TDefaultSocketFactory then
-      Factory := TDefaultSocketFactory(Factory as TObject).WithIdentity(
-        FIdentity, FLogger);
-  end;
+  if FProxyIdentity <> nil then
+    if FProxyIdentity.NotAfter < LocalTimeToUniversal(Now) then
+      raise EHttpTlsConfigError.CreateFmt(
+        'the proxy client certificate expired on %s UTC',
+        [FormatDateTime('yyyy-mm-dd hh:nn:ss', FProxyIdentity.NotAfter)]);
+  // an injected transport factory is the test seam and is left alone; with a
+  // selector installed the fixed identity is nil and each dial is handed the
+  // selector's answer instead
+  if ((FIdentity <> nil) or (FProxyIdentity <> nil) or
+      (FIdentitySelector <> nil)) and (Factory is TDefaultSocketFactory) then
+    Factory := TDefaultSocketFactory(Factory as TObject).WithIdentity(
+      FIdentity, FLogger, FProxyIdentity);
   // every proxy source collapses into one selector here (nil = all direct);
   // an unusable proxy value raises EHttpProxyConfigError before any request
   Fixed := nil;
@@ -2508,6 +2658,7 @@ begin
     FMaxRedirects, FConnectTimeoutMs, FHeaderTimeoutMs, FIdleTimeoutMs,
     FObserver, FHttp1Fallback, FClearTextPolicy, Selector);
   Client.InstallRequestObservers(FRequestObservers, FLogger);
+  Client.InstallIdentitySelector(FIdentitySelector);
   Result := Client;
 end;
 
@@ -3113,6 +3264,7 @@ begin
   FIdleSince := TDictionary<Pointer, QWord>.Create;
   FCreatedAt := TDictionary<Pointer, QWord>.Create;
   FPending := TDictionary<string, Integer>.Create;
+  FIdentityKeys := TDictionary<string, string>.Create;
   FFactory := AFactory;
   FObserver := AObserver;
   FMaxConnectionsPerHost := AMaxConnectionsPerHost;
@@ -3146,6 +3298,7 @@ begin
   FIdleSince.Free;
   FCreatedAt.Free;
   FPending.Free;
+  FIdentityKeys.Free;
   FLock.Free;
   inherited Destroy;
 end;
@@ -3257,11 +3410,18 @@ end;
 
 function TConnectionPool.DialFor(const AHost: string; const APort: Word;
   const AScheme: string; const ATimeoutMs: Integer; const AProxy: IProxy;
+  const AUseIdentity: Boolean; const AIdentity: IClientIdentity;
   out AProtocol: TNegotiatedProtocol): IHttp2Socket;
 var
   CF: ICleartextSocketFactory;
   PF: IProxySocketFactory;
+  IdFactory: IIdentitySocketFactory;
 begin
+  // the selector's answer, nil included, replaces the factory's fixed identity
+  if AUseIdentity and Supports(FFactory, IIdentitySocketFactory, IdFactory) then
+    Exit(IdFactory.DialProtocolViaAs(AHost, APort, AScheme, FHttp1Fallback,
+      FClearTextPolicy, ATimeoutMs, AProxy, AIdentity, AProtocol));
+
   // a factory that takes the route per dial (the default factory) gets the
   // proxy chosen for this request; nil dials directly
   if Supports(FFactory, IProxySocketFactory, PF) then
@@ -3434,7 +3594,8 @@ end;
 function TConnectionPool.OpenForTxn(const AOrigin, AHost: string;
   const APort: Word; const ARequest: TStreamRequest;
   const AHeaderTimeoutMs: Integer; const AScheme: string;
-  const AProxy: IProxy;
+  const AProxy: IProxy; const AUseIdentity: Boolean;
+  const AIdentity: IClientIdentity;
   out AConn: IPooledConnection; out AUpgraded: Boolean;
   out AFirst: IHttpResponse): Boolean;
 var
@@ -3446,7 +3607,8 @@ begin
   AConn := nil;
   AUpgraded := False;
   AFirst := nil;
-  Sock := DialFor(AHost, APort, AScheme, FConnectTimeoutMs, AProxy, Protocol);
+  Sock := DialFor(AHost, APort, AScheme, FConnectTimeoutMs, AProxy,
+    AUseIdentity, AIdentity, Protocol);
   try
     case Protocol of
       npHttp2Tls, npHttp2Cleartext:
@@ -3509,9 +3671,20 @@ var
   First: IHttpResponse;
   Waiting, Opened: Boolean;
   Protocol: TNegotiatedProtocol;
+  Key, PendingKey, Remembered, Fingerprint: string;
+  Selecting, Resolved, NeedSelect: Boolean;
+  Identity: IClientIdentity;
 begin
   Deadline := GetTickCount64 + QWord(AHeaderTimeoutMs);
   Waiting := False;
+  PendingKey := AOrigin;
+  // a selector only applies to a TLS dial on a factory that can take the
+  // identity per dial; everything else keeps the plain key
+  Selecting := (FIdentitySelector <> nil) and (ARequest.Scheme = 'https') and
+    Supports(FFactory, IIdentitySocketFactory);
+  Resolved := False;
+  Identity := nil;
+  Fingerprint := '';
   try
     while True do
     begin
@@ -3520,34 +3693,76 @@ begin
       Upgraded := False;
       First := nil;
       Opened := False;
+      NeedSelect := False;
       FLock.Acquire;
       try
+        // with a selector the key carries the fingerprint: the one the
+        // selector just answered, else the one the last dial here presented,
+        // so a reused connection never asks the selector again
+        Key := AOrigin;
+        if Selecting then
+        begin
+          if Resolved then
+            Remembered := Fingerprint
+          else if not FIdentityKeys.TryGetValue(AOrigin, Remembered) then
+            Remembered := '';
+          Key := AOrigin + ' id=' + Remembered;
+        end;
+        if Waiting and (PendingKey <> Key) then
+        begin
+          AddPendingLocked(PendingKey, -1);
+          AddPendingLocked(Key, 1);
+        end;
+        PendingKey := Key;
         ReapClosed;
         ReapIdleLocked;
-        Conn := PickEligible(AOrigin);
-        if (Conn = nil) and CanOpenNew(AOrigin) then
+        Conn := PickEligible(Key);
+        if (Conn = nil) and CanOpenNew(Key) then
         begin
-          // the one transport-selection point: TLS vs cleartext and the HTTP/2
-          // vs HTTP/1.1 codec (doc/design/fallback.md "Negotiation")
-          OpenForTxn(AOrigin, AHost, APort, ARequest, AHeaderTimeoutMs,
-            ARequest.Scheme, AProxy, Conn, Upgraded, First);
-          Opened := Conn <> nil;
+          if Selecting and not Resolved then
+            // a dial is needed: ask the selector outside the lock, then come
+            // back and key the new connection by its answer
+            NeedSelect := True
+          else
+          begin
+            // the one transport-selection point: TLS vs cleartext and the
+            // HTTP/2 vs HTTP/1.1 codec (doc/design/fallback.md "Negotiation")
+            OpenForTxn(Key, AHost, APort, ARequest, AHeaderTimeoutMs,
+              ARequest.Scheme, AProxy, Selecting, Identity, Conn, Upgraded,
+              First);
+            Opened := Conn <> nil;
+            if Opened and Selecting then
+              FIdentityKeys.AddOrSetValue(AOrigin, Fingerprint);
+          end;
         end;
         // a caller with no connection and no answer parks below: count it so
         // PoolStats can report the queue
-        if (Conn <> nil) or (First <> nil) then
-        begin
-          if Waiting then
-            AddPendingLocked(AOrigin, -1);
-          Waiting := False;
-        end
-        else if not Waiting then
-        begin
-          AddPendingLocked(AOrigin, 1);
-          Waiting := True;
-        end;
+        // (a caller about to ask the selector is not parked: it goes straight
+        // round again)
+        if not NeedSelect then
+          if (Conn <> nil) or (First <> nil) then
+          begin
+            if Waiting then
+              AddPendingLocked(Key, -1);
+            Waiting := False;
+          end
+          else if not Waiting then
+          begin
+            AddPendingLocked(Key, 1);
+            Waiting := True;
+          end;
       finally
         FLock.Release;
+      end;
+
+      if NeedSelect then
+      begin
+        Identity := ChooseClientIdentity(FIdentitySelector, AHost, APort);
+        Fingerprint := '';
+        if Identity <> nil then
+          Fingerprint := Identity.Fingerprint;
+        Resolved := True;
+        Continue;
       end;
 
       if First <> nil then
@@ -3633,7 +3848,7 @@ begin
     begin
       FLock.Acquire;
       try
-        AddPendingLocked(AOrigin, -1);
+        AddPendingLocked(PendingKey, -1);
       finally
         FLock.Release;
       end;
@@ -3888,6 +4103,13 @@ begin
   Result := FPool.Stats;
 end;
 
+procedure THttpClient.InstallIdentitySelector(
+  const ASelector: IClientIdentitySelector);
+begin
+  FIdentitySelector := ASelector;
+  FPool.IdentitySelector := ASelector;
+end;
+
 procedure THttpClient.InstallRequestObservers(
   const AObservers: TArray<IHttpClientObserver>; const ALogger: IHttpLogger);
 begin
@@ -4083,6 +4305,7 @@ var
   Port: Word;
   Proxy: IProxy;
   Dialer: IHttp1SocketFactory;
+  IdFactory: IIdentitySocketFactory;
   Closed: Boolean;
   Tracker: TAttemptTracker;
   TrackerRef: IWebSocketAttempt;
@@ -4110,6 +4333,11 @@ begin
     if not Supports(FFactory, IHttp1SocketFactory, Dialer) then
       raise EHttpWebSocketError.Create(
         'the socket factory cannot dial an HTTP/1.1 connection');
+    // a selector chooses the identity of this dial, on this thread
+    if Secure and (FIdentitySelector <> nil) and
+       Supports(FFactory, IIdentitySocketFactory, IdFactory) then
+      Dialer := TIdentityHttp1Dialer.Create(IdFactory,
+        ChooseClientIdentity(FIdentitySelector, Host, Port));
     // the route is chosen on the equivalent http(s) URL, so http_proxy,
     // https_proxy and no_proxy apply as they do for the same request
     Proxy := nil;

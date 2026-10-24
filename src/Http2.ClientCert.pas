@@ -40,6 +40,16 @@ type
     property NotAfter: TDateTime read GetNotAfter;
   end;
 
+  /// chooses the identity for a TLS dial to an origin (doc/design/mtls.md,
+  /// "Selector and proxy identity").  Select is called once per new
+  /// connection, on the dialling thread and outside the pool lock, never for a
+  /// request that reuses a pooled connection.  nil presents no certificate.
+  /// An implementation may be called from several threads at once and must
+  /// not block for long: the dial waits for it.
+  IClientIdentitySelector = interface
+    function Select(const AHost: string; const APort: Word): IClientIdentity;
+  end;
+
   /// loaders for IClientIdentity; each raises EHttpTlsConfigError for an
   /// unreadable file, malformed PEM or PKCS#12, a wrong passphrase or a key
   /// that does not match the leaf.  An expired leaf still loads (NotAfter
@@ -59,6 +69,10 @@ type
     class function FromPkcs12(const AData: TBytes;
       const APassphrase: string = ''): IClientIdentity; static;
   end;
+
+/// a selector that answers AIdentity (possibly nil) for every origin
+function FixedIdentitySelector(
+  const AIdentity: IClientIdentity): IClientIdentitySelector;
 
 implementation
 
@@ -98,6 +112,34 @@ type
     function GetChainCount: Integer;
     function GetChainCertificate(const AIndex: Integer): PX509;
   end;
+
+  TFixedIdentitySelector = class(TInterfacedObject, IClientIdentitySelector)
+  private
+    FIdentity: IClientIdentity;
+  public
+    constructor Create(const AIdentity: IClientIdentity);
+    function Select(const AHost: string; const APort: Word): IClientIdentity;
+  end;
+
+{ TFixedIdentitySelector }
+
+constructor TFixedIdentitySelector.Create(const AIdentity: IClientIdentity);
+begin
+  inherited Create;
+  FIdentity := AIdentity;
+end;
+
+function TFixedIdentitySelector.Select(const AHost: string;
+  const APort: Word): IClientIdentity;
+begin
+  Result := FIdentity;
+end;
+
+function FixedIdentitySelector(
+  const AIdentity: IClientIdentity): IClientIdentitySelector;
+begin
+  Result := TFixedIdentitySelector.Create(AIdentity);
+end;
 
 { OpenSSL error queue }
 

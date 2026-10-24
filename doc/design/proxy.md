@@ -265,6 +265,14 @@ inside the tunnel, so a proxied `https` request carries two TLS layers.
   the origin's, using the trust settings of the client (`WithCACertFile`,
   `WithInsecureTls`).
 - No ALPN is offered to the proxy; the `CONNECT` exchange is HTTP/1.1.
+- A proxy that requires a client certificate is answered with
+  `WithProxyClientIdentity`. That identity is presented on this leg only: the
+  origin's TLS inside the tunnel presents the origin identity (the fixed
+  identity or the selector's answer), never the proxy identity, and the proxy
+  never receives the origin identity. A cleartext origin through an `https://`
+  proxy still uses the proxy identity on the proxy leg. A SOCKS5 or plain
+  `http://` proxy has no TLS leg. The identity is explicit: it is not read from
+  the proxy environment variables. See [mtls](mtls.md).
 - `Proxy-Authorization` travels inside the encrypted leg, so credentials are
   not exposed to the network between client and proxy.
 - A handshake failure with the proxy raises `EHttpConnectionError` and names

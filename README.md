@@ -117,7 +117,7 @@ has its own task.
 | `task validate:harness` | The RFC conformance harness. 146 case ids. | About 30 minutes |
 | `task validate:sse` | The opt-in live SSE case against `tools/validate/sse_server.py`. | Seconds |
 | `task validate:websocket` | The opt-in live WebSocket case: `ws` and `wss`, directly and through an HTTP `CONNECT`, https and SOCKS5 proxy, against `tools/validate/ws_servers.py`, plus a check of the servers' logs (mask bit on every client frame, close codes, route). `task validate:websocket:autobahn` runs the Autobahn|Testsuite client cases (Docker). | Seconds |
-| `task validate:mtls` | The opt-in live mutual TLS case: an accepted identity, none, one from another CA and an expired one, against `tools/validate/mtls_server.py` (HTTP/1.1, an event stream and `wss`, pinned to TLS 1.2 and to TLS 1.3) and `nghttpd --verify-client` (HTTP/2). The expired identity is refused by the client at `Build`. | Seconds |
+| `task validate:mtls` | The opt-in live mutual TLS case: an accepted identity, none, one from another CA and an expired one, against `tools/validate/mtls_server.py` (HTTP/1.1, an event stream and `wss`, pinned to TLS 1.2 and to TLS 1.3) and `nghttpd --verify-client` (HTTP/2). The expired identity is refused by the client at `Build`. It also runs a selector against two origins that each serve one identity, and an `https` proxy that requires its own client certificate in front of an origin that requires another. | Seconds |
 | `task validate:cleartext` | The opt-in live cleartext case: a bodyless `GET`, `POST`, `DELETE` and `HEAD` under `ctUpgrade` and `ctHttp1` against `tools/validate/h1_counter_server.py`, an HTTP/1.1-only server that logs each request; every request arrives once. | Seconds |
 | `task validate:proxy` | The opt-in live proxy case: HTTP `CONNECT`, https and SOCKS5 proxies from `tools/validate/proxy_servers.py`, with and without credentials, HTTP/2 through each proxy kind when `nghttpd` is installed, plus a check of the proxy logs. | Seconds |
 
@@ -340,6 +340,36 @@ Cleartext (`http`, `ws`) connections ignore the identity. With an
 fingerprint, and nothing else about it. `examples/mtls_get.pas` is a short
 program; see `doc/design/mtls.md`.
 
+A different identity per origin, or a certificate that is replaced while the
+process runs, comes from a selector that is asked once for each new TLS
+connection (not for a request that reuses one):
+
+```pascal
+type
+  TByOrigin = class(TInterfacedObject, IClientIdentitySelector)
+    function Select(const AHost: string; const APort: Word): IClientIdentity;
+  end;
+
+function TByOrigin.Select(const AHost: string; const APort: Word): IClientIdentity;
+begin
+  if AHost = 'billing.example' then
+    // read fresh each time, so a renewed file is presented by the next connection
+    Result := TClientIdentity.FromPemFiles('billing.pem', 'billing.key')
+  else
+    Result := nil;    // present no certificate
+end;
+
+Client := THttpClientFactory.Create
+  .WithClientIdentitySelector(TByOrigin.Create)
+  .WithProxyClientIdentity(ProxyIdentity)   // for an https proxy that asks for one
+  .Build;
+```
+
+The pool keeps connections that used different identities apart; connections
+that used a replaced certificate serve until they close. The identity given
+with `WithProxyClientIdentity` goes to an `https://` proxy only, and the origin
+identity never goes to the proxy.
+
 ### Text, JSON, and XML helpers
 
 `WithTextBody` and `ReadText` live in `Http2.Client`:
@@ -515,7 +545,7 @@ make measure-observer                                # observer overhead on loop
 | `threaded_get.pas` | Many threads sharing one client and its pool. |
 | `sse_stream.pas` | `SseRequest` + `TSseReconnectLoop` over an event stream. |
 | `proxy_env.pas` | A GET routed by the proxy environment variables. |
-| `mtls_get.pas` | A GET, or a `wss` session, with a client certificate; reports a rejection. |
+| `mtls_get.pas` | GETs, or a `wss` session, with a client certificate, a per-origin selector or an `https` proxy identity; reports a rejection. |
 | `websocket_echo.pas` | Open a WebSocket, send a message, print the echo, close. |
 | `observer_all.pas` | The tracing, metrics and logging adapters together on a request, an SSE stream with a reconnect and a WebSocket. |
 | `observer_overhead.pas` | What the observers cost on a loopback request. |
@@ -579,7 +609,8 @@ The connection speaks HTTP/1.1 (RFC 6455); a WebSocket is not pooled. See
 - `doc/design/proxy.md` gives the proxy routing: environment variables,
   the no-proxy list, and `IProxySelector`.
 - `doc/design/mtls.md` gives mutual TLS: the identity loaders, where the
-  identity is presented, and how a rejection is reported.
+  identity is presented, the per-origin selector and certificate rotation, the
+  proxy identity, and how a rejection is reported.
 - `doc/design/websocket.md` gives the WebSocket client: handshake, framing,
   delivery and demand, closing, and the reference implementations.
 - `doc/design/messages.md` gives the request and response types.

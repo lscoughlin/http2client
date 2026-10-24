@@ -37,9 +37,10 @@ without one the client answers none.
 - The identity can come from PEM files, PEM held in memory, or a PKCS#12
   bundle, with an optional passphrase.
 - A consumer that needs a different identity per origin, or that rotates the
-  certificate while the process runs, will supply a selector that is asked at
-  each dial. That extension is described below under "Selector and proxy
-  identity" and is not built yet.
+  certificate while the process runs, supplies a selector that is asked at
+  each dial (see "Selector and proxy identity").
+- An `https://` proxy can require its own client identity, kept apart from the
+  origin identity.
 - A bad configuration fails when the client is built, not on the first
   request.
 - A server that rejects the identity produces a distinct error, even though
@@ -56,13 +57,19 @@ without one the client answers none.
   handshake. Configuring one is not an error and has no effect there.
 - No TLS renegotiation or post-handshake client authentication.
 - No server-side mutual TLS.
+- No file watching or automatic reload; rotation is a selector that returns a
+  fresh identity.
+- No identity from the proxy environment variables; `WithProxyClientIdentity`
+  is explicit.
+- No eviction of pooled connections authenticated with a replaced certificate.
 
 ## Vocabulary
 
 | Term | Meaning |
 |---|---|
 | Identity | a leaf certificate, its chain, and the matching private key |
-| Selector | a callback that returns the identity for a dial, or none |
+| Selector | an object that returns the identity for a dial, or none |
+| Proxy identity | the identity presented to an `https://` proxy, never to an origin |
 | Rejection | the server closed the connection with a client-certificate alert |
 
 ## Public surface
@@ -102,6 +109,14 @@ type
       const APassphrase: string = ''): IClientIdentity; static;
   end;
 
+  /// chooses the identity of a TLS dial to an origin
+  IClientIdentitySelector = interface
+    function Select(const AHost: string; const APort: Word): IClientIdentity;
+  end;
+
+/// a selector that answers one identity (possibly nil) for every origin
+function FixedIdentitySelector(
+  const AIdentity: IClientIdentity): IClientIdentitySelector;
 ```
 
 Factory methods:
@@ -110,9 +125,15 @@ Factory methods:
 |---|---|
 | `WithClientIdentity(identity)` | present this identity on every TLS dial; `nil` removes it |
 | `WithClientCertificateFiles(cert, key, passphrase)` | sugar: load PEM files, then `WithClientIdentity` |
+| `WithClientIdentitySelector(selector)` | ask the selector at each dial, in place of a fixed identity; `nil` removes it |
+| `WithProxyClientIdentity(identity)` | present this identity to an `https://` proxy only; `nil` removes it |
+
+`WithClientIdentity`, `WithClientCertificateFiles` and
+`WithClientIdentitySelector` replace one another: the last one called wins.
+`WithProxyClientIdentity` is independent of them.
 
 A client with neither configured behaves as before. `Build` raises
-`EHttpTlsConfigError` for an identity whose leaf has expired, and for files
+`EHttpTlsConfigError` for a fixed or proxy identity whose leaf has expired, and for files
 given to `WithClientCertificateFiles` that could not be loaded: the factory is
 a value builder, so the load failure is held and raised at `Build`, and the
 passphrase is not kept past the call. An injected socket factory
@@ -153,31 +174,83 @@ the terminal.
 |---|---|
 | TLS to an origin, direct | the client identity, or the selector's answer |
 | TLS to an origin inside a proxy tunnel | the same; the tunnel is transparent to the origin |
-| TLS to an `https://` proxy | none; the origin identity is never handed to the proxy |
-| `http` and `ws` | none |
+| TLS to an `https://` proxy | the proxy identity, or none; the origin identity is never handed to the proxy |
+| `http` and `ws` to an origin | none |
+| `http` and `ws` to an origin through an `https://` proxy | the proxy identity on the proxy leg only |
 
 The proxy rule keeps an origin identity from being handed to a third party
-that happens to relay the connection.
+that happens to relay the connection, and the proxy identity from being handed
+to the origin. The two never cross: the origin identity (or the selector's
+answer) reaches only the TLS handshake with the origin, and the proxy identity
+only the handshake with the proxy. Only the `TTlsSocket` built for the proxy
+leg in `DialRoutedTransport` takes the proxy identity. A SOCKS5 or plain
+`http://` proxy has no TLS leg, so the proxy identity is unused there.
 
 ## Pooling
 
-The pool keys connections by origin and route. A client has one identity, so
-the key is unchanged.
+The pool keys connections by origin and route. With a fixed identity the key
+is unchanged, because a client has one identity. With a selector installed, a
+TLS request's key also carries the identity fingerprint
+(`origin id=<fingerprint>`, an empty fingerprint for a `nil` answer), so two
+identities to one origin never share a connection and neither does an identity
+and a `nil` answer. Cleartext requests keep the plain key.
 
 ## Selector and proxy identity
 
-Not built yet; the shape is fixed so the pieces added later fit:
+`IClientIdentitySelector.Select(host, port)` returns the identity for a dial,
+or `nil` to present no certificate. `WithClientIdentitySelector` installs it in
+place of a fixed identity.
 
-- `IClientIdentitySelector.Select(host, port)` returns the identity for a dial,
-  or `nil`, and `WithClientIdentitySelector` installs it in place of a fixed
-  identity. A selector that returns a fresh `FromPemFiles` per dial gives
-  rotation.
-- When a selector is installed the pool key gains the identity fingerprint, so
-  two identities to one origin never share a connection, and connections that
-  were authenticated with a rotated-out certificate stay pooled until they
-  close or idle out.
-- `WithProxyClientIdentity(identity)` presents an identity to an `https://`
-  proxy only.
+- It is called once per new TLS connection: on the dialling thread (the thread
+  that called `Send`, for a WebSocket the thread that opens it), outside the
+  pool lock, with the origin's host and port. A request that reuses a pooled
+  connection does not call it, and a cleartext request never does. It may be
+  called from several threads at once and the dial waits for it, so it should
+  not block for long.
+- An exception from the selector fails that dial with `EHttpTlsConfigError`
+  carrying its message; nothing is dialled, and the next request asks again.
+  `Build` cannot check an identity the selector has not returned yet, so an
+  expired answer reaches the server and is reported as a rejection.
+- How the pool asks without holding its lock: a request first looks for a
+  connection under the fingerprint the last dial to that origin presented
+  (remembered per origin). Only when none is eligible and a new connection may
+  be opened does it release the lock, ask the selector, and key the new
+  connection by the answer.
+- Rotation needs no special code. A selector that returns a fresh identity
+  (for example `TClientIdentity.FromPemFiles` on each call, or a cached
+  identity that a background task replaces) is presented by the next new
+  connection. Connections authenticated with the replaced certificate stay in
+  the pool, finish the requests already on them and are used until they close
+  or idle out; they are not evicted. A pooled HTTP/2 connection takes every
+  later request while it lives, so a new certificate is presented once that
+  connection closes, idles out, or the pool opens another (for example because
+  it is full). The selector is not asked in between.
+- Per origin: the selector decides by host and port.
+
+```pascal
+type
+  TByOrigin = class(TInterfacedObject, IClientIdentitySelector)
+    function Select(const AHost: string; const APort: Word): IClientIdentity;
+  end;
+
+function TByOrigin.Select(const AHost: string; const APort: Word): IClientIdentity;
+begin
+  if (AHost = 'billing.example') and (APort = 443) then
+    Result := TClientIdentity.FromPemFiles('billing.pem', 'billing.key')
+  else
+    Result := nil;
+end;
+
+Client := THttpClientFactory.Create
+  .WithClientIdentitySelector(TByOrigin.Create)
+  .Build;
+```
+
+`WithProxyClientIdentity(identity)` presents an identity on the TLS leg to an
+`https://` proxy, so a proxy that requires a client certificate accepts the
+client, and to nothing else. It is checked at `Build` like a fixed identity.
+An origin identity does not satisfy a proxy that asks for one: the proxy
+refuses the handshake and the request fails before the origin is dialled.
 
 ## Rejection
 
@@ -235,12 +308,23 @@ Consequences:
   CA and expired, for TLS 1.2 and TLS 1.3 separately, over HTTP/2, HTTP/1.1,
   SSE and `wss`, and through a CONNECT, a SOCKS5 and an `https` proxy. A
   source scan checks that every `TTlsSocket` for an origin is built with the
-  identity.
+  identity. The selector cases count its calls (once per dial, not per
+  request, never for cleartext), check the thread and that another thread can
+  take the pool lock meanwhile, choose a different identity per origin, answer
+  `nil`, throw, rotate between two dials (the old connection still delivers
+  its response and the pool holds two keys) and cover `wss`. The proxy cases
+  use a loopback `https` proxy that requires a client certificate: it accepts
+  the proxy identity, the origin sees the origin identity only, the origin
+  identity alone is refused, and a cleartext origin behind it gets nothing.
 - Live: a Python `ssl` server with `CERT_REQUIRED` (TLS 1.2 and 1.3, HTTP/1.1,
   SSE and `wss`) and `nghttpd --verify-client` for HTTP/2 (it requests a
-  certificate but does not verify it); `make validate-mtls`.
+  certificate but does not verify it); two Python origins that each serve one
+  identity only, reached by one client with a selector; and a Python `https`
+  proxy that requires a client certificate in front of an origin that requires
+  another, with the logs of both showing which identity each saw;
+  `make validate-mtls`.
 
-Fixtures (a private CA, a server certificate, an accepted client, an expired
+Fixtures (a private CA, a server certificate, two accepted clients, an expired
 client, a client from another CA) are generated by a script and checked in
 beside the existing `test/certs`, with validity long enough that the suite
 does not rot.
@@ -250,7 +334,5 @@ does not rot.
 | Question | Recommendation |
 |---|---|
 | Passphrase as a callback so it is never in a long-lived string | Accept a string now, wipe it after loading; add a callback later if asked |
-| Reload of files when they change on disk | Not built in; a selector that returns a fresh `FromPemFiles` per dial gives rotation |
-| An identity on a proxy leg through the environment variables | No; explicit `WithProxyClientIdentity` only |
 | Pin the server's certificate or key | Out of scope here; it is a server-verification feature, not a client-identity one |
 | Expose the negotiated client identity on the outcome (`THttpOutcome`) | Not in this version; the selector's caller already knows what it returned |

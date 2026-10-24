@@ -12,6 +12,10 @@
 #   server.crt / server.key       a server certificate for localhost, from ca
 #   client.crt / client.key       the accepted client, issued by intermediate
 #   client-chain.pem              client.crt followed by intermediate.crt
+#   client2.crt / client2.key     a second accepted client ("mtls client two"),
+#                                 issued by intermediate, for the selector and
+#                                 proxy-identity cases
+#   client2-chain.pem             client2.crt followed by intermediate.crt
 #   client-encrypted.key          client.key under the passphrase below
 #   expired.crt / expired.key     a client from ca whose validity ended in 2016
 #   other-client.crt / .key       a client from other-ca
@@ -75,11 +79,13 @@ selfsigned_ca other-ca "/O=http2client mtls test/CN=mtls other CA"
 issue intermediate "/O=http2client mtls test/CN=mtls test intermediate" ca "$WORK/intermediate.ext" -days "$DAYS"
 issue server "/O=http2client mtls test/CN=localhost" ca "$WORK/server.ext" -days "$DAYS"
 issue client "/O=http2client mtls test/CN=mtls client" intermediate "$WORK/client.ext" -days "$DAYS"
+issue client2 "/O=http2client mtls test/CN=mtls client two" intermediate "$WORK/client.ext" -days "$DAYS"
 issue expired "/O=http2client mtls test/CN=mtls expired client" ca "$WORK/client.ext" \
   -not_before 20150101000000Z -not_after 20160101000000Z
 issue other-client "/O=http2client mtls test/CN=mtls other client" other-ca "$WORK/client.ext" -days "$DAYS"
 
 cat "$OUT/client.crt" "$OUT/intermediate.crt" >"$OUT/client-chain.pem"
+cat "$OUT/client2.crt" "$OUT/intermediate.crt" >"$OUT/client2-chain.pem"
 "$OPENSSL" pkcs8 -topk8 -v2 aes-256-cbc -in "$OUT/client.key" \
   -passout "pass:$PASS" -out "$OUT/client-encrypted.key"
 
@@ -103,6 +109,8 @@ if "$OPENSSL" verify -CAfile "$OUT/ca.crt" "$OUT/client.crt" >/dev/null 2>&1; th
   echo "make-mtls-certs: client.crt verified without its intermediate" >&2
   exit 1
 fi
+"$OPENSSL" verify -CAfile "$OUT/ca.crt" -untrusted "$OUT/intermediate.crt" \
+  "$OUT/client2.crt" >/dev/null
 for bad in expired other-client; do
   if "$OPENSSL" verify -CAfile "$OUT/ca.crt" -untrusted "$OUT/intermediate.crt" \
       "$OUT/$bad.crt" >/dev/null 2>&1; then
