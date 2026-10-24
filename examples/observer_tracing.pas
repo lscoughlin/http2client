@@ -14,9 +14,10 @@
 //   * OnResponseHeaders records the status, OnRedirect and OnRetry add span
 //     events, and OnAttemptEnd records the outcome, sets status and error and
 //     ends the span.
-// - registered first with WithRequestObserver, the tracer sees every header
-//   the observers registered after it inject (start callbacks run in
-//   registration order).
+// - registered first with WithRequestObserver, the tracer wraps the others:
+//   its start runs first, so the observers after it see its `traceparent`, and
+//   it reads what they injected once every start has run (RecordRequestHeader
+//   does it in OnResponseHeaders).
 unit observer_tracing;
 
 {$mode delphi}{$H+}

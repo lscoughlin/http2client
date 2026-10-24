@@ -1,8 +1,8 @@
 /// http2client example: what the request observers cost on loopback.
 // - build and run: `make measure-observer`
 //   or by hand:    bin/observer_overhead [requests-per-round [rounds]]
-//   (defaults: 3000 requests in each of 3 rounds; the OpenSSL library path
-//   is not needed, the traffic is cleartext)
+//   (defaults: 3000 requests in each of 3 rounds; the traffic is cleartext
+//   HTTP/1.1, so there is no TLS handshake)
 // - measures the wall time of one request with no observer, with the tracing,
 //   metrics and logging adapters (examples/observer_*.pas) installed, and,
 //   for an event stream, with the metrics adapter's per-event gate on.  It

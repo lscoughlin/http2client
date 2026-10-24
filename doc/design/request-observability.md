@@ -283,8 +283,10 @@ TCompositeObserver = class(TInterfacedObject, IHttpClientObserver, IHttpMessageO
 
 `WithRequestObserver` accumulates: each call adds an observer. Start callbacks
 run in registration order and end callbacks in reverse, so the observer
-registered first wraps the rest (a tracing observer registered first sees
-every header the later ones inject). `TCompositeObserver` is the same
+registered first wraps the rest: its start runs first and its end last. A
+tracing observer registered first therefore sees the headers the later ones
+inject from `OnResponseHeaders` onward, not inside its own `OnAttemptStart`,
+and the later ones see what it injected. `TCompositeObserver` is the same
 behaviour as a reusable class.
 
 ### Pull-based pool statistics

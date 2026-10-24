@@ -64,8 +64,10 @@ make measure-observer MORMOT=third_party/mORMot2/src
 bin/observer_overhead [requests-per-round [rounds]]
 ```
 
-It is not part of `make test` and needs no fixture, no TLS library and no
-network beyond loopback.
+It is not part of `make test` and needs no fixture and no network beyond
+loopback. The traffic is cleartext HTTP/1.1, so there is no TLS handshake in
+the timings; `make` passes `OPENSSL_LIBPATH` as for every other target, and a
+direct run of the program should export it too.
 
 ## Results
 

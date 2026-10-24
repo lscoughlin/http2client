@@ -97,7 +97,7 @@ OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib ./myprogram
 
 ## Examples
 
-`examples/` holds eight small programs — see `examples/README.md`:
+`examples/` holds ten small programs and three observer adapter units — see `examples/README.md`:
 
 | Program | Shows |
 |---|---|
@@ -109,6 +109,8 @@ OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib ./myprogram
 | `websocket_echo` | `TWebSocketRequest` + a listener: open, request demand, send, close |
 | `proxy_env` | `WithProxyEnvironmentVars` + `WithNoProxy`: routing by `http_proxy` / `https_proxy` / `all_proxy` / `no_proxy` |
 | `threaded_get` | one shared `IHttpClient` driven by many threads |
+| `observer_all` | the tracing, metrics and logging adapters (`observer_tracing`, `observer_metrics`, `observer_logging`) installed together on a request, an SSE stream and a WebSocket |
+| `observer_overhead` | what the observers cost on a loopback request (`make measure-observer`) |
 
 ```sh
 make examples     # or: task examples  ->  bin/<program>

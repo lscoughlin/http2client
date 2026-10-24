@@ -1338,6 +1338,7 @@ procedure TWsObservabilityTest.TestEmptySetAndOtherKindsSeeNothing;
 var
   Sock: IWebSocket;
   O: THttpOutcome;
+  I: Integer;
 begin
   // an observer that wants nothing sees no message, but the aggregates stand
   Start(ScriptKinds, []);
@@ -1365,10 +1366,20 @@ begin
   AssertEquals('text in and text out only', 'text', KindsOf(mdIn));
   AssertEquals('text out', 'text', KindsOf(mdOut));
   AssertEquals('two messages', 2, FObs.MessageCount);
-  AssertEquals('inbound text is the first inbound message', 0,
-    FObs.MessageAt(0).Index);
-  AssertEquals('outbound text is the first outbound message', 0,
-    FObs.MessageAt(1).Index);
+  // the two reports come from two threads (the reader and the sender), so
+  // their order in the record is not fixed: look each up by direction.  The
+  // automatic pong for the server's ping is outbound too, and takes index 0
+  // when it is written before the text is, so the text is 0 or 1 and the
+  // inbound text, the server's first message, is always 0
+  AssertTrue('one in and one out',
+    FObs.MessageAt(0).Direction <> FObs.MessageAt(1).Direction);
+  for I := 0 to 1 do
+    if FObs.MessageAt(I).Direction = mdIn then
+      AssertEquals('inbound text is the first inbound message', 0,
+        FObs.MessageAt(I).Index)
+    else
+      AssertTrue('outbound text comes first or just after the pong',
+        FObs.MessageAt(I).Index in [0, 1]);
 end;
 
 { 21.11 }

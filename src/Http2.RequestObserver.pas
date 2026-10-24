@@ -212,8 +212,9 @@ type
 
   /// runs several observers as one.  Start-side callbacks run in registration
   /// order and OnAttemptEnd in reverse, so the observer registered first wraps
-  /// the rest (a tracer registered first sees every header the later ones
-  /// inject).  A member that raises is skipped for that callback and reported
+  /// the rest (its start runs first and its end last, so a tracer registered
+  /// first reads the headers the later ones inject from OnResponseHeaders on,
+  /// and they see what it injected).  A member that raises is skipped for that callback and reported
   /// to the logger; a member whose OnAttemptStart raised gets no further
   /// callbacks for that attempt.  Members never see each other's tokens.
   // - it is also the IHttpMessageObserver of its members: it asks each member

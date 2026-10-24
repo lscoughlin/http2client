@@ -24,7 +24,7 @@ uses
   observer_tracing, observer_metrics, observer_logging;
 
 type
-  /// sends one message, closes when the echo arrives, and signals the end
+  /// closes when the echo arrives, and signals the end
   TEchoOnce = class(TWebSocketListener)
   public
     Finished: TEvent;
@@ -54,7 +54,6 @@ end;
 procedure TEchoOnce.OnOpen(const ASocket: IWebSocket);
 begin
   ASocket.Request(4);
-  ASocket.SendText('hello');
 end;
 
 procedure TEchoOnce.OnText(const ASocket: IWebSocket; const AText: string;
@@ -218,6 +217,7 @@ begin
       // 3. a WebSocket session
       Socket := Client.Send(TWebSocketRequest.Create(WsUrl, Listener)
         .WithContext(Root));
+      Socket.SendText('hello');
       if Echo.Finished.WaitFor(15000) <> wrSignaled then
       begin
         WriteLn(StdErr, 'no WebSocket answer within 15 seconds');
