@@ -365,7 +365,9 @@ var
 begin
   // a write to a connection the client already closed must not kill the run
   One := 1;
+  {$IFDEF DARWIN}
   fpSetSockOpt(AFd, SOL_SOCKET, SO_NOSIGPIPE, @One, SizeOf(One));
+  {$ENDIF}
   Tv.tv_sec := AMs div 1000;
   Tv.tv_usec := (AMs mod 1000) * 1000;
   fpSetSockOpt(AFd, SOL_SOCKET, SO_RCVTIMEO, @Tv, SizeOf(Tv));
