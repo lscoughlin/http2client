@@ -341,7 +341,7 @@ fingerprint, and nothing else about it. `examples/mtls_get.pas` is a short
 program; see `doc/design/mtls.md`.
 
 A different identity per origin, or a certificate that is replaced while the
-process runs, comes from a selector that is asked once for each new TLS
+process runs, comes from a selector that is asked for each new TLS
 connection (not for a request that reuses one):
 
 ```pascal

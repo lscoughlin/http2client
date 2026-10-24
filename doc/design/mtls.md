@@ -193,7 +193,11 @@ is unchanged, because a client has one identity. With a selector installed, a
 TLS request's key also carries the identity fingerprint
 (`origin id=<fingerprint>`, an empty fingerprint for a `nil` answer), so two
 identities to one origin never share a connection and neither does an identity
-and a `nil` answer. Cleartext requests keep the plain key.
+and a `nil` answer. Cleartext requests keep the plain key. The connection caps
+then count per origin, route and identity, so after a rotation an origin can
+briefly hold more than `MaxConnectionsPerHost` split across the old and new
+keys (`MaxTotalConnections` still bounds the pool), and `PoolStats` lists the
+keys with their `id=` suffix.
 
 ## Selector and proxy identity
 
@@ -201,12 +205,14 @@ and a `nil` answer. Cleartext requests keep the plain key.
 or `nil` to present no certificate. `WithClientIdentitySelector` installs it in
 place of a fixed identity.
 
-- It is called once per new TLS connection: on the dialling thread (the thread
+- It is called for each new TLS connection: on the dialling thread (the thread
   that called `Send`, for a WebSocket the thread that opens it), outside the
   pool lock, with the origin's host and port. A request that reuses a pooled
   connection does not call it, and a cleartext request never does. It may be
   called from several threads at once and the dial waits for it, so it should
-  not block for long.
+  not block for long. The lock is released while it runs, so two concurrent
+  requests to a cold origin can both ask; one dials and the other then finds
+  that connection, so it is asked at most once per request that needs a dial.
 - An exception from the selector fails that dial with `EHttpTlsConfigError`
   carrying its message; nothing is dialled, and the next request asks again.
   `Build` cannot check an identity the selector has not returned yet, so an
