@@ -105,7 +105,7 @@ IDE as a design-time package.
 
 | Fact | Value |
 |---|---|
-| Package name / type | `http2client`, `RunAndDesignTime`, `Version 0.21.0` |
+| Package name / type | `http2client`, `RunAndDesignTime`, `Version 0.22.0` |
 | Units | all 22 in `src/`, `Http2.pas` (umbrella) first; `Http2.Readers.pas` is the optional JSON/XML unit, and `Http2.Encoding.pas` holds the content codings, `Http2.Sse.pas` the Server-Sent Events reader, `Http2.Proxy.pas` and `Http2.Socks.pas` proxy routing, `Http2.WebSocket.pas` and `Http2.WebSocketClient.pas` the WebSocket client, `Http2.Clock.pas` and `Http2.RequestObserver.pas` the request observer |
 | Test suite | 792 tests, 0 errors, 0 failures (registration list: `test/Http2.TestRunner.pas`); see [testing-observability](../design/testing-observability.md) |
 | `OtherUnitFiles` | `src` + the four vendored mormot dirs (`core`, `lib`, `net`, `crypt`) |
