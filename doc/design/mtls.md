@@ -458,6 +458,6 @@ does not rot.
 
 | Question | Recommendation |
 |---|---|
-| Passphrase as a callback so it is never in a long-lived string | Accept a string now, wipe it after loading; add a callback later if asked |
+| Passphrase as a callback so it is never in a long-lived string | No callback: the client is not interactive, so the passphrase is supplied when the identity is built, and it is wiped after loading |
 | Pin the server's certificate or key | Out of scope here; it is a server-verification feature, not a client-identity one |
 | Expose the negotiated client identity on the outcome (`THttpOutcome`) | Not in this version; the selector's caller already knows what it returned |

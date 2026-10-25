@@ -33,7 +33,10 @@
 # Needs Docker.  From a machine without it, set MTLS_REAL_HOST (default
 # lscoughlin@liam-rzbox.local): the tree is copied there with
 # tools/container/remote-run.sh and this script runs on that host.
-# MTLS_REAL_HOST=local runs it on this machine.
+# MTLS_REAL_HOST=local runs it on this machine.  MTLS_REAL_NATIVE=1 builds and
+# runs the client with the host's own Free Pascal (as `make test` does) and
+# starts only the servers in Docker, whose published ports the host reaches on
+# loopback (Rancher Desktop does this for --network host containers).
 #
 #   bash tools/validate/mtls-real.sh          # or: make validate-mtls-real
 #
@@ -45,7 +48,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 HOST="${MTLS_REAL_HOST:-lscoughlin@liam-rzbox.local}"
 
-if [ "${MTLS_REAL_LOCAL:-0}" != 1 ] && [ "$HOST" != local ]; then
+NATIVE="${MTLS_REAL_NATIVE:-0}"
+if [ "$NATIVE" != 1 ] && [ "${MTLS_REAL_LOCAL:-0}" != 1 ] && [ "$HOST" != local ]; then
   # the remote tree remote-run.sh uses for this checkout (same derivation)
   DIR="${HTTP2_REMOTE_DIR:-http2client-ci/run-$(printf '%s' "$ROOT" | cksum | cut -d' ' -f1)}"
   export HTTP2_REMOTE_DIR="$DIR"
@@ -65,6 +69,7 @@ CERTS="$ROOT/test/certs/mtls"
 WORK="$(mktemp -d)"
 TAG="mtls-real-$$"
 RUN_TIMEOUT=20
+POST_BYTES="${MTLS_POST_BYTES:-8388608}"
 ID="$(id -u):$(id -g)"
 
 # Documented known limits: "server|listener|scenario" a reason.  A listed case
@@ -80,15 +85,25 @@ trap cleanup EXIT INT TERM
 
 command -v docker >/dev/null || { echo "mtls-real: docker not found" >&2; exit 2; }
 
-# the client, built with the dev image's Free Pascal
-M=/src/third_party/mORMot2/src
+# the client, built with the dev image's Free Pascal (or the host's, NATIVE)
 mkdir -p "$ROOT/bin/mtls-real"
-docker run --rm --user "$ID" -e HOME=/tmp -v "$ROOT:/src" -w /src "$IMAGE" \
-  fpc -O2 -vw -Mdelphi -Fu/src/src -Fu$M/core -Fu$M/lib -Fu$M/net -Fu$M/crypt \
-  -FE/src/bin/mtls-real -FU/tmp examples/mtls_get.pas >"$WORK/fpc.log" 2>&1 \
-  || { cat "$WORK/fpc.log"; echo "mtls-real: could not build examples/mtls_get.pas" >&2; exit 2; }
-docker run -d --rm --name "$TAG-client" --network host --user "$ID" -e HOME=/tmp \
-  -v "$ROOT:/src:ro" "$IMAGE" sleep 3600 >/dev/null || exit 2
+if [ "$NATIVE" = 1 ]; then
+  CD="$ROOT/test/certs/mtls"
+  M="${MORMOT:-$ROOT/third_party/mORMot2/src}"
+  export OPENSSL_LIBPATH="${OPENSSL_LIBPATH:-/opt/homebrew/opt/openssl@3/lib}"
+  ${FPC:-fpc} -O2 -vw -Mdelphi -Fu"$ROOT/src" -Fu$M/core -Fu$M/lib -Fu$M/net -Fu$M/crypt \
+    -FE"$ROOT/bin/mtls-real" -FU"$WORK" "$ROOT/examples/mtls_get.pas" >"$WORK/fpc.log" 2>&1 \
+    || { cat "$WORK/fpc.log"; echo "mtls-real: could not build examples/mtls_get.pas" >&2; exit 2; }
+else
+  CD=/src/test/certs/mtls
+  M=/src/third_party/mORMot2/src
+  docker run --rm --user "$ID" -e HOME=/tmp -v "$ROOT:/src" -w /src "$IMAGE" \
+    fpc -O2 -vw -Mdelphi -Fu/src/src -Fu$M/core -Fu$M/lib -Fu$M/net -Fu$M/crypt \
+    -FE/src/bin/mtls-real -FU/tmp examples/mtls_get.pas >"$WORK/fpc.log" 2>&1 \
+    || { cat "$WORK/fpc.log"; echo "mtls-real: could not build examples/mtls_get.pas" >&2; exit 2; }
+  docker run -d --rm --name "$TAG-client" --network host --user "$ID" -e HOME=/tmp \
+    -v "$ROOT:/src:ro" "$IMAGE" sleep 3600 >/dev/null || exit 2
+fi
 
 # servers: nginx, httpd, caddy; ports BASE+slot*10 + {0: h2/1.2, 1: h2/1.3, 2: h1/1.3}
 SERVERS="nginx httpd caddy"
@@ -136,8 +151,15 @@ row() { printf '%s\t%s\t%s\t%s\t%s\n' "$@" >>"$ROWS"; } # server listener scenar
 run_get() {
   local url="$1" cert="$2" key="$3"
   shift 3
-  OUT="$(timeout $((RUN_TIMEOUT + 15)) docker exec -e MTLS_PRINT_BODY=1 "$@" "$TAG-client" \
-    timeout "$RUN_TIMEOUT" /src/bin/mtls-real/mtls_get "$url" "$cert" "$key" /src/test/certs/mtls/ca.crt 2>&1)"
+  if [ "$NATIVE" = 1 ]; then
+    local envs=() e
+    for e in "$@"; do [ "$e" = -e ] || envs+=("$e"); done
+    OUT="$(env MTLS_PRINT_BODY=1 ${envs[@]+"${envs[@]}"} timeout "$RUN_TIMEOUT" \
+      "$ROOT/bin/mtls-real/mtls_get" "$url" "$cert" "$key" "$CD/ca.crt" 2>&1)"
+  else
+    OUT="$(timeout $((RUN_TIMEOUT + 15)) docker exec -e MTLS_PRINT_BODY=1 "$@" "$TAG-client" \
+      timeout "$RUN_TIMEOUT" /src/bin/mtls-real/mtls_get "$url" "$cert" "$key" "$CD/ca.crt" 2>&1)"
+  fi
   RC=$?
 }
 
@@ -162,7 +184,7 @@ accept_case() {
   local body dn proto tls status
   status="$(printf '%s\n' "$OUT" | sed -n 's/^status: //p')"
   body="$(printf '%s\n' "$OUT" | sed -n 's/^body: //p')"
-  dn="$(printf '%s' "$body" | sed 's/^dn=//; s/ \(verify\|proto\)=.*//')"
+  dn="$(printf '%s' "$body" | sed -E 's/^dn=//; s/ (verify|proto)=.*//')"
   proto="$(printf '%s' "$body" | sed -n 's/.* proto=\([^ ]*\).*/\1/p' | tr 'A-Z' 'a-z')"
   tls="$(printf '%s' "$body" | sed -n 's/.* tls=\([^ ]*\).*/\1/p' | tr -cd '0-9')"
   case "$proto" in http/2*) proto=h2;; http/1.1) proto=h1;; esac
@@ -220,7 +242,6 @@ reject_case() {
 
 C1="CN=mtls client,O=http2client mtls test"
 C2="CN=mtls client two,O=http2client mtls test"
-CD=/src/test/certs/mtls
 
 for s in $SERVERS; do
   for i in 0 1 2; do
@@ -236,6 +257,11 @@ for s in $SERVERS; do
       -e "MTLS_REQUEST_CERT=$CD/client2-chain.pem" -e "MTLS_REQUEST_KEY=$CD/client2.key"
     reject_case "$s" "$lis" none "$url" - -
     reject_case "$s" "$lis" "wrong CA" "$url" "$CD/other-client.crt" "$CD/other-client.key"
+    # a body larger than any socket buffer: the server answers (or resets) while
+    # the upload is still in flight, which is where a TLS 1.3 alert can be lost
+    reject_case "$s" "$lis" "none, ${POST_BYTES} B POST" "$url" - - -e "MTLS_POST_BYTES=$POST_BYTES"
+    reject_case "$s" "$lis" "wrong CA, ${POST_BYTES} B POST" "$url" "$CD/other-client.crt" \
+      "$CD/other-client.key" -e "MTLS_POST_BYTES=$POST_BYTES"
   done
 done
 

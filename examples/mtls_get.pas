@@ -30,7 +30,7 @@ program example_mtls_get;
 uses
   {$IFDEF UNIX}cthreads,{$ENDIF}
   SysUtils, Classes, SyncObjs, Http2.Errors, Http2.Stream, Http2.Messages,
-  Http2.ClientCert, Http2.Proxy, Http2.Client, Http2.WebSocket;
+  Http2.ClientCert, Http2.Proxy, Http2.Headers, Http2.Client, Http2.WebSocket;
 
 type
   /// MTLS_SELECT: the identity files for each origin port, read at every dial
@@ -155,6 +155,9 @@ var
   Listener: TFirstText;
   ListenerRef: IWebSocketListener;
   Socket: IWebSocket;
+  PostBytes: Integer;
+  PostBody: TBytes;
+  Request: THttpRequest;
   CaFile, Passphrase, BodyText: string;
 begin
   if ParamCount < 3 then
@@ -230,8 +233,20 @@ begin
         end
         else
         begin
-          Response := Client.Send(THttpRequest.Create(hmGet, Urls[UrlIndex])
-            .WithClientIdentity(ReqId));
+          // MTLS_POST_BYTES=N sends an N-byte POST body, so a server that
+          // answers with an alert while the upload is in flight is exercised
+          PostBytes := StrToIntDef(GetEnvironmentVariable('MTLS_POST_BYTES'), 0);
+          if PostBytes > 0 then
+          begin
+            SetLength(PostBody, PostBytes);
+            FillChar(PostBody[0], PostBytes, Ord('x'));
+            Request := THttpRequest.Create(hmPost, Urls[UrlIndex])
+              .WithBody(THttpBody.FromBytes(PostBody))
+              .WithHeader(HeaderContentType, 'application/octet-stream');
+          end
+          else
+            Request := THttpRequest.Create(hmGet, Urls[UrlIndex]);
+          Response := Client.Send(Request.WithClientIdentity(ReqId));
           WriteLn('status: ', Response.StatusCode);
           BodyText := ReadText(Response);
           WriteLn('body bytes: ', Length(BodyText));

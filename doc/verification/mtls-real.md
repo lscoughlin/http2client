@@ -28,8 +28,10 @@ The script runs on a Docker host (`MTLS_REAL_HOST`, default
 with `tools/container/remote-run.sh`, compiles the example in the dev image,
 and starts the servers as sibling containers from their stock images with
 `--network host` on ports from `MTLS_REAL_BASE` (default 9440). The client runs
-in a container on the same network. Every client run is under a 20 second
-timeout.
+in a container on the same network. With `MTLS_REAL_NATIVE=1` the client is
+built with the host's own Free Pascal and runs on the host, and only the servers
+run in Docker (Rancher Desktop forwards their ports to loopback). Every client
+run is under a 20 second timeout.
 
 | Server | Configuration |
 |---|---|
@@ -63,9 +65,12 @@ into a generic error only some of the time.
 
 ## Results
 
-Ubuntu 24.04 x86_64, nginx 1.28.3, Apache 2.4.69, Caddy 2.11.7. All 36 rows
-pass; the rejection rows were also run with 20 repeats, with one distinct
-outcome per row.
+nginx 1.28.3, Apache 2.4.69, Caddy 2.11.7, on Ubuntu 24.04 x86_64 (GET rows,
+also run with 20 repeats) and in Rancher Desktop on aarch64 (all 54 rows). Every
+row passes, with one distinct outcome per row.
+
+The 8 MiB POST rejections give the same outcome as the GET rows on every
+listener.
 
 | Server | Listener | accepted | request | none | wrong CA |
 |---|---|---|---|---|---|
@@ -86,8 +91,8 @@ every run.
 
 ## Not covered
 
-- Only GET requests: the rejection race with a large unread request body is not
-  exercised.
+- The client sends the large body as one fixed body; a streaming `IBodyWriter`
+  upload is covered by the unit tests, not by this gate.
 - TLS 1.2 is not run with HTTP/1.1 only, and the client has no option to pin
   its own TLS version; versions are pinned on the server.
 - Certificate revocation, an expired server certificate and `ssl_verify_client
