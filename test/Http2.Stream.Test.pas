@@ -52,6 +52,20 @@ type
     property Ids: TArray<LongWord> read FIds;
   end;
 
+  /// after a delay, hands one frame to a lease the way the connection's reader
+  /// thread does: the peer answering while an upload is parked on credit
+  TLateFrame = class(TThread)
+  private
+    FLease: TStreamLease;
+    FFrame: TFrame;
+    FDelayMs: Integer;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(const ALease: TStreamLease; const AFrame: TFrame;
+      const ADelayMs: Integer);
+  end;
+
   TStreamLeaseTest = class(TTestCase)
   private
     /// allocate a lease that the connection owns and the caller also holds;
@@ -68,6 +82,10 @@ type
     procedure TestLargeHeaderBlockUsesContinuation;
     // 08.4
     procedure TestBodyIsStreamedInDataFrames;
+    // RFC 9113 section 8.1: a peer that answers before the body is in is not
+    // going to read the rest; the upload stops instead of waiting for credit
+    procedure TestEarlyResponseStopsAnUploadParkedOnCredit;
+    procedure TestPeerResetStopsAnUploadWithoutAnotherReset;
     procedure TestBodyWriterIsPulledUntilFalse;
     // 08.5
     procedure TestResponseAssemblyStatusHeadersBody;
@@ -454,6 +472,135 @@ begin
            (Fields[I].Value = '/a/long/path/that/will/not/fit') then
           Found := True;
       AssertTrue('header block reassembles across CONTINUATION', Found);
+    finally
+      Lease.ReleaseLease;
+      IL := nil;
+      Alloc.Free;
+    end;
+  finally
+    Conn.Free;
+  end;
+end;
+
+{ TLateFrame }
+
+constructor TLateFrame.Create(const ALease: TStreamLease; const AFrame: TFrame;
+  const ADelayMs: Integer);
+begin
+  inherited Create(True);
+  FreeOnTerminate := False;
+  FLease := ALease;
+  FFrame := AFrame;
+  FDelayMs := ADelayMs;
+end;
+
+procedure TLateFrame.Execute;
+begin
+  Sleep(FDelayMs);
+  FLease.OnStreamFrame(FFrame);
+end;
+
+procedure TStreamLeaseTest.TestEarlyResponseStopsAnUploadParkedOnCredit;
+var
+  Sock: TMockSocket;
+  Conn: TConnection;
+  Lease: TStreamLease;
+  IL: IConnectionStream;
+  Alloc: TStreamIdAllocator;
+  Req: TStreamRequest;
+  Late: TLateFrame;
+  F: TFrame;
+  Body: TBytes;
+  Started: QWord;
+  DataBytes, Resets: Integer;
+  ResetCode: THttp2ErrorCode;
+begin
+  Sock := TMockSocket.Create;
+  Conn := TConnection.Create(Sock);
+  try
+    // larger than the default 65535-byte stream window, so the upload parks
+    SetLength(Body, 200000);
+    FillChar(Body[0], Length(Body), Ord('x'));
+    Req := TStreamRequest.WithMethod(hmPost, 'api.example')
+      .WithBody(THttpBody.FromBytes(Body));
+    MakeLease(Conn, Req, Alloc, Lease, IL);
+    try
+      Late := TLateFrame.Create(Lease, BuildDataFrame(1, nil, True), 150);
+      try
+        Late.Start;
+        Started := GetTickCount64;
+        Lease.Start;
+        AssertTrue('Start returned long before the credit timeout',
+          GetTickCount64 - Started < 5000);
+        Late.WaitFor;
+      finally
+        Late.Free;
+      end;
+      DataBytes := 0;
+      Resets := 0;
+      ResetCode := ecNoError;
+      while Conn.Outbound.TryPop(F) do
+        if F.Header.FrameType = ftData then
+          Inc(DataBytes, Length(ExtractDataPayload(F)))
+        else if F.Header.FrameType = ftRstStream then
+        begin
+          Inc(Resets);
+          ParseRstStream(F, ResetCode);
+        end;
+      AssertTrue('some DATA went out before the window ran dry', DataBytes > 0);
+      AssertTrue('no more than the window was sent', DataBytes <= 65535);
+      AssertEquals('the client told the peer to stop', 1, Resets);
+      AssertEquals('with CANCEL', Ord(ecCancel), Ord(ResetCode));
+    finally
+      Lease.ReleaseLease;
+      IL := nil;
+      Alloc.Free;
+    end;
+  finally
+    Conn.Free;
+  end;
+end;
+
+procedure TStreamLeaseTest.TestPeerResetStopsAnUploadWithoutAnotherReset;
+var
+  Sock: TMockSocket;
+  Conn: TConnection;
+  Lease: TStreamLease;
+  IL: IConnectionStream;
+  Alloc: TStreamIdAllocator;
+  Req: TStreamRequest;
+  Late: TLateFrame;
+  F: TFrame;
+  Body: TBytes;
+  Started: QWord;
+  Resets: Integer;
+begin
+  Sock := TMockSocket.Create;
+  Conn := TConnection.Create(Sock);
+  try
+    SetLength(Body, 200000);
+    FillChar(Body[0], Length(Body), Ord('x'));
+    Req := TStreamRequest.WithMethod(hmPost, 'api.example')
+      .WithBody(THttpBody.FromBytes(Body));
+    MakeLease(Conn, Req, Alloc, Lease, IL);
+    try
+      Late := TLateFrame.Create(Lease, BuildRstStreamFrame(1, ecNoError), 150);
+      try
+        Late.Start;
+        Started := GetTickCount64;
+        Lease.Start;
+        AssertTrue('Start returned long before the credit timeout',
+          GetTickCount64 - Started < 5000);
+        Late.WaitFor;
+      finally
+        Late.Free;
+      end;
+      Resets := 0;
+      while Conn.Outbound.TryPop(F) do
+        if F.Header.FrameType = ftRstStream then
+          Inc(Resets);
+      AssertEquals('the peer already reset the stream: no reset from us', 0,
+        Resets);
     finally
       Lease.ReleaseLease;
       IL := nil;

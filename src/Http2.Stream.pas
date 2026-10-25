@@ -237,6 +237,13 @@ type
     FStarted: Boolean;
     FRegistered: Boolean;
     FUnregistered: Boolean;
+    /// set by the connection's reader thread when the peer has ended the
+    /// response or reset the stream: an upload parked on credit stops, because
+    /// a peer that answered early is not going to read the rest (RFC 9113
+    /// section 8.1)
+    FPeerDone: LongInt;
+    FPeerReset: LongInt;
+    FUploadStopped: Boolean;
     FLocalState: TLeaseLocalState;
     FResponseState: TResponseState;
 
@@ -729,7 +736,10 @@ end;
 
 function TStreamLease.AcquireCredit(const AWant: LongWord): LongWord;
 begin
-  Result := FConnection.AcquireSendCredit(FStreamId, AWant, FTimeoutMs);
+  Result := FConnection.AcquireSendCredit(FStreamId, AWant, FTimeoutMs,
+    @FPeerDone);
+  if (Result = 0) and (InterlockedExchangeAdd(FPeerDone, 0) <> 0) then
+    Exit(0);   // the caller stops the upload; the response is already queued
   if Result = 0 then
     raise EHttpTimeout.CreateFmt(
       'timed out after %d ms waiting for flow-control credit on stream %d',
@@ -846,6 +856,8 @@ begin
     FOutbound.Push(BuildDataFrame(FStreamId, nil, AEndStream));
     Exit;
   end;
+  if FUploadStopped then
+    Exit;
   Inc(FBytesSent, Length(AData));
   Ofs := 0;
   while Ofs < Length(AData) do
@@ -858,6 +870,16 @@ begin
     if LongWord(N) < Want then
       Want := LongWord(N);
     N := Integer(AcquireCredit(Want));
+    if N = 0 then
+    begin
+      // the peer answered (or reset the stream) before the body was in: send
+      // no more, and tell it so unless it reset the stream itself.  The
+      // response it already sent is read as usual.
+      FUploadStopped := True;
+      if InterlockedExchangeAdd(FPeerReset, 0) = 0 then
+        FConnection.PostFrame(BuildRstStreamFrame(FStreamId, ecCancel));
+      Exit;
+    end;
     Chunk := Copy(AData, Ofs, N);
     Inc(Ofs, N);
     FOutbound.Push(BuildDataFrame(FStreamId, Chunk,
@@ -973,7 +995,7 @@ begin
   else if FRequest.BodyWriter <> nil then
   begin
     PendingSet := False;
-    while FRequest.BodyWriter.NextChunk(Chunk) do
+    while (not FUploadStopped) and FRequest.BodyWriter.NextChunk(Chunk) do
     begin
       if PendingSet then
         EmitData(Pending, False);
@@ -1533,6 +1555,17 @@ begin
   if FUnregistered then
     Exit;
   FInbound.Push(AFrame);
+  // on the reader thread, before the consumer sees the frame: an upload parked
+  // on flow-control credit would otherwise wait out its timeout and lose the
+  // response that is already sitting in the queue
+  if AFrame.Header.FrameType = ftRstStream then
+    InterlockedExchange(FPeerReset, 1);
+  if (AFrame.Header.FrameType = ftRstStream) or
+     ((AFrame.Header.FrameType in [ftHeaders, ftData]) and AFrame.IsEndStream) then
+  begin
+    InterlockedExchange(FPeerDone, 1);
+    FConnection.WakeSendCredit;
+  end;
 end;
 
 end.

@@ -202,9 +202,10 @@ type
     /// apply an inbound WINDOW_UPDATE to SEND-side credit (RFC 9113 section
     /// 6.9) and wake any sender starved on this window
     procedure ApplyWindowUpdate(const AStreamId, AIncrement: LongWord);
-    /// release every sender parked on FSendCreditEvent
-    procedure WakeSendCredit;
   public
+    /// release every sender parked on FSendCreditEvent; each re-checks its own
+    /// window and its AAbort flag, so a wake that is not for it is harmless
+    procedure WakeSendCredit;
     constructor Create(const ASocket: IHttp2Socket); overload;
     constructor Create(const ASocket: IHttp2Socket;
       const ALocalSettings: TConnectionSettings); overload;
@@ -229,8 +230,11 @@ type
     //   or the stream window and waits for WINDOW_UPDATE when either is
     //   exhausted. Callers must treat a zero-length END_STREAM frame as
     //   exempt: it carries no flow-controlled bytes
+    //   A non-nil AAbort that turns non-zero ends the wait at once with 0, so a
+    //   sender whose peer has already answered or reset the stream stops
+    //   waiting for credit the peer will never grant
     function AcquireSendCredit(const AStreamId: LongWord; const AMax: LongWord;
-      const ATimeoutMs: Integer): LongWord;
+      const ATimeoutMs: Integer; const AAbort: PLongInt = nil): LongWord;
     /// may a new stream still be opened on this connection?
     function CanOpenStream: Boolean;
     /// RFC 7540 section 6.8: after GOAWAY, a stream with an id strictly above
@@ -1274,7 +1278,8 @@ begin
 end;
 
 function TConnection.AcquireSendCredit(const AStreamId: LongWord;
-  const AMax: LongWord; const ATimeoutMs: Integer): LongWord;
+  const AMax: LongWord; const ATimeoutMs: Integer;
+  const AAbort: PLongInt): LongWord;
 var
   Deadline: QWord;
   Remaining: Integer;
@@ -1313,6 +1318,9 @@ begin
         if (Granted > 0) and FFlowControl.TryConsume(AStreamId, Granted) then
           Exit(Granted);
       end;
+      // credit that is there is still used; only a wait for more is cut short
+      if (AAbort <> nil) and (InterlockedExchangeAdd(AAbort^, 0) <> 0) then
+        Exit(0);
       // No credit. Register as a waiter BEFORE releasing FLock: a
       // WINDOW_UPDATE that lands from here on will count us and signal, so no
       // wakeup can be lost between this check and the wait below

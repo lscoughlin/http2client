@@ -226,6 +226,13 @@ Rules:
 - Sending DATA decrements both windows; the sender must not exceed either and
   waits for `WINDOW_UPDATE`. This turns a slow reader into backpressure on
   `IBodyWriter` rather than unbounded buffering.
+- A peer may answer before the request body is in (RFC 9113 section 8.1: a
+  400 for a missing client certificate, a 413 for a large body) and stop
+  reading. When the peer has ended the response or reset the stream, an
+  upload parked on credit stops at once instead of waiting out its timeout.
+  The client sends `RST_STREAM(CANCEL)` unless the peer already reset the
+  stream, and the response already received is returned as usual. Credit that
+  is available is still used; only the wait for more is cut short.
 - Receiving DATA consumes local windows; the client sends `WINDOW_UPDATE`
   (connection and stream) as DATA arrives, in batches (see
   "Implementation note"), so the peer's windows stay open while a reader
@@ -238,7 +245,7 @@ Rules:
 flowchart TB
   subgraph SEND["send path"]
     D["DATA frame to write"] --> C1{"stream window has credit?"}
-    C1 -->|"no"| W1["AcquireCredit blocks until WINDOW_UPDATE<br/>or lease deadline → EHttpTimeout"]
+    C1 -->|"no"| W1["AcquireCredit blocks until WINDOW_UPDATE,<br/>the peer ends or resets the stream (upload stops),<br/>or lease deadline → EHttpTimeout"]
     W1 --> C1
     C1 -->|"yes"| C2{"connection window has credit?"}
     C2 -->|"no"| W1
