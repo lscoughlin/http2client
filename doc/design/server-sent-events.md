@@ -292,6 +292,15 @@ rejects a `content-encoding` other than `identity` (or absent) with
 This is a correctness rule, not an optimisation: the whole point of SSE is
 incremental delivery.
 
+`WrapDecodingResponse` returns a `text/event-stream` response unchanged.
+The media type comparison ignores case, surrounding spaces, and parameters.
+The original `content-encoding` and `content-length` headers remain available
+to `TSseSource.ValidateResponse`. No body read occurs before that check.
+Thus, both valid and malformed gzip or deflate bodies receive the same
+`EHttpProtocolError` when the source validates the response. Other media types
+retain transparent decoding; a prefix such as `text/event-streaming` does not
+select SSE handling.
+
 ## Reconnection and resume
 
 SSE's reconnect contract is client-driven: when the stream ends (server

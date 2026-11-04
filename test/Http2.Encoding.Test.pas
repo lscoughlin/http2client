@@ -54,6 +54,9 @@ type
     // the wrapper
     procedure TestWrapDecodingRemovesTheCodingHeader;
     procedure TestWrapDecodingLeavesIdentityAlone;
+    procedure TestCodedSseRetainsHeadersWithoutReadingBody;
+    procedure TestValidGzipSseStillRequiresIdentity;
+    procedure TestSseMediaTypePrefixDoesNotDisableDecoding;
     procedure TestDecodingBodyStreamInflatesGzip;
     procedure TestDecodingBodyStreamInflatesDeflate;
   end;
@@ -64,6 +67,7 @@ type
     FData: TBytes;
     FPos: Integer;
   public
+    Reads: Integer;
     constructor Create(const AData: TBytes);
     function Read(var ABuffer; const ACount: LongInt): LongInt;
     function Eof: Boolean;
@@ -85,6 +89,8 @@ procedure RegisterTests;
 
 implementation
 
+uses Http2.Sse, Http2.Errors;
+
 { TMemoryBodyStream }
 
 constructor TMemoryBodyStream.Create(const AData: TBytes);
@@ -99,6 +105,7 @@ var
   P: PByte;
   Left, Take: Integer;
 begin
+  Inc(Reads);
   P := @ABuffer;
   Left := Length(FData) - FPos;
   if Left <= 0 then
@@ -424,6 +431,79 @@ begin
   Inner := TStubResponse.Create(TMemoryBodyStream.Create(BytesOf('plain')));
   AssertTrue('an uncoded response is returned unchanged',
     WrapDecodingResponse(Inner) = Inner);
+end;
+
+procedure TEncodingTest.TestCodedSseRetainsHeadersWithoutReadingBody;
+const
+  Codings: array[0..1] of string = ('gzip', 'deflate');
+  MediaTypes: array[0..2] of string = ('text/event-stream',
+    'Text/Event-Stream; charset=UTF-8', ' text/event-stream ; charset=utf-8');
+var
+  I, J: Integer;
+  Body: TMemoryBodyStream;
+  Inner, Wrapped: IHttpResponse;
+  Rejected: Boolean;
+begin
+  for I := Low(Codings) to High(Codings) do
+    for J := Low(MediaTypes) to High(MediaTypes) do
+    begin
+      Body := TMemoryBodyStream.Create(BytesOf('invalid coded body'));
+      Inner := TStubResponse.Create(Body);
+      Inner.Headers.Add(HeaderContentType, MediaTypes[J]);
+      Inner.Headers.Add(HeaderContentEncoding, Codings[I]);
+      Inner.Headers.Add(HeaderContentLength, '18');
+      Wrapped := WrapDecodingResponse(Inner);
+      AssertTrue('SSE response stays unwrapped', Wrapped = Inner);
+      AssertEquals('coding remains available', Codings[I],
+        Wrapped.Headers.GetFirst(HeaderContentEncoding));
+      AssertEquals('wire length remains available', '18',
+        Wrapped.Headers.GetFirst(HeaderContentLength));
+      AssertEquals('no decoding header read', 0, Body.Reads);
+      Rejected := False;
+      try
+        TSseSource.ValidateResponse(Wrapped);
+      except
+        on EHttpProtocolError do Rejected := True;
+      end;
+      AssertTrue('SSE rejects nonidentity coding', Rejected);
+      AssertEquals('validation does not read the body', 0, Body.Reads);
+      Wrapped := nil;
+      Inner := nil;
+    end;
+end;
+
+procedure TEncodingTest.TestValidGzipSseStillRequiresIdentity;
+var
+  Body: TMemoryBodyStream;
+  Response: IHttpResponse;
+  Rejected: Boolean;
+begin
+  Body := TMemoryBodyStream.Create(GzipCompress(BytesOf('data: value'#10#10)));
+  Response := TStubResponse.Create(Body);
+  Response.Headers.Add(HeaderContentType, 'text/event-stream');
+  Response.Headers.Add(HeaderContentEncoding, 'gzip');
+  Response := WrapDecodingResponse(Response);
+  Rejected := False;
+  try
+    TSseSource.ValidateResponse(Response);
+  except
+    on EHttpProtocolError do Rejected := True;
+  end;
+  AssertTrue('valid gzip is still not an identity-coded stream', Rejected);
+  AssertEquals(0, Body.Reads);
+end;
+
+procedure TEncodingTest.TestSseMediaTypePrefixDoesNotDisableDecoding;
+var
+  Inner, Wrapped: IHttpResponse;
+begin
+  Inner := TStubResponse.Create(
+    TMemoryBodyStream.Create(GzipCompress(BytesOf('ordinary body'))));
+  Inner.Headers.Add(HeaderContentType, 'text/event-streaming');
+  Inner.Headers.Add(HeaderContentEncoding, 'gzip');
+  Wrapped := WrapDecodingResponse(Inner);
+  AssertTrue(Wrapped <> Inner);
+  AssertEquals('ordinary body', TextOf(Drain(Wrapped.Body)));
 end;
 
 procedure TEncodingTest.TestDecodingBodyStreamInflatesGzip;

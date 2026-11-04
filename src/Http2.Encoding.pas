@@ -9,6 +9,8 @@
 //   the body decoded transparently: THttpResponse wraps the body in a
 //   TDecodingBodyStream and removes the `content-encoding` header, so every
 //   reader (ReadText, ReadAllBodyBytes, a typed reader) sees plain bytes.
+// - text/event-stream responses retain their wire coding header and body.
+//   TSseSource rejects nonidentity coding before it reads the body.
 unit Http2.Encoding;
 
 {$mode delphi}{$H+}
@@ -561,9 +563,20 @@ end;
 function WrapDecodingResponse(const AResponse: IHttpResponse): IHttpResponse;
 var
   Coding: TContentEncoding;
+  MediaType: string;
+  ParameterStart: Integer;
 begin
   Result := AResponse;
   if AResponse = nil then
+    Exit;
+  // The SSE reader validates the wire coding before body access. Creating
+  // a decoding stream here could read a coding header and hide the coding
+  // from that validation, even when the request asked for identity.
+  MediaType := AResponse.Headers.GetFirst(HeaderContentType);
+  ParameterStart := Pos(';', MediaType);
+  if ParameterStart > 0 then
+    SetLength(MediaType, ParameterStart - 1);
+  if SameText(Trim(MediaType), 'text/event-stream') then
     Exit;
   Coding := ParseContentEncoding(
     AResponse.Headers.GetFirst(HeaderContentEncoding));

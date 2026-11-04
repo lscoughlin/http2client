@@ -306,6 +306,14 @@ that `Body` yields plain bytes, and the `content-encoding` header (with a
 sees plain bytes, whether it is `ReadText`, `ReadAllBodyBytes`, or a typed
 reader.
 
+An SSE response is the exception to transparent decoding. For the exact
+media type `text/event-stream`, the wrapper leaves the wire body,
+`content-encoding`, and `content-length` unchanged. The comparison ignores
+letter case and media-type parameters. `TSseSource` can thus reject a
+nonidentity coding before any body read. A valid gzip body and a malformed
+gzip body are both rejected as coded SSE. Other media types keep the
+transparent decoding behavior described above.
+
 `ReadText` only copies bytes verbatim; the decode happens below it, in the
 body stream, so it needs no special case.
 

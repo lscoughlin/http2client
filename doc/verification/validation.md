@@ -8,12 +8,30 @@ tags:
   - validation
 status: validated
 up: "[http2client](../http2client.md)"
-updated: 2026-10-13
+updated: 2026-11-04
 validation-results: "bin/validation-results.md"
 harness-log: "doc/verification/harness-run-full.log"
 ---
 
 # Validation against external suites
+
+## SSE content-coding regression check, 2026-11-04
+
+`make test` passed on macOS 27.2 (26B123), aarch64, with Free Pascal
+3.2.4-rc2 [2026/08/26] and `OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib`.
+The runner reported 907 tests, zero errors, and zero failures. This was the
+default local suite; optional external-service gates were not enabled.
+
+The 33 `TEncodingTest` tests include three added regression cases. Coded SSE
+responses retain their wire headers without a body read; both malformed
+gzip/deflate and valid gzip are rejected by SSE validation. Media type case
+and parameters do not change this result. `text/event-streaming` still uses
+normal gzip decoding. The 12 `TSseSourceTest` tests also passed.
+
+The implementation contract is described in
+[messages](../design/messages.md) and
+[server-sent events](../design/server-sent-events.md). This check adds no
+Linux validation result.
 
 ## Goal
 
