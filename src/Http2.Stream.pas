@@ -232,6 +232,7 @@ type
     FDecoder: THpackCodec;
     FOwnsEncoder: Boolean;
     FOwnsDecoder: Boolean;
+    FWaitLock: TCriticalSection; // weak; the pooled connection outlives the lease
     FBodyStream: IHttpBodyStream;
 
     FStarted: Boolean;
@@ -316,6 +317,7 @@ type
     procedure EmitHeaderBlock(const ABlock: TBytes; const AEndStream: Boolean);
     procedure EmitData(const AData: TBytes; const AEndStream: Boolean);
     function PopInbound(out AFrame: TFrame; const ATimeoutMs: Integer): Boolean;
+    function WaitForInbound(const ATimeoutMs: Integer): Boolean;
     /// wait for an inbound frame on the body read path, honouring the
     /// request's own body-read deadline and polling its cancel token. Returns
     /// False on shutdown, on the deadline, or when the token is cancelled;
@@ -328,6 +330,9 @@ type
     procedure MarkResponseComplete;
     function RequestIsBodyless: Boolean;
   public
+    /// Production callers hold this lock while processing lease frames.
+    /// Inbound queue waits release it and reacquire it before processing.
+    property WaitLock: TCriticalSection read FWaitLock write FWaitLock;
     constructor Create(const AConnection: TConnection;
       const AAllocator: TStreamIdAllocator; const ARequest: TStreamRequest);
       overload;
@@ -1026,6 +1031,16 @@ begin
   FLocalState := lsLocalHalfClosed;
 end;
 
+function TStreamLease.WaitForInbound(const ATimeoutMs: Integer): Boolean;
+begin
+  if FWaitLock <> nil then FWaitLock.Release;
+  try
+    Result := FInbound.WaitForItem(ATimeoutMs);
+  finally
+    if FWaitLock <> nil then FWaitLock.Acquire;
+  end;
+end;
+
 function TStreamLease.PopInbound(out AFrame: TFrame;
   const ATimeoutMs: Integer): Boolean;
 var
@@ -1042,7 +1057,7 @@ begin
     if GetTickCount64 >= Deadline then
       Exit(False);
     Remaining := Integer(Deadline - GetTickCount64);
-    FInbound.WaitForItem(Remaining);
+    WaitForInbound(Remaining);
     if FInbound.TryPop(AFrame) then
       Exit(True);
   end;
@@ -1087,7 +1102,7 @@ begin
       Slice := MaxInt;
     if (Token <> nil) and Token.IsCancelled then
       Exit(False);
-    Waiting := FInbound.WaitForItem(Slice);
+    Waiting := WaitForInbound(Slice);
     if FInbound.TryPop(AFrame) then
       Exit(True);
     if not Waiting then

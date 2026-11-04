@@ -486,7 +486,8 @@ type
   end;
 
   /// IHttpBodyStream facade over a lease body that holds the pooled
-  /// connection's critical section, serializing HPACK decode across streams
+  /// connection's critical section while processing frames. The lease releases
+  /// this lock while waiting for input, so other streams can make progress.
   TGuardedBody = class(TInterfacedObject, IHttpBodyStream, IStampedBodyStream)
   private
     FInner: IHttpBodyStream;
@@ -2929,6 +2930,7 @@ begin
     Lease := TStreamLease.Create(FConn, FAllocator, ARequest, FEncoder,
       FDecoder);
     Keep := Lease;
+    Lease.WaitLock := FLock;
     Lease.TimeoutMs := ATimeoutMs;
     Lease.Start;
     AAcquired := True;
@@ -2971,10 +2973,11 @@ begin
     end;
     // a body coded by the peer is decoded here, at the one place every
     // response is built, so ReadText and every typed reader inherit it
-    Result := WrapDecodingResponse(THttpResponse.Create(Lease, Keep, Self));
+    Result := THttpResponse.Create(Lease, Keep, Self);
   finally
     FLock.Release;
   end;
+  Result := WrapDecodingResponse(Result);
 end;
 
 procedure THttpConnection.MaybeClose;
@@ -3028,6 +3031,7 @@ begin
     Lease := TStreamLease.Create(FConn, FAllocator, ARequest, FEncoder,
       FDecoder);
     Keep := Lease;
+    Lease.WaitLock := FLock;
     Lease.TimeoutMs := ATimeoutMs;
     try
       Lease.AdoptUpgradedStream;
@@ -3064,10 +3068,11 @@ begin
       raise EHttpTimeout.Create('timed out waiting for response headers');
     end;
     // a body coded by the peer is decoded here (mirrors AcquireCancellable)
-    Result := WrapDecodingResponse(THttpResponse.Create(Lease, Keep, Self));
+    Result := THttpResponse.Create(Lease, Keep, Self);
   finally
     FLock.Release;
   end;
+  Result := WrapDecodingResponse(Result);
 end;
 
 { TSingleReadSocket }

@@ -227,6 +227,19 @@ returns an `IHttpResponse` whose body can be streamed or drained (see
 thread-safe and may be called concurrently from many threads; each call
 acquires its own stream lease.
 
+On HTTP/2, an idle response does not hold the connection lock while it
+waits for response headers or body frames. Other streams on that connection
+can send requests and read responses during the wait. Frame processing and
+access to the shared HPACK codecs still use the connection lock. The lease
+releases the lock only for the inbound queue wait and acquires it again
+before it processes a frame. The response keeps the connection alive for
+the full body lifetime. Automatic content decoding starts after the header
+acquisition lock is released, so a decoded body has the same wait rule.
+
+A cancellation token applies to its request. Cancellation of a blocked
+stream does not cancel another stream on the same connection. This rule
+applies to HTTP/2; an HTTP/1.1 connection has one active request at a time.
+
 The second `Send` opens a WebSocket (see [websocket](websocket.md)): it dials a dedicated
 HTTP/1.1 connection, runs the upgrade handshake and returns an `IWebSocket`
 whose listener callbacks run on its own reader thread. That connection is not

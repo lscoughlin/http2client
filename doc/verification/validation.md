@@ -15,6 +15,26 @@ harness-log: "doc/verification/harness-run-full.log"
 
 # Validation against external suites
 
+## Multiplexed wait regression check, 2026-11-04
+
+`make test` passed on macOS 27.2 (26B123), aarch64, with Free Pascal
+3.2.4-rc2 [2026/08/26] and `OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib`.
+The default suite reported 910 tests, zero errors, and zero failures.
+Optional external-service gates were not enabled. No Linux check was run.
+
+The 29 `TClientTest` tests include three new cases on one HTTP/2 connection:
+an idle first body does not block a second response; pending first headers
+do not block a second response; cancellation during the first header wait
+leaves the connection usable. Custom response headers exercise the shared
+HPACK dynamic table. Waits have deadlines, and test cleanup releases the
+held response before it joins workers.
+
+The lease releases the connection lock during inbound queue waits and
+acquires it again before frame processing. Content decoding starts outside
+the header acquisition lock. The threading contract is described in
+[client API](../design/client-api.md) and
+[server-sent events](../design/server-sent-events.md).
+
 ## SSE content-coding regression check, 2026-11-04
 
 `make test` passed on macOS 27.2 (26B123), aarch64, with Free Pascal
