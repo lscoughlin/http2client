@@ -2841,6 +2841,7 @@ begin
   FOrigin := AOrigin;
   FEncoder := THpackCodec.Create;
   FDecoder := THpackCodec.Create;
+  FConn.HeaderDecoder := FDecoder;
   FAllocator := TStreamIdAllocator.Create;
   FLock := TCriticalSection.Create;
   FMaxStreamsPerConnection := AMaxStreamsPerConnection;

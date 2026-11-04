@@ -229,8 +229,10 @@ acquires its own stream lease.
 
 On HTTP/2, an idle response does not hold the connection lock while it
 waits for response headers or body frames. Other streams on that connection
-can send requests and read responses during the wait. Frame processing and
-access to the shared HPACK codecs still use the connection lock. The lease
+can send requests and read responses during the wait. Caller-side frame processing and the shared HPACK encoder use the
+connection lock. The shared HPACK decoder runs only on the connection
+reader thread, in wire order, before dispatch to stream queues. Header
+blocks for an unregistered stream still update that decoder. The lease
 releases the lock only for the inbound queue wait and acquires it again
 before it processes a frame. The response keeps the connection alive for
 the full body lifetime. Automatic content decoding starts after the header

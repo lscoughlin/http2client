@@ -245,8 +245,8 @@ stream; `TSseReconnectLoop` stops when the source is closed or cancelled.
 During an HTTP/2 header or body wait, the lease releases the pooled
 connection lock. A quiet SSE stream therefore does not prevent another
 stream on the same connection from receiving its response. The lock is
-held again when a frame is processed, including access to shared HPACK
-state. Cancellation closes only the affected stream; other streams remain
+held again when a caller processes a frame. Shared HPACK decoding occurs
+on the connection reader thread in wire order, before stream dispatch. Cancellation closes only the affected stream; other streams remain
 usable. HTTP/1.1 keeps the one-request-per-connection restriction below.
 
 ## Flow control on a long-lived stream

@@ -11,7 +11,7 @@ unit Http2.Frames;
 interface
 
 uses
-  SysUtils, Classes, Http2.Errors;
+  SysUtils, Classes, Http2.Errors, Http2.Hpack;
 
 const
   /// every frame starts with a 9-byte header
@@ -65,6 +65,9 @@ type
     /// thread finished reading this frame; meaningful only on received frames
     /// and never serialized.  0 on every frame built locally.
     ArrivedUs: Int64;
+    /// Reader-thread HPACK result on END_HEADERS; never serialized.
+    HeadersDecoded: Boolean;
+    DecodedHeaders: THeaderBlock;
     /// build a frame, filling Header.Length from Payload
     class function Create(const AFrameType: TFrameType; const AFlags: TFrameFlags;
       const AStreamId: LongWord; const APayload: TBytes): TFrame; static;
@@ -268,6 +271,8 @@ begin
   Result.Payload := APayload;
   Result.Header.Length := Length(APayload);
   Result.ArrivedUs := 0;
+  Result.HeadersDecoded := False;
+  Result.DecodedHeaders := nil;
 end;
 
 function TFrame.DataLength: LongWord;
@@ -700,6 +705,8 @@ begin
   ReadExact(AStream, Hdr[0], FrameHeaderSize, 'frame header');
   Result.Header := TFrameHeader.ReadFrom(Hdr);
   Result.ArrivedUs := 0;
+  Result.HeadersDecoded := False;
+  Result.DecodedHeaders := nil;
   if Result.Header.Length > AMaxFrameSize then
     raise EHttpProtocolError.Create(Format(
       'frame length %d exceeds SETTINGS_MAX_FRAME_SIZE %d',

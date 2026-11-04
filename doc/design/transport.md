@@ -114,6 +114,13 @@ One thread per connection, responsible for *both* directions:
   Encoding is therefore routed through the connection thread (or guarded by
   the connection's critical section); the decoder is touched only by the
   connection thread.
+  Complete HEADERS/CONTINUATION blocks are decoded before stream lookup.
+  This includes header blocks for a stream whose lease was released. The
+  END_HEADERS frame carries decoded fields as internal metadata; those fields
+  are not written to the socket. Each lease validates the fields and updates
+  its response state on the caller thread. A caller can consume streams in
+  any order without changing the HPACK dynamic-table order. Interleaved or
+  wrong-stream CONTINUATION frames fail the connection.
 - **ARC hazard:** `TConnectionThread` stores a raw (weak) pointer to avoid
   an interface reference cycle (`TConnection` ↔ thread). `TConnection`
   `Terminate`+`WaitFor`s the thread before releasing `FSocket`/queues.

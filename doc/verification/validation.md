@@ -15,6 +15,28 @@ harness-log: "doc/verification/harness-run-full.log"
 
 # Validation against external suites
 
+## HPACK dispatch order check, 2026-11-04
+
+Eight concurrent requests on one connection reproduced an out-of-order
+HPACK decode when each response contained a shared dynamic-table header.
+The fifth stress iteration failed with `HPACK: index 62 out of range`.
+The connection reader now decodes complete header blocks before dispatch.
+The same stress check passed 50 consecutive runs with this correction.
+
+Three `THpackWireOrderTests` cases verify decoded fields independently of
+consumer order, a dynamic-table update from an unregistered stream, and
+HEADERS/CONTINUATION assembly. The split case preserves END_STREAM on the
+initial HEADERS and makes decoded metadata available only at END_HEADERS.
+All three targeted tests passed. Field semantics remain validated by the
+lease; HPACK failures apply to the connection. The implementation contract
+is described in [transport](../design/transport.md).
+
+The final `make test` run passed 913 tests, with zero errors and zero
+failures, on macOS 27.2 (26B123), aarch64, Free Pascal 3.2.4-rc2
+[2026/08/26], and OpenSSL 3 from `/opt/homebrew/opt/openssl@3/lib`.
+This was the default local suite. External-service gates were not enabled,
+and no Linux check was run.
+
 ## Multiplexed wait regression check, 2026-11-04
 
 `make test` passed on macOS 27.2 (26B123), aarch64, with Free Pascal

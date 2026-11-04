@@ -1442,6 +1442,7 @@ var
   I, Ok: Integer;
 begin
   Factory := TFakeSocketFactory.Create;
+  Factory.AddResponseHeader('x-test-concurrent', 'dynamic-value');
   Client := THttpClientFactory.Create
     .WithSocketFactory(Factory)
     .WithMaxConnections(1)
@@ -1459,6 +1460,8 @@ begin
     AssertTrue('worker finished', Workers[I].WaitDone(10000));
     AssertFalse('no error under concurrency: ' + Workers[I].Error,
       Workers[I].Raised);
+    AssertEquals('shared dynamic header is decoded', 'dynamic-value',
+      Workers[I].Response.Headers.GetFirst('x-test-concurrent'));
     if Workers[I].Status = 200 then
       Inc(Ok);
     Workers[I].Free;

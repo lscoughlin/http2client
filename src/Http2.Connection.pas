@@ -18,7 +18,7 @@ interface
 uses
   SysUtils, Classes, SyncObjs, Generics.Collections,
   Http2.Errors, Http2.Frames, Http2.Tls, Http2.Observer, Http2.FlowControl,
-  Http2.Clock;
+  Http2.Clock, Http2.Hpack;
 
 const
   /// connection-level receive window we advertise (RFC 7540 section 6.9.2)
@@ -137,6 +137,9 @@ type
     FOutbound: IBlockingQueue<TFrame>;
     FInbound: IBlockingQueue<TFrame>;
     FThread: TConnectionThread;
+    FHeaderDecoder: THpackCodec; // weak; owner outlives the connection thread
+    FHeaderBytes: TBytes;       // only the connection reader accesses this
+    FHeaderStream: LongWord;
     FState: TConnectionState;
     FLocalSettings: TConnectionSettings;
     FPeerSettings: TConnectionSettings;
@@ -277,6 +280,8 @@ type
     /// hand a stream-scoped frame to its lease; False when nobody owns it
     /// (the frame is then left on the shared inbound queue)
     function DispatchStreamFrame(const AFrame: TFrame): Boolean;
+    /// Set before Start. Decoding then occurs in wire order, before dispatch.
+    property HeaderDecoder: THpackCodec read FHeaderDecoder write FHeaderDecoder;
 
     property State: TConnectionState read GetState;
     property PeerSettings: TConnectionSettings read GetPeerSettings;
@@ -656,6 +661,11 @@ var
   Increment: LongWord;
 begin
   TConnection(FConn).EmitFrameIn(AFrame);
+  if (TConnection(FConn).FHeaderStream <> 0) and
+     ((AFrame.Header.FrameType <> ftContinuation) or
+      (AFrame.Header.StreamId <> TConnection(FConn).FHeaderStream)) then
+    raise EHttpProtocolError.Create('header block requires adjacent CONTINUATION',
+      ecProtocolError);
   case AFrame.Header.FrameType of
     ftSettings:
       if AFrame.IsAck then
@@ -1081,7 +1091,39 @@ end;
 function TConnection.DispatchStreamFrame(const AFrame: TFrame): Boolean;
 var
   S: IConnectionStream;
+  Routed: TFrame;
+  Fragment: TBytes;
+  N: Integer;
 begin
+  Routed := AFrame;
+  if (FHeaderDecoder <> nil) and
+     (AFrame.Header.FrameType in [ftHeaders, ftContinuation]) then
+  begin
+    Fragment := ExtractHeaderBlock(AFrame);
+    if AFrame.Header.FrameType = ftHeaders then
+    begin
+      FHeaderStream := AFrame.Header.StreamId;
+      FHeaderBytes := Fragment;
+    end
+    else
+    begin
+      if (FHeaderStream = 0) or
+         (FHeaderStream <> AFrame.Header.StreamId) then
+        raise EHttpProtocolError.Create('unexpected CONTINUATION stream',
+          ecProtocolError);
+      N := Length(FHeaderBytes);
+      SetLength(FHeaderBytes, N + Length(Fragment));
+      if Length(Fragment) > 0 then
+        Move(Fragment[0], FHeaderBytes[N], Length(Fragment));
+    end;
+    if AFrame.IsEndHeaders then
+    begin
+      Routed.DecodedHeaders := FHeaderDecoder.Decode(FHeaderBytes);
+      Routed.HeadersDecoded := True;
+      FHeaderBytes := nil;
+      FHeaderStream := 0;
+    end;
+  end;
   FLock.Acquire;
   try
     Result := FStreams.TryGetValue(AFrame.Header.StreamId, S);
@@ -1090,7 +1132,7 @@ begin
   end;
   // deliver OUTSIDE the lock: a lease callback must never re-enter FLock
   if Result then
-    S.OnStreamFrame(AFrame);
+    S.OnStreamFrame(Routed);
 end;
 
 procedure TConnection.FailWith(const AMessage: string;

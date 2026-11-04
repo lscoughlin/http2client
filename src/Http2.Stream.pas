@@ -327,6 +327,8 @@ type
     procedure HandleHeaderFrame(const AFrame: TFrame);
     procedure HandleDataFrame(const AFrame: TFrame);
     procedure DecodeBlock(const ABlock: TBytes; const AEndStream: Boolean);
+    procedure ApplyDecodedBlock(const Fields: THeaderBlock;
+      const AEndStream: Boolean);
     procedure MarkResponseComplete;
     function RequestIsBodyless: Boolean;
   public
@@ -1180,19 +1182,26 @@ begin
   if AFrame.IsEndHeaders then
   begin
     FInHeaderBlock := False;
-    DecodeBlock(FPendingBlock, FPendingEndStream);
+    if AFrame.HeadersDecoded then
+      ApplyDecodedBlock(AFrame.DecodedHeaders, FPendingEndStream)
+    else
+      DecodeBlock(FPendingBlock, FPendingEndStream);
   end;
 end;
 
 procedure TStreamLease.DecodeBlock(const ABlock: TBytes;
   const AEndStream: Boolean);
+begin
+  ApplyDecodedBlock(FDecoder.Decode(ABlock), AEndStream);
+end;
+
+procedure TStreamLease.ApplyDecodedBlock(const Fields: THeaderBlock;
+  const AEndStream: Boolean);
 var
-  Fields: THeaderBlock;
   F: THttpHeaderField;
   I, St: Integer;
   SawRegular: Boolean;
 begin
-  Fields := FDecoder.Decode(ABlock);
   if not FHeadersDecoded then
   begin
     FStatusCode := -1;
