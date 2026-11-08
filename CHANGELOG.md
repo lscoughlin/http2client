@@ -3,14 +3,16 @@
 The notable changes of the library. Each entry names the release that
 holds it. Dates follow the release commits and tags.
 
-Releases 0.14.0 to 0.21.0 have tags (`v0.14.0` to `v0.21.0`). Release 0.13.0
+Releases 0.14.0 to 0.22.0 have tags (`v0.14.0` to `v0.22.0`). Release 0.13.0
 has none: it is the commit `558787c`. The package version in
-`http2client.lpk` is 0.22.0, which has no tag yet, so its changes sit under
+`http2client.lpk` is 0.23.0, which has no tag yet, so its changes sit under
 Unreleased.
 
 ## [Unreleased]
 
-Changes after the 0.22.0 version bump (`d7a422f`).
+## [0.22.0] - 2026-11-08
+
+Changes after the 0.21.0 tag. The package version moved to 0.22.0 in `d7a422f`.
 
 ### Changed
 
