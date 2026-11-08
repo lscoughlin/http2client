@@ -7,7 +7,7 @@ tags:
   - verification
 status: done
 up: "[http2client](../http2client.md)"
-updated: 2026-10-13
+updated: 2026-11-08
 ---
 
 # Toolchain and environment
@@ -37,7 +37,7 @@ reproduce commands.
 |---|---|
 | FPC 3.2.4 bundled `openssl` / `opensslsockets` | **No ALPN symbols** (grep of `opensslsockets.ppu` empty) → cannot negotiate `h2`. |
 | mormot2 `src/lib/mormot.lib.openssl11.pas` | **Exports ALPN**: `SSL_CTX_set_alpn_protos` (line 2164), `SSL_get0_alpn_selected` (line 2192); dynamically loads OpenSSL 1.1/3.x. |
-| mormot checkout | `third_party/mORMot2` @ `2ccea1a0e5d7be85bd3cf68e1fd70e9e603d09cc` (2026-10-05, "net: minor hardening of TTunnelLocal.SendFrame"). Unit dirs: `core`, `lib`, `net`, `crypt`. |
+| mormot checkout | `third_party/mORMot2` @ `b2b195da1e0580058672a88620ef71bb47283eb1` (2026-10-08, "core: Locked*() are now full memory barriers on FPC non-Intel CPUs"), the revision `../http2server` pins. Unit dirs: `core`, `lib`, `net`, `crypt`. |
 | mormot2 WebSocket references | read as design references, not linked: `src/net/mormot.net.ws.core.pas` (`TWebSocketFrameOpCode`, `FRAME_LEN_MASK`, `ProcessMask`, `ComputeChallenge`, `FrameSendEncode` and its use of `NetRandom32`), `src/net/mormot.net.ws.client.pas` (`THttpClientWebSockets` and its handshake). The linked pieces are unchanged: `Http2.WebSocketClient` takes its random masking key from `RAND_bytes` in `mormot.lib.openssl11`. See `doc/design/websocket.md`. |
 | mormot2 proxy-routing references | read as design references, not linked: `src/net/mormot.net.sock.pas` (`TUri`, `TIp4SubNet`, `NetIsIP4`, `NetIsIP6`, `TCrtSocket.DoOpenTunnel`), `src/core/mormot.core.os.pas` (`IsLocalHost`, `GetSystemEnv`). Linked by `Http2.Tls`: `src/lib/mormot.lib.openssl11.pas` (`BIO_s_mem`, `BIO_read`, `BIO_write`, `BIO_ctrl`, `SSL_set_bio`). Absent from the OpenSSL binding: `BIO_meth_new`, `BIO_set_data`, `BIO_set_retry_*`, `BIO_new_bio_pair`. No SOCKS client exists in the checkout. See `doc/design/proxy.md`. |
 | `OPENSSL_LIBPATH` | **Required on this machine.** Without it `OpenSslIsAvailable=FALSE` and `OpenSslVersionText=''`. With `OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib`: `OpenSslIsAvailable=TRUE`, `OpenSslVersionText='OpenSSL 3.6.5 29 Sep 2026'`. Probed from `/tmp/mormotprobe/probe_tls.pas`. |
@@ -77,7 +77,7 @@ nghttpd --version            # expect 1.70.0
 
 # 3. TLS unit dependency: pinned checkout
 git clone --depth 1 https://github.com/synopse/mORMot2.git third_party/mORMot2
-# revision 2ccea1a0e5d7be85bd3cf68e1fd70e9e603d09cc (recorded above).
+# revision b2b195da1e0580058672a88620ef71bb47283eb1 (recorded above).
 # Http2.Tls uses these unit dirs: third_party/mORMot2/src/{core,lib,net,crypt}
 # Runtime needs OPENSSL_LIBPATH=/opt/homebrew/opt/openssl@3/lib (see the table).
 

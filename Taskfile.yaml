@@ -26,7 +26,7 @@ vars:
     sh: echo "${FPC_UNITS:-/usr/local/lib/fpc/3.2.4/units/aarch64-darwin}"
   MORMOT: 'third_party/mORMot2/src'
   MORMOT_REPO: 'third_party/mORMot2'
-  MORMOT_REV: '2ccea1a0e5d7be85bd3cf68e1fd70e9e603d09cc'
+  MORMOT_REV: 'b2b195da1e0580058672a88620ef71bb47283eb1'
   HARNESS_REPO: 'third_party/h2-client-test-harness'
   HARNESS_REV: '0bc075cc21e5a247dfd222e005d1e7e5679d2bff'
   HARNESS_IMAGE: 'h2-test-harness'
